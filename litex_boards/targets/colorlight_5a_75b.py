@@ -110,7 +110,7 @@ def load():
     f.write(
 """
 interface ftdi
-ftdi_vid_pid 0x0403 0x6011
+ftdi_vid_pid 0x0403 0x6010
 ftdi_channel 0
 ftdi_layout_init 0x0098 0x008b
 reset_config none
