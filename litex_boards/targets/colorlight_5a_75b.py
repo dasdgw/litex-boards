@@ -14,6 +14,10 @@
 # Get and install wishbone tool from: https://github.com/litex-hub/wishbone-utils/releases
 # wishbone-tool --ethernet-host 192.168.1.50 --server terminal --csr-csv csr.csv
 # You should see the LiteX BIOS and be able to interact with it.
+#
+# Build/Use without ethernet:
+# ./colorlight_5a_75b.py --uart-name=stub --csr-csv=csr.csv
+# ./colorlight_5a_75b.py --load
 
 import argparse
 import sys
