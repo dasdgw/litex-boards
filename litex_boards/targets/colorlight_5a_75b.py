@@ -71,6 +71,10 @@ class BaseSoC(SoCCore):
         self.sync += led_counter.eq(led_counter + 1)
         self.comb += platform.request("user_led_n", 0).eq(led_counter[26])
 
+        #self.comb += platform.request("debug", 0).eq(led_counter[26])
+        self.comb += platform.request("j1", 0).eq(led_counter[27])
+        self.comb += platform.request("j1", 1).eq(led_counter[26])
+        self.comb += platform.request("j1", 2).eq(led_counter[25])
 # EtherboneSoC -------------------------------------------------------------------------------------
 
 class EtherboneSoC(BaseSoC):

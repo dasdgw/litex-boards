@@ -173,7 +173,35 @@ _connectors_v7_0 = [
 ]
 
 
+_debug =  [
+    ("debug", 0, Pins("F3"), IOStandard("LVCMOS33"))
+]
 
+connectorsNG = [
+    ("j1", 0, Pins("F3"), IOStandard("LVCMOS33")),
+    ("j1", 1, Pins("F1"), IOStandard("LVCMOS33")),
+    ("j1", 2, Pins("G3"), IOStandard("LVCMOS33")),
+    ("j1", 3, Pins("G2"), IOStandard("LVCMOS33")),
+    ("j1", 4, Pins("H3"), IOStandard("LVCMOS33")),
+    ("j1", 5, Pins("H5"), IOStandard("LVCMOS33")),
+
+    ("j1", 6, Pins("F15"), IOStandard("LVCMOS33")),
+    ("j1", 7, Pins("L2"), IOStandard("LVCMOS33")),
+    ("j1", 8, Pins("K1"), IOStandard("LVCMOS33")),
+    ("j1", 9, Pins("J5"), IOStandard("LVCMOS33")),
+    ("j1", 10, Pins("K2"), IOStandard("LVCMOS33")),
+    ("j1", 11, Pins("B16"), IOStandard("LVCMOS33")),
+    ("j1", 12, Pins("J14"), IOStandard("LVCMOS33")),
+    ("j1", 13, Pins("F12"), IOStandard("LVCMOS33")),
+
+#    ("j2", 0, Pins("J4  K3  G1  K4  C2  E3  F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j3", 0, Pins("H4  K5  P1  R1  L5  F2  F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j4", 0, Pins("P4  R2  M8  T6  R6  F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j5", 0, Pins("M11 N11 P12 K15 N12 L16 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j6", 0, Pins("K16 J15 J16 J12 H15 G16 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j7", 0, Pins("H13 J13 H12 G14 H14 G15 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+#    ("j8", 0, Pins("A15 F16 A14 E13 B14 A13 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
+]
 # Platform -----------------------------------------------------------------------------------------
 
 class Platform(LatticePlatform):
@@ -187,3 +215,5 @@ class Platform(LatticePlatform):
         io         = {"6.1": _io_v6_1,            "7.0": _io_v7_0}[revision]
         connectors = {"6.1": _connectors_v6_1,            "7.0": _connectors_v7_0}[revision]
         LatticePlatform.__init__(self, device, io, connectors=connectors, toolchain="trellis")
+        #self.add_extension(_debug)
+        self.add_extension(connectorsNG)
