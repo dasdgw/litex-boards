@@ -33,6 +33,22 @@ from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 from liteeth.core import LiteEthUDPIPCore
 from liteeth.frontend.etherbone import LiteEthEtherbone
 
+# LED ----------------------------------------------------------------------------------------------
+
+class _led(Module):
+    def __init__(self, platform, sys_clk_freq):
+
+        # Led --------------------------------------------------------------------------------------
+        led_counter = Signal(32)
+        self.sync += led_counter.eq(led_counter + 1)
+        self.comb += platform.request("user_led_n", 0).eq(led_counter[26])
+
+        #self.comb += platform.request("debug", 0).eq(led_counter[26])
+        self.comb += platform.request("j1", 0).eq(led_counter[27])
+        self.comb += platform.request("j1", 1).eq(led_counter[26])
+        self.comb += platform.request("j1", 2).eq(led_counter[25])
+
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(Module):
@@ -66,15 +82,7 @@ class BaseSoC(SoCCore):
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
 
-        # Led --------------------------------------------------------------------------------------
-        led_counter = Signal(32)
-        self.sync += led_counter.eq(led_counter + 1)
-        self.comb += platform.request("user_led_n", 0).eq(led_counter[26])
-
-        #self.comb += platform.request("debug", 0).eq(led_counter[26])
-        self.comb += platform.request("j1", 0).eq(led_counter[27])
-        self.comb += platform.request("j1", 1).eq(led_counter[26])
-        self.comb += platform.request("j1", 2).eq(led_counter[25])
+        self.submodules.led = _led(platform, sys_clk_freq)
 # EtherboneSoC -------------------------------------------------------------------------------------
 
 class EtherboneSoC(BaseSoC):
