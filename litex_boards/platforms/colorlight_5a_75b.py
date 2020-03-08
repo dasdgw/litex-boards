@@ -94,6 +94,15 @@ _io_v7_0 = [ # Documented by @miek
     ("user_btn_n", 0, Pins("M13"), IOStandard("LVCMOS33")),
 
     # sdram (M12616161A)
+    # spi flash (25Q32JVSIQ)
+    ("spiflash", 0,
+        Subsignal("cs_n", Pins("N8")),
+        Subsignal("clk",  Pins("N9")),
+        Subsignal("mosi", Pins("T8")),
+        Subsignal("miso", Pins("T7")),
+        IOStandard("LVCMOS33"),
+    ),
+
     ("sdram_clock", 0, Pins("C6"), IOStandard("LVCMOS33")),
     ("sdram", 0,
         Subsignal("a", Pins(
