@@ -93,7 +93,6 @@ _io_v7_0 = [ # Documented by @miek
     # btn
     ("user_btn_n", 0, Pins("M13"), IOStandard("LVCMOS33")),
 
-    # sdram (M12616161A)
     # spi flash (25Q32JVSIQ)
     ("spiflash", 0,
         Subsignal("cs_n", Pins("N8")),
@@ -103,6 +102,7 @@ _io_v7_0 = [ # Documented by @miek
         IOStandard("LVCMOS33"),
     ),
 
+    # sdram (W9816G6JH-6) winbond  ! different chip than documented
     ("sdram_clock", 0, Pins("C6"), IOStandard("LVCMOS33")),
     ("sdram", 0,
         Subsignal("a", Pins(
