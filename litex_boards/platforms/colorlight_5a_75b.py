@@ -211,6 +211,28 @@ connectorsNG = [
 #    ("j7", 0, Pins("H13 J13 H12 G14 H14 G15 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
 #    ("j8", 0, Pins("A15 F16 A14 E13 B14 A13 F15 L2 K1 J5 K2 B16 J14 F12"), IOStandard("LVCMOS33")),
 ]
+
+_hub75 = [
+    ("hub75", 0,
+        Subsignal("R0",   Pins("j1:0")),
+        Subsignal("G0",   Pins("j1:1")),
+        Subsignal("B0",   Pins("j1:2")),
+        Subsignal("R1",   Pins("j1:4")),
+        Subsignal("G1",   Pins("j1:5")),
+        Subsignal("B1",   Pins("j1:6")),
+        Subsignal("E",   Pins("j1:7")),
+        Subsignal("A",   Pins("j1:8")),
+        Subsignal("B",   Pins("j1:9")),
+        Subsignal("C",   Pins("j1:10")),
+        Subsignal("D",   Pins("j1:11")),
+        Subsignal("CLK",   Pins("j1:12")),
+        Subsignal("STB",   Pins("j1:13")),
+        Subsignal("OE",   Pins("j1:14")),
+        IOStandard("LVCMOS33")
+    ),
+]
+
+
 # Platform -----------------------------------------------------------------------------------------
 
 class Platform(LatticePlatform):
@@ -226,3 +248,4 @@ class Platform(LatticePlatform):
         LatticePlatform.__init__(self, device, io, connectors=connectors, toolchain="trellis")
         #self.add_extension(_debug)
         self.add_extension(connectorsNG)
+        self.add_extension(_hub75)
