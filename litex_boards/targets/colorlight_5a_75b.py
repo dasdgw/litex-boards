@@ -25,6 +25,8 @@ import sys
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
+from litex.soc.doc import generate_docs, generate_svd
+
 from litex_boards.platforms import colorlight_5a_75b
 
 from litex.build.lattice.trellis import trellis_args, trellis_argdict
@@ -176,6 +178,8 @@ def main():
     else:
         vns=builder.build()
     soc.do_exit(vns)
+    generate_docs(soc, "build/documentation")
+    generate_svd(soc, "build/software")
 
 if __name__ == "__main__":
     main()
