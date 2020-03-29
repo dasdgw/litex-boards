@@ -6,9 +6,11 @@
 import argparse
 
 from migen import *
+from migen.genlib.io import DDROutput
 
 from litex_boards.platforms import linsn_rv901t
 
+from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc_sdram import *
 from litex.soc.integration.builder import *
 from litex.soc.cores.clock import S6PLL
@@ -34,32 +36,36 @@ class _CRG(Module):
         self.submodules.pll = pll = S6PLL(speedgrade=-2)
         pll.register_clkin(clk25, 25e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
-        pll.create_clkout(self.cd_sys_ps, sys_clk_freq, phase=270)
+        pll.create_clkout(self.cd_sys_ps, sys_clk_freq, phase=90)
 
-        self.specials += Instance("ODDR2",
-            p_DDR_ALIGNMENT="NONE",
-            p_INIT=0, p_SRTYPE="SYNC",
-            i_D0=0, i_D1=1, i_S=0, i_R=0, i_CE=1,
-            i_C0=self.cd_sys.clk, i_C1=~self.cd_sys.clk,
-            o_Q=platform.request("sdram_clock"))
+        # SDRAM clock
+        self.specials += DDROutput(0, 1, platform.request("sdram_clock"), ClockSignal("sys_ps"))
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
-class BaseSoC(SoCSDRAM):
+class BaseSoC(SoCCore):
     def __init__(self, **kwargs):
         platform     = linsn_rv901t.Platform()
         sys_clk_freq = int(75e6)
 
-        # SoCSDRAM ---------------------------------------------------------------------------------
-        SoCSDRAM.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
 
         # SDR SDRAM --------------------------------------------------------------------------------
-        self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"))
-        sdram_module = M12L64322A(sys_clk_freq, "1:1")
-        self.register_sdram(self.sdrphy, sdram_module.geom_settings, sdram_module.timing_settings)
+        if not self.integrated_main_ram_size:
+            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), cmd_latency=2)
+            self.add_sdram("sdram",
+                phy                     = self.sdrphy,
+                module                  = M12L64322A(sys_clk_freq, "1:1"),
+                origin                  = self.mem_map["main_ram"],
+                size                    = kwargs.get("max_sdram_size", 0x40000000),
+                l2_cache_size           = kwargs.get("l2_size", 8192),
+                l2_cache_min_data_width = kwargs.get("min_l2_data_width", 128),
+                l2_cache_reverse        = True
+            )
 
 # EthernetSoC --------------------------------------------------------------------------------------
 

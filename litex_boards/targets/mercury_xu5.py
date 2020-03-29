@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 
-# This file is Copyright (c) 2020 Mark Standke <mstandke@cern.ch>
+# This file is Copyright (c) 2020 Antmicro <www.antmicro.com>
 # License: BSD
 
 import argparse
 
 from migen import *
+from migen.genlib.io import CRG
 
-from litex.boards.platforms import kx2
+from litex_boards.platforms import mercury_xu5
 
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc_sdram import *
 from litex.soc.integration.builder import *
 
-from litedram.modules import H5TC4G63CFR
-from litedram.phy import s7ddrphy
-
+from litedram.modules import MT40A256M16
+from litedram.phy import usddrphy
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -24,25 +24,33 @@ class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_sys4x  = ClockDomain(reset_less=True)
-        self.clock_domains.cd_clk200 = ClockDomain()
+        self.clock_domains.cd_pll4x  = ClockDomain(reset_less=True)
+        self.clock_domains.cd_clk500 = ClockDomain()
 
         # # #
 
-        self.submodules.pll = pll = S7MMCM(speedgrade=-2)
-        self.comb += pll.reset.eq(~platform.request("cpu_reset_n"))
-        pll.register_clkin(platform.request("clk200"), 200e6)
-        pll.create_clkout(self.cd_sys,    sys_clk_freq)
-        pll.create_clkout(self.cd_sys4x,  4*sys_clk_freq)
-        pll.create_clkout(self.cd_clk200, 200e6)
+        self.submodules.pll = pll = USMMCM(speedgrade=-1)
+        pll.register_clkin(platform.request("clk100"), 100e6)
 
-        self.submodules.idelayctrl = S7IDELAYCTRL(self.cd_clk200)
+        pll.create_clkout(self.cd_pll4x, sys_clk_freq*4, buf=None, with_reset=False)
+        pll.create_clkout(self.cd_clk500, 500e6, with_reset=False)
 
+        self.specials += [
+            Instance("BUFGCE_DIV", name="main_bufgce_div",
+                p_BUFGCE_DIVIDE=4,
+                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys.clk),
+            Instance("BUFGCE", name="main_bufgce",
+                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
+            AsyncResetSynchronizer(self.cd_clk500, ~pll.locked),
+        ]
+
+        self.submodules.idelayctrl = USIDELAYCTRL(cd_ref=self.cd_clk500, cd_sys=self.cd_sys)
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
     def __init__(self, sys_clk_freq=int(125e6), **kwargs):
-        platform = kx2.Platform()
+        platform = mercury_xu5.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
@@ -50,16 +58,19 @@ class BaseSoC(SoCCore):
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
 
-        # DDR3 SDRAM -------------------------------------------------------------------------------
+        # DDR4 SDRAM -------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.ddrphy = s7ddrphy.K7DDRPHY(platform.request("ddram"),
-                memtype      = "DDR3",
-                nphases      = 4,
-                sys_clk_freq = sys_clk_freq)
+            self.submodules.ddrphy = usddrphy.USPDDRPHY(platform.request("ddram"),
+                memtype          = "DDR4",
+                sys_clk_freq     = sys_clk_freq,
+                iodelay_clk_freq = 500e6,
+                cmd_latency      = 0)
             self.add_csr("ddrphy")
+            self.add_constant("USDDRPHY")
+            self.add_constant("USDDRPHY_DEBUG")
             self.add_sdram("sdram",
                 phy                     = self.ddrphy,
-                module                  = H5TC4G63CFR(sys_clk_freq, "1:4"),
+                module                  = MT40A256M16(sys_clk_freq, "1:4"),
                 origin                  = self.mem_map["main_ram"],
                 size                    = kwargs.get("max_sdram_size", 0x40000000),
                 l2_cache_size           = kwargs.get("l2_size", 8192),
@@ -70,7 +81,7 @@ class BaseSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on KX2")
+    parser = argparse.ArgumentParser(description="LiteX SoC on Enclustra's Mercury XU5")
     builder_args(parser)
     soc_sdram_args(parser)
     args = parser.parse_args()

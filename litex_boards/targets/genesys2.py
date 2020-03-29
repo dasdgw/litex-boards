@@ -10,6 +10,7 @@ from migen import *
 from litex_boards.platforms import genesys2
 
 from litex.soc.cores.clock import *
+from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc_sdram import *
 from litex.soc.integration.builder import *
 
@@ -17,7 +18,6 @@ from litedram.modules import MT41J256M16
 from litedram.phy import s7ddrphy
 
 from liteeth.phy.s7rgmii import LiteEthPHYRGMII
-from liteeth.mac import LiteEthMAC
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -40,12 +40,12 @@ class _CRG(Module):
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
-class BaseSoC(SoCSDRAM):
-    def __init__(self, sys_clk_freq=int(125e6), **kwargs):
+class BaseSoC(SoCCore):
+    def __init__(self, sys_clk_freq=int(125e6), with_ethernet=False, with_etherbone=False, **kwargs):
         platform = genesys2.Platform()
 
-        # SoCSDRAM ---------------------------------------------------------------------------------
-        SoCSDRAM.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
@@ -57,45 +57,31 @@ class BaseSoC(SoCSDRAM):
                 nphases      = 4,
                 sys_clk_freq = sys_clk_freq)
             self.add_csr("ddrphy")
-            sdram_module = MT41J256M16(self.clk_freq, "1:4")
-            self.register_sdram(self.ddrphy,
-                geom_settings       = sdram_module.geom_settings,
-                timing_settings     = sdram_module.timing_settings)
-
-# EthernetSoC --------------------------------------------------------------------------------------
-
-class EthernetSoC(BaseSoC):
-    mem_map = {
-        "ethmac": 0xb0000000,
-    }
-    mem_map.update(BaseSoC.mem_map)
-
-    def __init__(self, **kwargs):
-        BaseSoC.__init__(self, **kwargs)
+            self.add_sdram("sdram",
+                phy                     = self.ddrphy,
+                module                  = MT41J256M16(sys_clk_freq, "1:4"),
+                origin                  = self.mem_map["main_ram"],
+                size                    = kwargs.get("max_sdram_size", 0x40000000),
+                l2_cache_size           = kwargs.get("l2_size", 8192),
+                l2_cache_min_data_width = kwargs.get("min_l2_data_width", 128),
+                l2_cache_reverse        = True
+            )
 
         # Ethernet ---------------------------------------------------------------------------------
-        # phy
-        self.submodules.ethphy = LiteEthPHYRGMII(
-            clock_pads = self.platform.request("eth_clocks"),
-            pads       = self.platform.request("eth"))
-        self.add_csr("ethphy")
-        # mac
-        self.submodules.ethmac = LiteEthMAC(
-            phy        = self.ethphy,
-            dw         = 32,
-            interface  = "wishbone",
-            endianness = self.cpu.endianness)
-        self.add_wb_slave(self.mem_map["ethmac"], self.ethmac.bus, 0x2000)
-        self.add_memory_region("ethmac", self.mem_map["ethmac"], 0x2000, type="io")
-        self.add_csr("ethmac")
-        self.add_interrupt("ethmac")
-        # timing constraints
-        self.platform.add_period_constraint(self.ethphy.crg.cd_eth_rx.clk, 1e9/125e6)
-        self.platform.add_period_constraint(self.ethphy.crg.cd_eth_tx.clk, 1e9/125e6)
-        self.platform.add_false_path_constraints(
-            self.crg.cd_sys.clk,
-            self.ethphy.crg.cd_eth_rx.clk,
-            self.ethphy.crg.cd_eth_tx.clk)
+        if with_ethernet:
+            self.submodules.ethphy = LiteEthPHYRGMII(
+                clock_pads = self.platform.request("eth_clocks"),
+                pads       = self.platform.request("eth"))
+            self.add_csr("ethphy")
+            self.add_ethernet(phy=self.ethphy)
+
+        # Etherbone --------------------------------------------------------------------------------
+        if with_etherbone:
+            self.submodules.ethphy = LiteEthPHYRGMII(
+                clock_pads = self.platform.request("eth_clocks"),
+                pads       = self.platform.request("eth"))
+            self.add_csr("ethphy")
+            self.add_etherbone(phy=self.ethphy)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -103,12 +89,13 @@ def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Genesys2")
     builder_args(parser)
     soc_sdram_args(parser)
-    parser.add_argument("--with-ethernet", action="store_true",
-                        help="enable Ethernet support")
+    parser.add_argument("--with-ethernet",  action="store_true", help="enable Ethernet support")
+    parser.add_argument("--with-etherbone", action="store_true", help="enable Etherbone support")
     args = parser.parse_args()
 
-    cls = EthernetSoC if args.with_ethernet else BaseSoC
-    soc = cls(**soc_sdram_argdict(args))
+    assert not (args.with_ethernet and args.with_etherbone)
+    soc = BaseSoC(with_ethernet=args.with_ethernet, with_etherbone=args.with_etherbone,
+        **soc_sdram_argdict(args))
     builder = Builder(soc, **builder_argdict(args))
     builder.build()
 

@@ -22,7 +22,7 @@ from litedram.phy import GENSDRPHY
 class _CRG(Module):
     def __init__(self, platform, with_sdram=False):
         self.clock_domains.cd_sys    = ClockDomain()
-        self.clock_domains.cd_sys_ps = ClockDomain()
+        self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
 
         # # #
 
@@ -43,7 +43,7 @@ class _CRG(Module):
                 p_CLK1_DIVIDE_BY         = 1,
                 p_CLK1_DUTY_CYCLE        = 50,
                 p_CLK1_MULTIPLY_BY       = 1,
-                p_CLK1_PHASE_SHIFT       = "-10000",
+                p_CLK1_PHASE_SHIFT       = "5000", # 90°
                 p_COMPENSATE_CLOCK       = "CLK0",
                 p_INCLK0_INPUT_FREQUENCY = 20000,
                 p_OPERATION_MODE         = "NORMAL",
@@ -61,10 +61,7 @@ class _CRG(Module):
             self.cd_sys.clk.eq(pll_clk_out[0]),
             self.cd_sys_ps.clk.eq(pll_clk_out[1]),
         ]
-        self.specials += [
-            AsyncResetSynchronizer(self.cd_sys,    ~pll_locked),
-            AsyncResetSynchronizer(self.cd_sys_ps, ~pll_locked)
-        ]
+        self.specials += AsyncResetSynchronizer(self.cd_sys, ~pll_locked)
 
         if with_sdram:
             self.comb += platform.request("sdram_clock").eq(self.cd_sys_ps.clk)
@@ -84,13 +81,13 @@ class BaseSoC(SoCCore):
 
 # MiSTerSDRAMSoC -----------------------------------------------------------------------------------
 
-class MiSTerSDRAMSoC(SoCSDRAM):
+class MiSTerSDRAMSoC(SoCCore):
     def __init__(self, sys_clk_freq=int(50e6), **kwargs):
         assert sys_clk_freq == int(50e6)
         platform = de10nano.Platform()
 
-        # SoCSDRAM ---------------------------------------------------------------------------------
-        SoCSDRAM.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, with_sdram=True)
@@ -98,10 +95,15 @@ class MiSTerSDRAMSoC(SoCSDRAM):
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
             self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"))
-            sdram_module = AS4C16M16(self.clk_freq, "1:1")
-            self.register_sdram(self.sdrphy,
-                geom_settings   = sdram_module.geom_settings,
-                timing_settings = sdram_module.timing_settings)
+            self.add_sdram("sdram",
+                phy                     = self.sdrphy,
+                module                  = AS4C16M16(self.clk_freq, "1:1"),
+                origin                  = self.mem_map["main_ram"],
+                size                    = kwargs.get("max_sdram_size", 0x40000000),
+                l2_cache_size           = kwargs.get("l2_size", 8192),
+                l2_cache_min_data_width = kwargs.get("min_l2_data_width", 128),
+                l2_cache_reverse        = True
+            )
 
 # Build --------------------------------------------------------------------------------------------
 

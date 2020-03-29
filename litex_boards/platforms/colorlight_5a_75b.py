@@ -232,6 +232,14 @@ _hub75 = [
     ),
 ]
 
+serial = [
+    ("serial", 0,
+        Subsignal("tx", Pins("P11")), # user_led_n
+        Subsignal("rx", Pins("M13")), # user_btn_n
+        IOStandard("LVCMOS33")
+    ),
+]
+
 
 # Platform -----------------------------------------------------------------------------------------
 

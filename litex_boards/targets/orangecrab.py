@@ -13,16 +13,17 @@ from litex_boards.platforms import orangecrab
 from litex.build.lattice.trellis import trellis_args, trellis_argdict
 
 from litex.soc.cores.clock import *
+from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc_sdram import *
 from litex.soc.integration.builder import *
 
-from litedram.modules import MT41K64M16
+from litedram.modules import MT41K64M16, MT41K128M16, MT41K256M16
 from litedram.phy import ECP5DDRPHY
 
 # _CRG ---------------------------------------------------------------------------------------------
 
 class _CRG(Module):
-    def __init__(self, platform, sys_clk_freq):
+    def __init__(self, platform, sys_clk_freq, with_usb_pll=False):
         self.clock_domains.cd_init     = ClockDomain()
         self.clock_domains.cd_por      = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys      = ClockDomain()
@@ -56,8 +57,7 @@ class _CRG(Module):
             Instance("ECLKBRIDGECS",
                 i_CLK0   = self.cd_sys2x_i.clk,
                 i_SEL    = 0,
-                o_ECSOUT = sys2x_clk_ecsout,
-            ),
+                o_ECSOUT = sys2x_clk_ecsout),
             Instance("ECLKSYNCB",
                 i_ECLKI = sys2x_clk_ecsout,
                 i_STOP  = self.stop,
@@ -72,41 +72,79 @@ class _CRG(Module):
             AsyncResetSynchronizer(self.cd_sys,  ~por_done | ~pll.locked)
         ]
 
+        # USB PLL
+        if with_usb_pll:
+            self.clock_domains.cd_usb_12 = ClockDomain()
+            self.clock_domains.cd_usb_48 = ClockDomain()
+            usb_pll = ECP5PLL()
+            self.submodules += usb_pll
+            usb_pll.register_clkin(clk48, 48e6)
+            usb_pll.create_clkout(self.cd_usb_48, 48e6)
+            usb_pll.create_clkout(self.cd_usb_12, 12e6)
+
 # BaseSoC ------------------------------------------------------------------------------------------
 
-class BaseSoC(SoCSDRAM):
+class BaseSoC(SoCCore):
     def __init__(self, sys_clk_freq=int(48e6), toolchain="trellis", **kwargs):
-        platform = orangecrab.Platform(toolchain=toolchain)
+        # Board Revision ---------------------------------------------------------------------------
+        revision = kwargs.get("revision", "0.2")
+        device = kwargs.get("device", "25F")
+        platform = orangecrab.Platform(revision=revision, device=device ,toolchain=toolchain)
 
-        # SoCSDRAM ---------------------------------------------------------------------------------
-        SoCSDRAM.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
+        # Serial -----------------------------------------------------------------------------------
+        platform.add_extension(orangecrab.feather_serial)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        with_usb_pll = kwargs.get("uart_name", None) == "usb_cdc"
+        self.submodules.crg = _CRG(platform, sys_clk_freq, with_usb_pll)
 
         # DDR3 SDRAM -------------------------------------------------------------------------------
-        self.submodules.ddrphy = ECP5DDRPHY(
-            platform.request("ddram"),
-            sys_clk_freq=sys_clk_freq)
-        self.add_csr("ddrphy")
-        self.add_constant("ECP5DDRPHY", None)
-        self.comb += self.crg.stop.eq(self.ddrphy.init.stop)
-        sdram_module = MT41K64M16(sys_clk_freq, "1:2")
-        self.register_sdram(self.ddrphy,
-            geom_settings   = sdram_module.geom_settings,
-            timing_settings = sdram_module.timing_settings)
+        if not self.integrated_main_ram_size:
+            available_sdram_modules = {
+                'MT41K64M16': MT41K64M16,
+                'MT41K128M16': MT41K128M16,
+                'MT41K256M16': MT41K256M16,
+#                'MT41K512M16': MT41K512M16
+            }
+            sdram_module = available_sdram_modules.get(
+                kwargs.get("sdram_device", "MT41K64M16"))
+
+            self.submodules.ddrphy = ECP5DDRPHY(
+                platform.request("ddram"),
+                sys_clk_freq=sys_clk_freq)
+            self.add_csr("ddrphy")
+            self.add_constant("ECP5DDRPHY")
+            self.comb += self.crg.stop.eq(self.ddrphy.init.stop)
+            self.add_sdram("sdram",
+                phy                     = self.ddrphy,
+                module                  = sdram_module(sys_clk_freq, "1:2"),
+                origin                  = self.mem_map["main_ram"],
+                size                    = kwargs.get("max_sdram_size", 0x40000000),
+                l2_cache_size           = kwargs.get("l2_size", 8192),
+                l2_cache_min_data_width = kwargs.get("min_l2_data_width", 128),
+                l2_cache_reverse        = True
+            )
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on OrangeCrab")
     parser.add_argument("--gateware-toolchain", dest="toolchain", default="trellis",
-        help="gateware toolchain to use, diamond (default) or  trellis")
+        help="gateware toolchain to use, trellis (default) or diamond")
     builder_args(parser)
     soc_sdram_args(parser)
     trellis_args(parser)
     parser.add_argument("--sys-clk-freq", default=48e6,
                         help="system clock frequency (default=48MHz)")
+    parser.add_argument("--revision", default="0.2",
+                        help="Board Revision {0.1, 0.2} (default=0.2)")
+    parser.add_argument("--device", default="25F",
+                        help="ECP5 device (default=25F)")
+    parser.add_argument("--sdram-device", default="MT41K64M16",
+                        help="ECP5 device (default=MT41K64M16)")
     args = parser.parse_args()
 
     soc = BaseSoC(toolchain=args.toolchain, sys_clk_freq=int(float(args.sys_clk_freq)), **soc_sdram_argdict(args))

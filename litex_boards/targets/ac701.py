@@ -11,6 +11,7 @@ from migen import *
 from litex_boards.platforms import ac701
 
 from litex.soc.cores.clock import *
+from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc_sdram import *
 from litex.soc.integration.builder import *
 
@@ -20,7 +21,6 @@ from litedram.phy import s7ddrphy
 from liteeth.phy.a7_gtp import QPLLSettings, QPLL
 from liteeth.phy.a7_1000basex import A7_1000BASEX
 from liteeth.phy.s7rgmii import LiteEthPHYRGMII
-from liteeth.mac import LiteEthMAC
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -45,12 +45,12 @@ class _CRG(Module):
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
-class BaseSoC(SoCSDRAM):
-    def __init__(self, sys_clk_freq=int(100e6), **kwargs):
+class BaseSoC(SoCCore):
+    def __init__(self, sys_clk_freq=int(100e6), with_ethernet=False, ethernet_phy="rgmii", **kwargs):
         platform = ac701.Platform()
 
-        # SoCSDRAM ---------------------------------------------------------------------------------
-        SoCSDRAM.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, clk_freq=sys_clk_freq, **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
@@ -62,78 +62,53 @@ class BaseSoC(SoCSDRAM):
                 nphases      = 4,
                 sys_clk_freq = sys_clk_freq)
             self.add_csr("ddrphy")
-            sdram_module = MT8JTF12864(sys_clk_freq, "1:4")
-            self.register_sdram(self.ddrphy,
-                geom_settings   = sdram_module.geom_settings,
-                timing_settings = sdram_module.timing_settings)
+            self.add_sdram("sdram",
+                phy                     = self.ddrphy,
+                module                  = MT8JTF12864(sys_clk_freq, "1:4"),
+                origin                  = self.mem_map["main_ram"],
+                size                    = kwargs.get("max_sdram_size", 0x40000000),
+                l2_cache_size           = kwargs.get("l2_size", 8192),
+                l2_cache_min_data_width = kwargs.get("min_l2_data_width", 128),
+                l2_cache_reverse        = True
+            )
 
-# EthernetSoC --------------------------------------------------------------------------------------
+        # Ethernet ---------------------------------------------------------------------------------
+        if with_ethernet:
+            # RGMII Ethernet PHY -------------------------------------------------------------------
+            if ethernet_phy == "rgmii":
+                # phy
+                self.submodules.ethphy = LiteEthPHYRGMII(
+                    clock_pads = self.platform.request("eth_clocks"),
+                    pads       = self.platform.request("eth"))
+                self.add_csr("ethphy")
 
-class EthernetSoC(BaseSoC):
-    mem_map = {
-        "ethmac": 0xb0000000,
-    }
-    mem_map.update(BaseSoC.mem_map)
+            # 1000BaseX Ethernet PHY ---------------------------------------------------------------
+            if ethernet_phy == "1000basex":
+                # phy
+                self.comb += self.platform.request("sfp_mgt_clk_sel0", 0).eq(0)
+                self.comb += self.platform.request("sfp_mgt_clk_sel1", 0).eq(0)
+                self.comb += self.platform.request("sfp_tx_disable_n", 0).eq(0)
+                qpll_settings = QPLLSettings(
+                    refclksel  = 0b001,
+                    fbdiv      = 4,
+                    fbdiv_45   = 5,
+                    refclk_div = 1)
+                refclk125 = self.platform.request("gtp_refclk")
+                refclk125_se = Signal()
+                self.specials += \
+                    Instance("IBUFDS_GTE2",
+                        i_CEB = 0,
+                        i_I   = refclk125.p,
+                        i_IB  = refclk125.n,
+                        o_O   = refclk125_se)
+                qpll = QPLL(refclk125_se, qpll_settings)
+                self.submodules += qpll
+                self.submodules.ethphy = A7_1000BASEX(
+                    qpll_channel = qpll.channels[0],
+                    data_pads    = self.platform.request("sfp", 0),
+                    sys_clk_freq = self.clk_freq)
 
-    def __init__(self, phy="rgmii", **kwargs):
-        assert phy in ["rgmii", "1000basex"]
-        BaseSoC.__init__(self, **kwargs)
-
-        # RGMII Ethernet PHY -----------------------------------------------------------------------
-        if phy == "rgmii":
-            # phy
-            self.submodules.ethphy = LiteEthPHYRGMII(
-                clock_pads = self.platform.request("eth_clocks"),
-                pads       = self.platform.request("eth"))
-            self.add_csr("ethphy")
-            # timing constraints
-            self.platform.add_period_constraint(self.ethphy.crg.cd_eth_rx.clk, 1e9/125e6)
-            self.platform.add_period_constraint(self.ethphy.crg.cd_eth_tx.clk, 1e9/125e6)
-            self.platform.add_false_path_constraints(
-                self.crg.cd_sys.clk,
-                self.ethphy.crg.cd_eth_rx.clk,
-                self.ethphy.crg.cd_eth_tx.clk)
-
-        # 1000BaseX Ethernet PHY -------------------------------------------------------------------
-        if phy == "1000basex":
-            # phy
-            self.comb += self.platform.request("sfp_mgt_clk_sel0", 0).eq(0)
-            self.comb += self.platform.request("sfp_mgt_clk_sel1", 0).eq(0)
-            self.comb += self.platform.request("sfp_tx_disable_n", 0).eq(0)
-            qpll_settings = QPLLSettings(
-                refclksel  = 0b001,
-                fbdiv      = 4,
-                fbdiv_45   = 5,
-                refclk_div = 1)
-            refclk125 = self.platform.request("gtp_refclk")
-            refclk125_se = Signal()
-            self.specials += \
-                Instance("IBUFDS_GTE2",
-                    i_CEB = 0,
-                    i_I   = refclk125.p,
-                    i_IB  = refclk125.n,
-                    o_O   = refclk125_se)
-            qpll = QPLL(refclk125_se, qpll_settings)
-            self.submodules += qpll
-            self.submodules.ethphy = A7_1000BASEX(qpll.channels[0], self.platform.request("sfp", 0), self.clk_freq)
-            # timing constraints
-            self.platform.add_period_constraint(self.ethphy.txoutclk, 1e9/62.5e6)
-            self.platform.add_period_constraint(self.ethphy.rxoutclk, 1e9/62.5e6)
-            self.platform.add_false_path_constraints(
-                self.crg.cd_sys.clk,
-                self.ethphy.txoutclk,
-                self.ethphy.rxoutclk)
-
-        # Ethernet MAC -----------------------------------------------------------------------------
-        self.submodules.ethmac = LiteEthMAC(
-            phy        = self.ethphy,
-            dw         = 32,
-            interface  = "wishbone",
-            endianness = self.cpu.endianness)
-        self.add_memory_region("ethmac", self.mem_map["ethmac"], 0x2000, type="io")
-        self.add_wb_slave(self.mem_map["ethmac"], self.ethmac.bus, 0x2000)
-        self.add_csr("ethmac")
-        self.add_interrupt("ethmac")
+            self.add_ethernet(phy=self.ethphy)
 
 # Build --------------------------------------------------------------------------------------------
 def main():
@@ -146,10 +121,9 @@ def main():
                         help="select Ethernet PHY (rgmii or 1000basex)")
     args = parser.parse_args()
 
-    if args.with_ethernet:
-        soc = EthernetSoC(args.ethernet_phy, **soc_sdram_argdict(args))
-    else:
-        soc = BaseSoC(**soc_sdram_argdict(args))
+    soc = BaseSoC(with_ethernet=args.with_ethernet,
+        ethernet_phy=args.ethernet_phy,
+        **soc_sdram_argdict(args))
     builder = Builder(soc, **builder_argdict(args))
     builder.build()
 
