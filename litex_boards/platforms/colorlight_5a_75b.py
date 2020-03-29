@@ -96,7 +96,7 @@ _io_v7_0 = [ # Documented by @miek
     # spi flash (25Q32JVSIQ)
     ("spiflash", 0,
         Subsignal("cs_n", Pins("N8")),
-        Subsignal("clk",  Pins("N9")),
+        #Subsignal("clk",  Pins("N9")), # Clock needs to be accessed through USRMCLK
         Subsignal("mosi", Pins("T8")),
         Subsignal("miso", Pins("T7")),
         IOStandard("LVCMOS33"),
