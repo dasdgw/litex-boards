@@ -76,8 +76,8 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, revision, **kwargs):
-        platform     = colorlight_5a_75b.Platform(revision=revision)
+    def __init__(self, revision, toolchain, **kwargs):
+        platform     = colorlight_5a_75b.Platform(revision=revision, toolchain=toolchain)
         sys_clk_freq = int(125e6)
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -151,6 +151,8 @@ def main():
     soc_core_args(parser)
     trellis_args(parser)
     parser.add_argument("--revision", default="7.0", type=str, help="Board revision 7.0 (default) or 6.1")
+    parser.add_argument("--gateware-toolchain", dest="toolchain", default="trellis",
+        help="gateware toolchain to use, trellis (default) or diamond")
     parser.add_argument("--with-etherbone", action="store_true", help="enable Etherbone support")
     parser.add_argument("--eth-phy", default=0, type=int, help="Ethernet PHY 0 or 1 (default=0)")
     parser.add_argument("--load", action="store_true", help="load bitstream")
@@ -164,11 +166,16 @@ def main():
         sim()
 
     if args.with_etherbone:
-        soc = EtherboneSoC(eth_phy=args.eth_phy, revision=args.revision, **soc_core_argdict(args))
+        soc = EtherboneSoC(eth_phy=args.eth_phy, revision=args.revision, toolchain=args.toolchain, **soc_core_argdict(args))
     else:
-        soc = BaseSoC(args.revision, **soc_core_argdict(args))
+        soc = BaseSoC(args.revision, toolchain=args.toolchain,**soc_core_argdict(args))
     builder = Builder(soc, **builder_argdict(args))
-    builder.build(**trellis_argdict(args))
+    # für diamond toolchain ohne trellis_argdict?
+    if args.toolchain == "trellis":
+        vns=builder.build(**trellis_argdict(args))
+    else:
+        vns=builder.build()
+    soc.do_exit(vns)
 
 if __name__ == "__main__":
     main()
