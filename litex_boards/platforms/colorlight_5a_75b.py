@@ -232,12 +232,13 @@ _hub75 = [
     ),
 ]
 
+# use led and btn as uart
 serial = [
     ("serial", 0,
         Subsignal("tx", Pins("P11")), # user_led_n
         Subsignal("rx", Pins("M13")), # user_btn_n
         IOStandard("LVCMOS33")
-    ),
+    )
 ]
 
 
