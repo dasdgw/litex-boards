@@ -62,6 +62,8 @@ class _CRG(Module):
     def __init__(self, platform, sys_clk_freq):
         self.clock_domains.cd_sys    = ClockDomain()
         self.clock_domains.cd_sys_ps = ClockDomain()
+        #self.clock_domains.cd_sys_125 = ClockDomain(reset_less=True)
+
 
         # # #
 
@@ -76,6 +78,7 @@ class _CRG(Module):
         pll.register_clkin(clk25, 25e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq, phase=11)
         pll.create_clkout(self.cd_sys_ps, sys_clk_freq, phase=20)
+        #pll.create_clkout(self.cd_sys_125, 125e6)
         #self.specials += AsyncResetSynchronizer(self.cd_sys, ~pll.locked | ~rst_n)
         self.specials += AsyncResetSynchronizer(self.cd_sys, ~pll.locked)
 
