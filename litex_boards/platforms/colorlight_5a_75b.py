@@ -102,7 +102,7 @@ _io_v7_0 = [ # Documented by @miek
         IOStandard("LVCMOS33"),
     ),
 
-    # sdram (W9816G6JH-6) winbond  ! different chip than documented
+    # sdram (M12616161A or W9816G6JH-6)
     ("sdram_clock", 0, Pins("C6"), IOStandard("LVCMOS33")),
     ("sdram", 0,
         Subsignal("a", Pins(
