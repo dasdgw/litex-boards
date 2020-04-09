@@ -19,6 +19,7 @@
 # ./colorlight_5a_75b.py --uart-name=stub --csr-csv=csr.csv
 # ./colorlight_5a_75b.py --load
 
+import os
 import argparse
 import sys
 
@@ -132,10 +133,9 @@ class BaseSoC(SoCCore):
             self.add_etherbone(phy=self.ethphy)
 
 
-# Load ---------------------------------------------------------------------------------------------
+# Load / Flash -------------------------------------------------------------------------------------
 
-def load():
-    import os
+def openocd_run_svf(filename):
     f = open("openocd.cfg", "w")
     f.write(
 """
@@ -148,8 +148,18 @@ adapter_khz 25000
 jtag newtap ecp5 tap -irlen 8 -expected-id 0x41111043
 """)
     f.close()
-    os.system("openocd -f openocd.cfg -c \"transport select jtag; init; svf soc_basesoc_colorlight_5a_75b/gateware/top.svf; exit\"")
-    exit()
+    os.system("openocd -f openocd.cfg -c \"transport select jtag; init; svf {}; exit\"".format(filename))
+    os.system("rm openocd.cfg")
+
+def load():
+    openocd_run_svf("soc_basesoc_colorlight_5a_75b/gateware/top.svf")
+
+def flash():
+    import os
+    os.system("cp bit_to_flash.py soc_basesoc_colorlight_5a_75b/gateware/")
+    os.system("cd soc_basesoc_colorlight_5a_75b/gateware && ./bit_to_flash.py top.bit top.svf.flash")
+    openocd_run_svf("soc_basesoc_colorlight_5a_75b/gateware/top.svf.flash")
+
 
 # sim ----------------------------------------------------------------------------------------------
 
@@ -171,14 +181,9 @@ def main():
     parser.add_argument("--with-etherbone", action="store_true", help="enable Etherbone support")
     parser.add_argument("--eth-phy", default=0, type=int, help="Ethernet PHY 0 or 1 (default=0)")
     parser.add_argument("--load", action="store_true", help="load bitstream")
+    parser.add_argument("--flash", action="store_true", help="flash bitstream")
     parser.add_argument("--sim", action="store_true", help="sim led (WIP)")
     args = parser.parse_args()
-
-    if args.load:
-        load()
-
-    if args.sim:
-        sim()
 
     assert not (args.with_ethernet and args.with_etherbone)
     soc = BaseSoC(revision = args.revision,
@@ -187,15 +192,25 @@ def main():
         with_etherbone = args.with_etherbone,
         **soc_core_argdict(args))
 
-    builder = Builder(soc, **builder_argdict(args))
-    # für diamond toolchain ohne trellis_argdict?
-    if args.toolchain == "trellis":
-        vns=builder.build(**trellis_argdict(args))
-    else:
-        vns=builder.build()
-    soc.do_exit(vns)
-    generate_docs(soc, "build/documentation")
-    generate_svd(soc, "build/software")
+    #builder = Builder(soc, **builder_argdict(args))
+    ## für diamond toolchain ohne trellis_argdict?
+    #if args.toolchain == "trellis":
+    #    vns=builder.build(**trellis_argdict(args))
+    #else:
+    #    vns=builder.build()
+    #soc.do_exit(vns)
+    #generate_docs(soc, "build/documentation")
+    ##generate_svd(soc, "build/software")
+
+    if args.load:
+        load()
+
+    if args.flash:
+        flash()
+
+    if args.sim:
+        sim()
+
 
 if __name__ == "__main__":
     main()
