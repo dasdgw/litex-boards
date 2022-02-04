@@ -4,6 +4,8 @@
 # Copyright (c) 2021 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+# Work-In-Progress...
+
 from litex.build.generic_platform import *
 from litex.build.xilinx import XilinxPlatform
 from litex.build.openocd import OpenOCD
@@ -59,6 +61,9 @@ _io = [
 # Platform -----------------------------------------------------------------------------------------
 
 class Platform(XilinxPlatform):
+    default_clk_name   = "debug"   # FIXME.
+    default_clk_period = 1e9/100e6 # FIXME.
+
     def __init__(self):
         XilinxPlatform.__init__(self, "xc7k70t-fbg676-1", _io, toolchain="vivado")
 

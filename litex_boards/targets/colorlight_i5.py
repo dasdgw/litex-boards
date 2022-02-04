@@ -19,10 +19,9 @@ from litex_boards.platforms import colorlight_i5
 from litex.build.lattice.trellis import trellis_args, trellis_argdict
 
 from litex.soc.cores.clock import *
-from litex.soc.cores.spi_flash import SpiFlash
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
-from litex.soc.cores.video import VideoECP5HDMIPHY
+from litex.soc.cores.video import VideoHDMIPHY
 from litex.soc.cores.led import LedChaser
 
 from litex.soc.interconnect.csr import *
@@ -98,8 +97,10 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    mem_map = {**SoCCore.mem_map, **{"spiflash": 0xd0000000}}
-    def __init__(self, board="i5", revision="7.0", sys_clk_freq=60e6, with_ethernet=False, with_etherbone=False, local_ip="", remote_ip="", eth_phy=0, use_internal_osc=False, sdram_rate="1:1", with_video_terminal=False, with_video_framebuffer=False, **kwargs):
+    def __init__(self, board="i5", revision="7.0", sys_clk_freq=60e6, with_ethernet=False,
+                 with_etherbone=False, local_ip="", remote_ip="", eth_phy=0, with_led_chaser=True, 
+                 use_internal_osc=False, sdram_rate="1:1", with_video_terminal=False,
+                 with_video_framebuffer=False, **kwargs):
         board = board.lower()
         assert board in ["i5"]
         if board == "i5":
@@ -107,8 +108,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, int(sys_clk_freq),
-            ident          = "LiteX SoC on Colorlight " + board.upper(),
-            ident_version  = True,
+            ident = "LiteX SoC on Colorlight " + board.upper(),
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -117,13 +117,14 @@ class BaseSoC(SoCCore):
         self.submodules.crg = _CRG(platform, sys_clk_freq, use_internal_osc=use_internal_osc, with_usb_pll=with_usb_pll, with_video_pll=with_video_pll, sdram_rate=sdram_rate)
 
         # Leds -------------------------------------------------------------------------------------
-        ledn = platform.request_all("user_led_n")
-        self.submodules.leds = LedChaser(pads=ledn, sys_clk_freq=sys_clk_freq)
+        if with_led_chaser:
+            ledn = platform.request_all("user_led_n")
+            self.submodules.leds = LedChaser(pads=ledn, sys_clk_freq=sys_clk_freq)
 
         # SPI Flash --------------------------------------------------------------------------------
-        self.add_spi_flash(mode="1x", dummy_cycles=8)
-        self.add_constant("SPIFLASH_PAGE_SIZE", 256)
-        self.add_constant("SPIFLASH_SECTOR_SIZE", 4096)
+        from litespi.modules import GD25Q16
+        from litespi.opcodes import SpiNorFlashOpCodes as Codes
+        self.add_spi_flash(mode="1x", module=GD25Q16(Codes.READ_1_1_1))
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
@@ -162,7 +163,7 @@ class BaseSoC(SoCCore):
 
         # Video ------------------------------------------------------------------------------------
         if with_video_terminal or with_video_framebuffer:
-            self.submodules.videophy = VideoECP5HDMIPHY(platform.request("gpdi"), clock_domain="hdmi")
+            self.submodules.videophy = VideoHDMIPHY(platform.request("gpdi"), clock_domain="hdmi")
             if with_video_terminal:
                 self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="hdmi")
             if with_video_framebuffer:
@@ -171,26 +172,26 @@ class BaseSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Colorlight i5")
-    parser.add_argument("--build",            action="store_true",      help="Build bitstream")
-    parser.add_argument("--load",             action="store_true",      help="Load bitstream")
-    parser.add_argument("--board",            default="i5",         help="Board type: i5 (default)")
-    parser.add_argument("--revision",         default="7.0", type=str,  help="Board revision: 7.0 (default)")
-    parser.add_argument("--sys-clk-freq",     default=60e6,             help="System clock frequency (default: 60MHz)")
+    parser = argparse.ArgumentParser(description="LiteX SoC on Colorlight I5")
+    parser.add_argument("--build",            action="store_true",      help="Build bitstream.")
+    parser.add_argument("--load",             action="store_true",      help="Load bitstream.")
+    parser.add_argument("--board",            default="i5",             help="Board type (i5).")
+    parser.add_argument("--revision",         default="7.0", type=str,  help="Board revision (7.0).")
+    parser.add_argument("--sys-clk-freq",     default=60e6,             help="System clock frequency.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",   action="store_true",      help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone",  action="store_true",      help="Enable Etherbone support")
-    parser.add_argument("--remote-ip",        default="192.168.1.100",  help="Remote IP address of TFTP server")
-    parser.add_argument("--local-ip",         default="192.168.1.50",   help="Local IP address")
+    ethopts.add_argument("--with-ethernet",   action="store_true",      help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone",  action="store_true",      help="Enable Etherbone support.")
+    parser.add_argument("--remote-ip",        default="192.168.1.100",  help="Remote IP address of TFTP server.")
+    parser.add_argument("--local-ip",         default="192.168.1.50",   help="Local IP address.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",  action="store_true",	help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",      action="store_true",	help="Enable SDCard support")
-    parser.add_argument("--eth-phy",          default=0, type=int,      help="Ethernet PHY: 0 (default) or 1")
-    parser.add_argument("--use-internal-osc", action="store_true",      help="Use internal oscillator")
-    parser.add_argument("--sdram-rate",       default="1:1",            help="SDRAM Rate: 1:1 Full Rate (default), 1:2 Half Rate")
+    sdopts.add_argument("--with-spi-sdcard",  action="store_true",	    help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",      action="store_true",	    help="Enable SDCard support.")
+    parser.add_argument("--eth-phy",          default=0, type=int,      help="Ethernet PHY (0 or 1).")
+    parser.add_argument("--use-internal-osc", action="store_true",      help="Use internal oscillator.")
+    parser.add_argument("--sdram-rate",       default="1:1",            help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI)")
-    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI)")
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI).")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)

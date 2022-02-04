@@ -78,7 +78,9 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), device="LFE5UM5G", with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50", eth_phy=0, toolchain="trellis", **kwargs):
+    def __init__(self, sys_clk_freq=int(75e6), device="LFE5UM5G", with_ethernet=False,
+                 with_etherbone=False, with_led_chaser=True, eth_ip="192.168.1.50", eth_phy=0,
+                 toolchain="trellis", **kwargs):
         platform = versa_ecp5.Platform(toolchain=toolchain, device=device)
 
         # FIXME: adapt integrated rom size for Microwatt
@@ -87,8 +89,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore -----------------------------------------_----------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Versa ECP5",
-            ident_version  = True,
+            ident = "LiteX SoC on Versa ECP5",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -120,24 +121,25 @@ class BaseSoC(SoCCore):
                 self.add_etherbone(phy=self.ethphy, ip_address=eth_ip)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Versa ECP5")
-    parser.add_argument("--build",           action="store_true",              help="Build bitstream")
-    parser.add_argument("--load",            action="store_true",              help="Load bitstream")
-    parser.add_argument("--toolchain",       default="trellis",                help="FPGA toolchain: trellis (default) or diamond")
-    parser.add_argument("--sys-clk-freq",    default=75e6,                     help="System clock frequency (default: 75MHz)")
-    parser.add_argument("--device",          default="LFE5UM5G",               help="FPGA device (LFE5UM5G (default) or LFE5UM)")
+    parser.add_argument("--build",           action="store_true",              help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true",              help="Load bitstream.")
+    parser.add_argument("--toolchain",       default="trellis",                help="FPGA toolchain (trellis or diamond).")
+    parser.add_argument("--sys-clk-freq",    default=75e6,                     help="System clock frequency.")
+    parser.add_argument("--device",          default="LFE5UM5G",               help="FPGA device (LFE5UM5G or LFE5UM).")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support")
-    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address")
-    parser.add_argument("--eth-phy",         default=0, type=int,              help="Ethernet PHY: 0 (default) or 1")
+    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support.")
+    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
+    parser.add_argument("--eth-phy",         default=0, type=int,              help="Ethernet PHY (0 or 1).")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)

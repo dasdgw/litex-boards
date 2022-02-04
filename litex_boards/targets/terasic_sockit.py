@@ -19,50 +19,8 @@ from litex.soc.cores.video import VideoVGAPHY
 
 from litex.build.io import DDROutput
 
-from litedram.modules import AS4C32M16
+from litedram.modules import W9825G6KH6, AS4C32M16
 from litedram.phy import HalfRateGENSDRPHY, GENSDRPHY
-
-# DRAM Module for XS board v2.2 ----------------------------------------------------------------------
-# FIXME: Move to litedram.modules.
-
-from litedram.modules import _TechnologyTimings, _SpeedgradeTimings, SDRModule
-
-class W9825G6KH6(SDRModule):
-    """
-    Winbond W9825G6KH-6 chip on Mister SDRAM XS board v2.2
-    This is the smallest and cheapest module.
-    running it at 100MHz (1:2 if system clock is 50MHz)
-    works well on my SoCKit and all 32MB test error free
-    I get a number of data errors if I run it at 50MHz,
-    so this defaults to 1:2. If you want to use a higher
-    system clock (eg 100MHz), you might want to consider
-    using 1:1 clocking, because the -6 speedgrade
-    can be clocked up to 166MHz (CL3) or 133MHz (CL2)
-    """
-    # geometry
-    nbanks = 4
-    nrows  = 8192
-    ncols  = 512
-
-    @staticmethod
-    def clock_cycles_to_ns(cycles, clk_freq, sdram_rate) -> float:
-        d = {
-            "1:1" : 1,
-            "1:2" : 2,
-            "1:4" : 4
-        }
-        return cycles / (d[sdram_rate] * clk_freq) / 1e-9
-
-    def __init__(self, clk_freq, sdram_rate):
-        # The datasheet specifies tWr in clock cycles, not in
-        # ns but to me it looks like litedram expects
-        # ns for these two parameters, so I have to convert them
-        # to ns first.
-        tWr  = self.clock_cycles_to_ns(2, clk_freq, sdram_rate)
-        tRRD = self.clock_cycles_to_ns(2, clk_freq, sdram_rate)
-        self.technology_timings = _TechnologyTimings(tREFI=64e6/8000, tWTR=(2, None), tCCD=(1, None), tRRD=(None, tRRD))
-        self.speedgrade_timings = {"default": _SpeedgradeTimings(tRP=15, tRCD=15, tWR=tWr, tRFC=(None, 60), tFAW=None, tRAS=42)}
-        super().__init__(clk_freq, sdram_rate)
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -107,17 +65,15 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(50e6), revision="revd", sdram_rate="1:2", mister_sdram=None, with_video_terminal=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(50e6), revision="revd", sdram_rate="1:2", mister_sdram=None,
+                 with_led_chaser=True, with_video_terminal=False, **kwargs):
         platform = terasic_sockit.Platform(revision)
 
-        # Defaults to UART over JTAG because serial is attached to the HPS and cannot be used.
-        if kwargs["uart_name"] == "serial":
-            kwargs["uart_name"] = "jtag_atlantic"
-
         # SoCCore ----------------------------------------------------------------------------------
+        if kwargs.get("uart_name", "serial") == "serial":
+            kwargs["uart_name"] = "jtag_uart" # Defaults to JTAG-UART.
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on the Terasic SoCKit",
-            ident_version  = True,
+            ident = "LiteX SoC on the Terasic SoCKit",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -143,22 +99,23 @@ class BaseSoC(SoCCore):
             self.add_video_terminal(phy=self.videophy, timings="1024x768@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on the Terasic SoCKit")
-    parser.add_argument("--single-rate-sdram",   action="store_true", help="clock SDRAM with 1x the sytem clock (instead of 2x)")
-    parser.add_argument("--mister-sdram-xs-v22", action="store_true", help="Use optional MiSTer SDRAM module XS v2.2 on J2 on GPIO daughter card")
-    parser.add_argument("--mister-sdram-xs-v24", action="store_true", help="Use optional MiSTer SDRAM module XS v2.4 on J2 on GPIO daughter card")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream")
-    parser.add_argument("--revision",            default="revd",      help="Board revision: revb (default), revc or revd")
-    parser.add_argument("--sys-clk-freq",        default=50e6,        help="System clock frequency (default: 50MHz)")
-    parser.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA)")
+    parser.add_argument("--single-rate-sdram",   action="store_true", help="Clock SDRAM with 1x the sytem clock (instead of 2x).")
+    parser.add_argument("--mister-sdram-xs-v22", action="store_true", help="Use optional MiSTer SDRAM module XS v2.2 on J2 on GPIO daughter card.")
+    parser.add_argument("--mister-sdram-xs-v24", action="store_true", help="Use optional MiSTer SDRAM module XS v2.4 on J2 on GPIO daughter card.")
+    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
+    parser.add_argument("--revision",            default="revd",      help="Board revision (revb, revc or revd).")
+    parser.add_argument("--sys-clk-freq",        default=50e6,        help="System clock frequency.")
+    parser.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

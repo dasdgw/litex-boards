@@ -147,7 +147,7 @@ class _CRGSDRAM(Module):
 
 class BaseSoC(SoCCore):
     def __init__(self, revision="0.2", device="25F", sdram_device="MT41K64M16",
-                 sys_clk_freq=int(48e6), toolchain="trellis", **kwargs):
+                 sys_clk_freq=int(48e6), toolchain="trellis", with_led_chaser=True, **kwargs):
         platform = orangecrab.Platform(revision=revision, device=device ,toolchain=toolchain)
 
         # Serial -----------------------------------------------------------------------------------
@@ -159,8 +159,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on OrangeCrab",
-            ident_version  = True,
+            ident = "LiteX SoC on OrangeCrab",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -197,22 +196,23 @@ class BaseSoC(SoCCore):
             )
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on OrangeCrab")
-    parser.add_argument("--build",           action="store_true",  help="Build bitstream")
-    parser.add_argument("--load",            action="store_true",  help="Load bitstream")
-    parser.add_argument("--toolchain",       default="trellis",    help="FPGA  use, trellis (default) or diamond")
-    parser.add_argument("--sys-clk-freq",    default=48e6,         help="System clock frequency (default: 48MHz)")
-    parser.add_argument("--revision",        default="0.2",        help="Board Revision: 0.1 or 0.2 (default)")
-    parser.add_argument("--device",          default="25F",        help="ECP5 device (default: 25F)")
-    parser.add_argument("--sdram-device",    default="MT41K64M16", help="SDRAM device (default: MT41K64M16)")
-    parser.add_argument("--with-spi-sdcard", action="store_true",  help="Enable SPI-mode SDCard support")
+    parser.add_argument("--build",           action="store_true",  help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true",  help="Load bitstream.")
+    parser.add_argument("--toolchain",       default="trellis",    help="FPGA toolchain (trellis or diamond).")
+    parser.add_argument("--sys-clk-freq",    default=48e6,         help="System clock frequency.")
+    parser.add_argument("--revision",        default="0.2",        help="Board Revision (0.1 or 0.2).")
+    parser.add_argument("--device",          default="25F",        help="ECP5 device (25F or 45F).")
+    parser.add_argument("--sdram-device",    default="MT41K64M16", help="SDRAM device (MT41K64M16, MT41K128M16, MT41K256M16 or MT41K512M16).")
+    parser.add_argument("--with-spi-sdcard", action="store_true",  help="Enable SPI-mode SDCard support.")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)

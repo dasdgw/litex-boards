@@ -23,13 +23,12 @@ from litex.soc.cores.led import LedChaser
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, platform, with_ethernet=False, **kwargs):
+    def __init__(self, platform, with_ethernet=False, with_led_chaser=True, **kwargs):
         sys_clk_freq = int(1e9/platform.default_clk_period)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX Simple SoC",
-            ident_version  = True,
+            ident = "LiteX Simple SoC",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -37,9 +36,10 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         try:
-            self.submodules.leds = LedChaser(
-                pads         = platform.request_all("user_led"),
-                sys_clk_freq = sys_clk_freq)
+            if with_led_chaser:
+                self.submodules.leds = LedChaser(
+                    pads         = platform.request_all("user_led"),
+                    sys_clk_freq = sys_clk_freq)
         except:
             pass
 
@@ -47,10 +47,10 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="Generic LiteX SoC")
-    parser.add_argument("platform",                             help="Module name of the platform to build for")
-    parser.add_argument("--build",         action="store_true", help="Build bitstream")
-    parser.add_argument("--load",          action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain",     default=None,        help="FPGA toolchain (None default)")
+    parser.add_argument("platform",                             help="Module name of the platform to build for.")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream.")
+    parser.add_argument("--toolchain",     default=None,        help="FPGA toolchain.")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

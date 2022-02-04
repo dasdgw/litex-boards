@@ -52,13 +52,13 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(125e6), with_ethernet=False, with_pcie=False, with_sata=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(125e6), with_ethernet=False, with_led_chaser=True,
+                 with_pcie=False, with_sata=False, **kwargs):
         platform = kc705.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on KC705",
-            ident_version  = True,
+            ident = "LiteX SoC on KC705",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -126,21 +126,22 @@ class BaseSoC(SoCCore):
             self.add_sata(phy=self.sata_phy, mode="read+write")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on KC705")
-    parser.add_argument("--build",         action="store_true", help="Build bitstream")
-    parser.add_argument("--load",          action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",  default=125e6,       help="System clock frequency (default: 125MHz)")
-    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
-    parser.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support")
-    parser.add_argument("--driver",        action="store_true", help="Generate PCIe driver")
-    parser.add_argument("--with-sata",     action="store_true", help="Enable SATA support (over SFP2SATA)")
+    parser.add_argument("--build",         action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",          action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",  default=125e6,       help="System clock frequency.")
+    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support.")
+    parser.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support.")
+    parser.add_argument("--driver",        action="store_true", help="Generate PCIe driver.")
+    parser.add_argument("--with-sata",     action="store_true", help="Enable SATA support (over SFP2SATA).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

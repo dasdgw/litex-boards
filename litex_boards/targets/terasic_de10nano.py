@@ -64,13 +64,13 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(50e6), with_mister_sdram=True, with_mister_video_terminal=False, sdram_rate="1:1", **kwargs):
+    def __init__(self, sys_clk_freq=int(50e6), with_led_chaser=True, with_mister_sdram=True,
+                 with_mister_video_terminal=False, sdram_rate="1:1", **kwargs):
         platform = de10nano.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on DE10-Nano",
-            ident_version  = True,
+            ident = "LiteX SoC on DE10-Nano",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -92,20 +92,21 @@ class BaseSoC(SoCCore):
             self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on DE10-Nano")
-    parser.add_argument("--build",                      action="store_true", help="Build bitstream")
-    parser.add_argument("--load",                       action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",               default=50e6,        help="System clock frequency (default: 50MHz)")
-    parser.add_argument("--with-mister-sdram",          action="store_true", help="Enable SDRAM with MiSTer expansion board")
-    parser.add_argument("--with-mister-video-terminal", action="store_true", help="Enable Video Terminal with Mister expansion board")
-    parser.add_argument("--sdram-rate",                 default="1:1",       help="SDRAM Rate: 1:1 Full Rate (default), 1:2 Half Rate")
+    parser.add_argument("--build",                      action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                       action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",               default=50e6,        help="System clock frequency.")
+    parser.add_argument("--with-mister-sdram",          action="store_true", help="Enable SDRAM with MiSTer expansion board.")
+    parser.add_argument("--with-mister-video-terminal", action="store_true", help="Enable Video Terminal with Mister expansion board.")
+    parser.add_argument("--sdram-rate",                 default="1:1",       help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

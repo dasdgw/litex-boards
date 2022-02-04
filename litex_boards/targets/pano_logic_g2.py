@@ -44,15 +44,15 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, revision, sys_clk_freq=int(50e6), with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50", **kwargs):
+    def __init__(self, revision, sys_clk_freq=int(50e6), with_ethernet=False, with_etherbone=False,
+                 eth_ip="192.168.1.50", with_led_chaser=True, **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         if with_etherbone:
             sys_clk_freq = int(125e6)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Pano Logic G2",
-            ident_version  = True,
+            ident = "LiteX SoC on Pano Logic G2",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -71,22 +71,23 @@ class BaseSoC(SoCCore):
                 self.add_etherbone(phy=self.ethphy, ip_address=eth_ip)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Pano Logic G2")
-    parser.add_argument("--build",           action="store_true",              help="Build bitstream")
-    parser.add_argument("--load",            action="store_true",              help="Load bitstream")
-    parser.add_argument("--revision",        default="c",                      help="Board revision c (default) or b")
-    parser.add_argument("--sys-clk-freq",    default=50e6,                     help="System clock frequency (default: 50MHz)")
+    parser.add_argument("--build",           action="store_true",              help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true",              help="Load bitstream.")
+    parser.add_argument("--revision",        default="c",                      help="Board revision (b or c).")
+    parser.add_argument("--sys-clk-freq",    default=50e6,                     help="System clock frequency.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support")
-    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address")
+    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support.")
+    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

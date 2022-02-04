@@ -37,20 +37,12 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    mem_map = {
-        **SoCCore.mem_map,
-        **{
-            "hyperram": 0x20000000,
-        }
-    }
-
-    def __init__(self, sys_clk_freq=int(100e6), **kwargs):
+    def __init__(self, sys_clk_freq=int(100e6), with_led_chaser=True, **kwargs):
         platform = trenz_te0725.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Trenz TE0725 Board",
-            ident_version  = True,
+            ident = "LiteX SoC on Trenz TE0725 Board",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -60,22 +52,23 @@ class BaseSoC(SoCCore):
         size = int((64*1024*1024) / 8)
         hr_pads = platform.request("hyperram", 0)
         self.submodules.hyperram = HyperRAM(hr_pads)
-        self.register_mem("hyperram", self.mem_map["hyperram"], self.hyperram.bus, size)
+        self.bus.add_slave("hyperram", slave=self.hyperram.bus, region=SoCRegion(origin=0x20000000, size=size))
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
-        self.add_csr("leds")
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
+            self.add_csr("leds")
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Trenz TE0725")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--flash",           action="store_true", help="Flash bitstream")
-    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency (default: 100MHz)")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--flash",           action="store_true", help="Flash bitstream.")
+    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency.")
 
     builder_args(parser)
     soc_core_args(parser)

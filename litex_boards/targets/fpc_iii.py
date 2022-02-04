@@ -80,7 +80,8 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(80e6), toolchain="trellis", with_ethernet=False, with_etherbone=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(80e6), toolchain="trellis", with_ethernet=False,
+                 with_etherbone=False, with_led_chaser=True, **kwargs):
         platform = fpc_iii.Platform(toolchain=toolchain)
 
         # Serial -----------------------------------------------------------------------------------
@@ -90,8 +91,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on FPC-III",
-            ident_version  = True,
+            ident = "LiteX SoC on FPC-III",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -123,32 +123,33 @@ class BaseSoC(SoCCore):
                 self.add_etherbone(phy=self.ethphy)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on FPC-III")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain",       default="trellis",   help="Gateware toolchain to use, trellis (default) or diamond")
-    parser.add_argument("--sys-clk-freq",    default=80e6,        help="System clock frequency (default=80MHz)")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--toolchain",       default="trellis",   help="Gateware toolchain to use (trellis or diamond).")
+    parser.add_argument("--sys-clk-freq",    default=80e6,        help="System clock frequency.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone", action="store_true", help="Enable Ethernet wishbone support")
+    ethopts.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support")
+    sdopts.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support.")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq = int(float(args.sys_clk_freq)),
-        with_ethernet = args.with_ethernet,
+        sys_clk_freq   = int(float(args.sys_clk_freq)),
+        with_ethernet  = args.with_ethernet,
         with_etherbone = args.with_etherbone,
         **soc_core_argdict(args))
     if args.with_spi_sdcard:

@@ -58,13 +58,14 @@ class BaseSoC(SoCCore):
     }
     mem_map.update(SoCCore.mem_map)
 
-    def __init__(self, sys_clk_freq=int(50e6), with_ethernet=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(50e6), with_led_chaser=True,
+        with_ethernet=False, with_etherbone=False,
+        **kwargs):
         platform = c10lprefkit.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on C10 LP RefKit",
-            ident_version  = True,
+            ident = "LiteX SoC on C10 LP RefKit",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -84,33 +85,39 @@ class BaseSoC(SoCCore):
                 l2_cache_size = kwargs.get("l2_size", 8192)
             )
 
-        # Ethernet ---------------------------------------------------------------------------------
-        if with_ethernet:
+        # Ethernet / Etherbone ---------------------------------------------------------------------
+        if with_ethernet or with_etherbone:
             self.submodules.ethphy = LiteEthPHYMII(
                 clock_pads = self.platform.request("eth_clocks"),
                 pads       = self.platform.request("eth"))
-            self.add_ethernet(phy=self.ethphy)
+            if with_ethernet:
+                self.add_ethernet(phy=self.ethphy)
+            if with_etherbone:
+                self.add_etherbone(phy=self.ethphy)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on C10 LP RefKit")
-    parser.add_argument("--build",         action="store_true", help="Build bitstream")
-    parser.add_argument("--load",          action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",  default=50e6,       help="System clock frequency (default: 50MHz)")
-    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
+    parser.add_argument("--build",          action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",           action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",   default=50e6,        help="System clock frequency.")
+    parser.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support.")
+    parser.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support.")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq  = int(float(args.sys_clk_freq)),
-        with_ethernet = args.with_ethernet,
+        sys_clk_freq   = int(float(args.sys_clk_freq)),
+        with_ethernet  = args.with_ethernet,
+        with_etherbone = args.with_etherbone,
         **soc_core_argdict(args)
     )
     builder = Builder(soc, **builder_argdict(args))

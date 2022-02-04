@@ -6,7 +6,7 @@
 
                                               LiteX boards files
 
-                                     Copyright 2012-2020 / LiteX-Hub community
+                                     Copyright 2012-2022 / LiteX-Hub community
 
 [![](https://github.com/litex-hub/litex-boards/workflows/ci/badge.svg)](https://github.com/litex-hub/litex-boards/actions) ![License](https://img.shields.io/badge/License-BSD%202--Clause-orange.svg)
 
@@ -56,7 +56,7 @@ Please use `./target.py --help` to see the pre-built various possibilities.
 
 Hoping you will find this useful and enjoy it, please contribute back if you make improvements that could be useful to others or find issues!
 
-**A question or want to get in touch? Our IRC channel is [#litex at freenode.net](https://webchat.freenode.net/?channels=litex)**
+**A question or want to get in touch? Our IRC channel is [#litex at irc.libera.chat](https://web.libera.chat/#litex)**
 
 > **Note:** All boards with >= 32MB of memory and enough logic can be considered as Linux Capable.
 
@@ -105,13 +105,14 @@ PCIe accelerators boards that you could use to accelerate your applications, Lit
 
 Repurposed FPGA hardware that has been "documented" by enthusiasts :), allows you to discover FPGAs for very cheap (starting at 15$)!
 
-| Name         | FPGA Family         | FPGA device   | Sys-Clk  | TTY  |       DRAM         |       Ethernet     |    Flash    |
-|--------------|---------------------|---------------|----------|------|--------------------|--------------------|-------------|
-| SDS1104X-E   | Xilinx Zynq         | XC7Z020       |  100MHz  | Eth  | 32-bit 256MB DDR3  | 100Mbps MII        |      ?      |
-| Colorlight5A | Lattice ECP5        | LFE5U-25F     |   60MHz  | IOs  | 32-bit 8MB SDR     | 2x 1Gbps RGMII     |   4MB QSPI  |
-| Linsn RV901  | Xilinx Spartan6     | XC6SLX16      |   75MHz  | IOs  | 32-bit 8MB SDR     | 2x 1Gbps RGMII     |   4MB QSPI  |
-| PanoLogic G2 | Xilinx Spartan6     | XC6SLX100-150 |   50MHz  | IOs  | 32-bit 128MB DDR2  | 1Gbps GMII         |  16MB QSPI  |
-| Camlink-4K   | Lattice ECP5        | LFE5U-25F     |   81MHz  | IOs  | 16-bit 128MB DDR3  |        No          |   ?MB QSPI  |
+| Name         | FPGA Family         | FPGA device   | Sys-Clk   | TTY  |       DRAM         |       Ethernet     |    Flash    |
+|--------------|---------------------|---------------|-----------|------|--------------------|--------------------|-------------|
+| SDS1104X-E   | Xilinx Zynq         | XC7Z020       |  100MHz   | Eth  | 32-bit 256MB DDR3  | 100Mbps MII        |      ?      |
+| Colorlight5A | Lattice ECP5        | LFE5U-25F     |   60MHz   | IOs  | 32-bit 8MB SDR     | 2x 1Gbps RGMII     |   4MB QSPI  |
+| Linsn RV901  | Xilinx Spartan6     | XC6SLX16      |   75MHz   | IOs  | 32-bit 8MB SDR     | 2x 1Gbps RGMII     |   4MB QSPI  |
+| PanoLogic G2 | Xilinx Spartan6     | XC6SLX100-150 |   50MHz   | IOs  | 32-bit 128MB DDR2  | 1Gbps GMII         |  16MB QSPI  |
+| Camlink-4K   | Lattice ECP5        | LFE5U-25F     |   81MHz   | IOs  | 16-bit 128MB DDR3  |        No          |   ?MB QSPI  |
+| EBAZ4205     | Xilinx Zynq         | XC7Z010 (28k) | 33.333MHz | IOs  | 256MB DDR3         | 100Mbps RMII       |  128MB NAND |
 
 The Colorlight5A is a very nice board to start with, cheap, powerful, easy to use with the open-source toolchain, you can find a specific LiteX project [here](https://github.com/enjoy-digital/colorlite)
 
@@ -150,13 +151,16 @@ The Colorlight5A is a very nice board to start with, cheap, powerful, easy to us
 | Nexys4DDR      | Xilinx Artix7       | XC7A100T      | 100MHz  | FTDI | 16-bit 128MB DDR2  |     No    | 100Mbps RMII   |  16MB QSPI* |   Yes  |
 | Nexys Video    | Xilinx Artix7       | XC7A200T      | 100MHz  | FTDI | 16-bit 512MB DDR3  |     No    |   1Gbps RMII   |  32MB QSPI* |   Yes  |
 | QMTech XC7A35T | Xilinx Artix7       | XC7A35T       | 100MHz  | FTDI | 16-bit 256MB DDR3  |     No    |   1Gbps GMII** |  16MB QSPI  |   Yes**|
+| QMTech Wukong1 | Xilinx Artix7       | XC7A100T      | 100MHz  | FTDI | 16-bit 256MB DDR3  |     No    |   1Gbps GMII   |  16MB QSPI  |   Yes**|
+| QMTech Wukong2 | Xilinx Artix7       | XC7A100T/200T | 100MHz  | FTDI | 16-bit 256MB DDR3  |     No    |   1Gbps GMII   |  16MB QSPI  |   Yes  |
+| RZ-EasyFPGA    | Intel Cyclone4      | EP4CE6        |  50MHz  | IOs  | 16-bit   8MB SDR   |     No    |       No       |      No     |   No   |
 | SP605          | Xilinx Spartan6     | XC6SLX45T     | 100MHz  | FTDI | 16-bit 128MB DDR3* |  Gen1 X1* |   1Gbps GMII   |   8MB QSPI* |   Yes* |
 | Tagus          | Xilinx Artix7       | XC7A200T      | 100MHz  | PCIe | 16-bit 256MB DDR3  |  Gen2 X1  |  1Gbps-BASE-X* |  16MB QSPI* |   No   |
 | VC707          | Xilinx Virex7       | XC7VX485T     | 125MHz  | FTDI | 64-bit   1GB DDR3  |  Gen3 X8* |   1Gbps GMII   |  16MB QSPI* |   Yes* |
 | VCU118         | Xilinx VirtexU+     | XCVU9P        | 125MHz  | FTDI | 2 x 64-bit 4GB DDR4|  Gen3 X16*|  1Gbps SGMII   |  16MB QSPI* |   Yes* |
 | Versa ECP5     | Lattice ECP5        | LFE5UM5G-45F  |  75MHz  | FTDI | 16-bit 128MB DDR3  |  Gen1 X1* | 1Gbps RGMII    |  16MB QSPI* |   No   |
 | ZCU104         | Xilinx ZynqU+       | XCZU7EV       | 125MHz  | FTDI | 64-bit   1GB DDR4  |     No    | 1Gbps RGMII*   |  64MB QSPI* |   Yes* |
-| Zybo Z7        | Xilinx ZynqU+       | XC7Z010       | 125MHz  | FTDI | 64-bit   1GB DDR4  |     No    | 1Gbps RGMII*   |  64MB QSPI* |   Yes* |
+| Zybo Z7        | Xilinx Zynq         | XC7Z010       | 125MHz  | FTDI | 64-bit   1GB DDR4  |     No    | 1Gbps RGMII*   |  64MB QSPI* |   Yes* |
 
 \* Present on the board but not yet supported or validated with LiteX.
 \*\* available on the daughterboard

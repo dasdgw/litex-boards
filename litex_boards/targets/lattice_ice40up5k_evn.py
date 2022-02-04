@@ -21,7 +21,6 @@ from litex_boards.platforms import lattice_ice40up5k_evn
 from litex.build.lattice.programmer import IceStormProgrammer
 
 from litex.soc.cores.ram import Up5kSPRAM
-from litex.soc.cores.spi_flash import SpiFlash
 from litex.soc.cores.clock import iCE40PLL
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.soc import SoCRegion
@@ -62,21 +61,16 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    mem_map = {**SoCCore.mem_map, **{"spiflash": 0x80000000}}
-    def __init__(self, bios_flash_offset, sys_clk_freq=int(12e6), **kwargs):
+    def __init__(self, bios_flash_offset, sys_clk_freq=int(12e6), with_led_chaser=True, **kwargs):
         platform = lattice_ice40up5k_evn.Platform()
 
         # Disable Integrated ROM/SRAM since too large for iCE40 and UP5K has specific SPRAM.
         kwargs["integrated_sram_size"] = 0
         kwargs["integrated_rom_size"]  = 0
 
-        # Set CPU variant / reset address
-        kwargs["cpu_reset_address"] = self.mem_map["spiflash"] + bios_flash_offset
-
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Lattice iCE40UP5k EVN breakout board",
-            ident_version  = True,
+            ident = "LiteX SoC on Lattice iCE40UP5k EVN breakout board",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -87,31 +81,29 @@ class BaseSoC(SoCCore):
         self.bus.add_slave("sram", self.spram.bus, SoCRegion(size=128*kB))
 
         # SPI Flash --------------------------------------------------------------------------------
-        self.add_spi_flash(mode="1x", dummy_cycles=8) 
         # 4x mode is not possible on this board since WP and HOLD pins are not connected to the FPGA
+        from litespi.modules import N25Q032A
+        from litespi.opcodes import SpiNorFlashOpCodes as Codes
+        self.add_spi_flash(mode="1x", module=N25Q032A(Codes.READ_1_1_1))
 
         # Add ROM linker region --------------------------------------------------------------------
         self.bus.add_region("rom", SoCRegion(
-            origin = self.mem_map["spiflash"] + bios_flash_offset,
+            origin = self.bus.regions["spiflash"].origin + bios_flash_offset,
             size   = 32*kB,
             linker = True)
         )
+        self.cpu.set_reset_address(self.bus.regions["rom"].origin)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led_n"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led_n"),
+                sys_clk_freq = sys_clk_freq)
 
-        # Add a UART-Wishbone bridge -----------------------------------------
-        debug_uart=False
+        # Add a UARTBone bridge --------------------------------------------------------------------
+        debug_uart = False
         if debug_uart:
-            # This will add a bridge on the second serial port defined in platform
-            from litex.soc.cores.uart import UARTWishboneBridge
-            self.submodules.uart_bridge = UARTWishboneBridge(
-                platform.request("serial"),
-                sys_clk_freq,
-                baudrate=115200)
-            self.add_wb_master(self.uart_bridge.wishbone)
+            self.add_uartbone(name="serial")
 
 # Flash --------------------------------------------------------------------------------------------
 
@@ -145,16 +137,16 @@ def flash(bios_flash_offset):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Lattice iCE40UP5k EVN breakout board")
-    parser.add_argument("--build",             action="store_true", help="Build bitstream")
-    parser.add_argument("--sys-clk-freq",      default=12e6,        help="System clock frequency (default: 12MHz)")
-    parser.add_argument("--bios-flash-offset", default=0x20000,     help="BIOS offset in SPI Flash (default: 0x20000)")
-    parser.add_argument("--flash",             action="store_true", help="Flash Bitstream")
+    parser.add_argument("--build",             action="store_true", help="Build bitstream.")
+    parser.add_argument("--sys-clk-freq",      default=12e6,        help="System clock frequency.")
+    parser.add_argument("--bios-flash-offset", default="0x20000",   help="BIOS offset in SPI Flash.")
+    parser.add_argument("--flash",             action="store_true", help="Flash Bitstream.")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        bios_flash_offset = args.bios_flash_offset,
+        bios_flash_offset = int(args.bios_flash_offset, 0),
         sys_clk_freq      = int(float(args.sys_clk_freq)),
         **soc_core_argdict(args)
     )

@@ -47,7 +47,7 @@ class _CRG(Module):
 
 
 class BaseSoC(SoCCore):
-    def __init__(self, board, sys_clk_freq=int(100e6), **kwargs):
+    def __init__(self, board, sys_clk_freq=int(100e6), with_led_chaser=True, **kwargs):
         platform = redpitaya.Platform(board)
 
         if kwargs["uart_name"] == "serial":
@@ -57,8 +57,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Zebboard",
-            ident_version  = True,
+            ident = "LiteX SoC on Zebboard",
             **kwargs)
 
         # Zynq7000 Integration ---------------------------------------------------------------------
@@ -83,19 +82,20 @@ class BaseSoC(SoCCore):
         self.submodules.crg = _CRG(platform, sys_clk_freq, use_ps7_clk)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Zedboard")
-    parser.add_argument("--build",        action="store_true", help="Build bitstream")
-    parser.add_argument("--load",         action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq", default=100e6,       help="System clock frequency (default: 100MHz)")
-    parser.add_argument("--board",        default="redpitaya14", help="Board type: redpitaya14 (default) or redpitaya16")
+    parser.add_argument("--build",        action="store_true",   help="Build bitstream.")
+    parser.add_argument("--load",         action="store_true",   help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq", default=100e6,         help="System clock frequency.")
+    parser.add_argument("--board",        default="redpitaya14", help="Board type (redpitaya14 or redpitaya16).")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)

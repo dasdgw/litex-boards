@@ -62,13 +62,13 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, variant="ztex2.13a", sys_clk_freq=int(100e6), expansion="debug", **kwargs):
+    def __init__(self, variant="ztex2.13a", sys_clk_freq=int(100e6), expansion="debug",
+                 with_led_chaser=True, **kwargs):
         platform = ztex213.Platform(variant=variant, expansion=expansion)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Ztex 2.13",
-            ident_version  = True,
+            ident = "LiteX SoC on Ztex 2.13",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -87,20 +87,21 @@ class BaseSoC(SoCCore):
             )
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Ztex 2.13")
-    parser.add_argument("--build", action="store_true", help="Build bitstream")
-    parser.add_argument("--load",  action="store_true", help="Load bitstream")
-    parser.add_argument("--expansion", default="debug", help="Expansion board, 'debug' (default) or 'sbus'")
-    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency (default=100MHz)")
-    parser.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support")
-    parser.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--expansion",       default="debug",     help="Expansion board (debug or sbus).")
+    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency.")
+    parser.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support.")
+    parser.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support.")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)

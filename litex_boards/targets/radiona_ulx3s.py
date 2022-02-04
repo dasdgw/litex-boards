@@ -23,7 +23,7 @@ from litex.build.lattice.trellis import trellis_args, trellis_argdict
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
-from litex.soc.cores.video import VideoECP5HDMIPHY
+from litex.soc.cores.video import VideoHDMIPHY
 from litex.soc.cores.led import LedChaser
 from litex.soc.cores.spi import SPIMaster
 from litex.soc.cores.gpio import GPIOOut
@@ -92,15 +92,13 @@ class _CRG(Module):
 class BaseSoC(SoCCore):
     def __init__(self, device="LFE5U-45F", revision="2.0", toolchain="trellis",
         sys_clk_freq=int(50e6), sdram_module_cls="MT48LC16M16", sdram_rate="1:1",
-        with_video_terminal=False, with_video_framebuffer=False, spiflash=False, **kwargs):
+        with_led_chaser=True, with_video_terminal=False, with_video_framebuffer=False,
+        with_spi_flash=False, **kwargs):
         platform = ulx3s.Platform(device=device, revision=revision, toolchain=toolchain)
-        if spiflash:
-            self.mem_map = {**SoCCore.mem_map, **{"spiflash": 0x80000000}}
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on ULX3S",
-            ident_version  = True,
+            ident = "LiteX SoC on ULX3S",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -113,26 +111,31 @@ class BaseSoC(SoCCore):
             sdrphy_cls = HalfRateGENSDRPHY if sdram_rate == "1:2" else GENSDRPHY
             self.submodules.sdrphy = sdrphy_cls(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
-                phy              = self.sdrphy,
-                module           = getattr(litedram_modules, sdram_module_cls)(sys_clk_freq, sdram_rate),
-                size             = 0x40000000,
-                l2_cache_size    = kwargs.get("l2_size", 8192),
-                l2_cache_reverse = False
+                phy           = self.sdrphy,
+                module        = getattr(litedram_modules, sdram_module_cls)(sys_clk_freq, sdram_rate),
+                size          = 0x40000000,
+                l2_cache_size = kwargs.get("l2_size", 8192)
             )
 
         # Video ------------------------------------------------------------------------------------
         if with_video_terminal or with_video_framebuffer:
-            self.submodules.videophy = VideoECP5HDMIPHY(platform.request("gpdi"), clock_domain="hdmi")
+            self.submodules.videophy = VideoHDMIPHY(platform.request("gpdi"), clock_domain="hdmi")
             if with_video_terminal:
                 self.add_video_terminal(phy=self.videophy, timings="640x480@75Hz", clock_domain="hdmi")
             if with_video_framebuffer:
                 self.add_video_framebuffer(phy=self.videophy, timings="640x480@75Hz", clock_domain="hdmi")
-                self.comb += platform.request("ext0p").eq(self.video_framebuffer.underflow) # FIXME: Remove, used to debug SDRAM underflows.
+
+        # SPI Flash --------------------------------------------------------------------------------
+        if with_spi_flash:
+            from litespi.modules import IS25LP128
+            from litespi.opcodes import SpiNorFlashOpCodes as Codes
+            self.add_spi_flash(mode="4x", module=IS25LP128(Codes.READ_1_1_4))
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
     def add_oled(self):
         pads = self.platform.request("oled_spi")
@@ -146,23 +149,22 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on ULX3S")
-    parser.add_argument("--build",           action="store_true",   help="Build bitstream")
-    parser.add_argument("--load",            action="store_true",   help="Load bitstream")
-    parser.add_argument("--toolchain",       default="trellis",     help="FPGA toolchain: trellis (default) or diamond")
-    parser.add_argument("--device",          default="LFE5U-45F",   help="FPGA device: LFE5U-12F, LFE5U-25F, LFE5U-45F (default)  or LFE5U-85F")
-    parser.add_argument("--revision",        default="2.0",         help="Board revision: 2.0 (default) or 1.7")
-    parser.add_argument("--sys-clk-freq",    default=50e6,          help="System clock frequency  (default: 50MHz)")
-    parser.add_argument("--sdram-module",    default="MT48LC16M16", help="SDRAM module: MT48LC16M16 (default), AS4C32M16 or AS4C16M16")
-    parser.add_argument("--with-spiflash",   action="store_true",   help="Make the SPI Flash accessible from the SoC")
-    parser.add_argument("--flash-boot-adr",  type=lambda x: int(x,0), default=None, help="Flash boot address")
+    parser.add_argument("--build",           action="store_true",   help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true",   help="Load bitstream.")
+    parser.add_argument("--toolchain",       default="trellis",     help="FPGA toolchain (trellis or diamond).")
+    parser.add_argument("--device",          default="LFE5U-45F",   help="FPGA device (LFE5U-12F, LFE5U-25F, LFE5U-45F or LFE5U-85F).")
+    parser.add_argument("--revision",        default="2.0",         help="Board revision (2.0 or 1.7).")
+    parser.add_argument("--sys-clk-freq",    default=50e6,          help="System clock frequency.")
+    parser.add_argument("--sdram-module",    default="MT48LC16M16", help="SDRAM module (MT48LC16M16, AS4C32M16 or AS4C16M16).")
+    parser.add_argument("--with-spi-flash",  action="store_true",   help="Enable SPI Flash (MMAPed).")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard", action="store_true",   help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",     action="store_true",   help="Enable SDCard support")
-    parser.add_argument("--with-oled",       action="store_true",   help="Enable SDD1331 OLED support")
-    parser.add_argument("--sdram-rate",      default="1:1",         help="SDRAM Rate: 1:1 Full Rate (default), 1:2 Half Rate")
+    sdopts.add_argument("--with-spi-sdcard", action="store_true",   help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",     action="store_true",   help="Enable SDCard support.")
+    parser.add_argument("--with-oled",       action="store_true",   help="Enable SDD1331 OLED support.")
+    parser.add_argument("--sdram-rate",      default="1:1",         help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI)")
-    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI)")
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI).")
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)
@@ -177,7 +179,7 @@ def main():
         sdram_rate             = args.sdram_rate,
         with_video_terminal    = args.with_video_terminal,
         with_video_framebuffer = args.with_video_framebuffer,
-        spiflash               = args.with_spiflash,
+        with_spi_flash         = args.with_spi_flash,
         **soc_core_argdict(args))
     if args.with_spi_sdcard:
         soc.add_spi_sdcard()
@@ -185,10 +187,6 @@ def main():
         soc.add_sdcard()
     if args.with_oled:
         soc.add_oled()
-    if args.with_spiflash:
-        soc.add_spi_flash(mode="1x", dummy_cycles=8)
-        if args.flash_boot_adr:
-            soc.add_constant("FLASH_BOOT_ADDRESS", args.flash_boot_adr)
 
     builder = Builder(soc, **builder_argdict(args))
     builder_kargs = trellis_argdict(args) if args.toolchain == "trellis" else {}

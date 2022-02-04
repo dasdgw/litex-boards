@@ -28,7 +28,7 @@ from liteeth.phy.s7rgmii import LiteEthPHYRGMII
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(Module):
-    def __init__(self, platform, sys_clk_freq, toolchain, with_video_pll=False):
+    def __init__(self, platform, sys_clk_freq, toolchain="vivado", with_video_pll=False):
         self.rst = Signal()
         self.clock_domains.cd_sys       = ClockDomain()
         self.clock_domains.cd_sys4x     = ClockDomain(reset_less=True)
@@ -71,13 +71,14 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, toolchain="vivado", sys_clk_freq=int(100e6), with_ethernet=False, with_sata=False, vadj="1.2V", with_video_terminal=False, with_video_framebuffer=False, **kwargs):
+    def __init__(self, toolchain="vivado", sys_clk_freq=int(100e6), with_ethernet=False,
+                 with_led_chaser=True, with_sata=False, sata_gen="gen2", vadj="1.2V", with_video_terminal=False,
+                 with_video_framebuffer=False, **kwargs):
         platform = nexys_video.Platform(toolchain=toolchain)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Nexys Video",
-            ident_version  = True,
+            ident = "LiteX SoC on Nexys Video",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -125,7 +126,7 @@ class BaseSoC(SoCCore):
             # PHY
             self.submodules.sata_phy = LiteSATAPHY(platform.device,
                 pads       = platform.request("fmc2sata"),
-                gen        = "gen2",
+                gen        = sata_gen,
                 clk_freq   = sys_clk_freq,
                 data_width = 16)
 
@@ -141,9 +142,10 @@ class BaseSoC(SoCCore):
                 self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="hdmi")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
         # VADJ -------------------------------------------------------------------------------------
         vadj_map = {"1.2V": 0b00, "1.8V": 0b01, "2.5V": 0b10, "3.3V": 0b11}
@@ -153,19 +155,20 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Nexys Video")
-    parser.add_argument("--toolchain",              default="vivado",    help="Toolchain use to build (default: vivado)")
-    parser.add_argument("--build",                  action="store_true", help="Build bitstream")
-    parser.add_argument("--load",                   action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",           default=100e6,       help="System clock frequency (default: 100MHz)")
-    parser.add_argument("--with-ethernet",          action="store_true", help="Enable Ethernet support")
+    parser.add_argument("--toolchain",              default="vivado",    help="FPGA toolchain (vivado or symbiflow).")
+    parser.add_argument("--build",                  action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                   action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",           default=100e6,       help="System clock frequency.")
+    parser.add_argument("--with-ethernet",          action="store_true", help="Enable Ethernet support.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",        action="store_true", help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",            action="store_true", help="Enable SDCard support")
-    parser.add_argument("--with-sata",              action="store_true", help="Enable SATA support (over FMCRAID)")
-    parser.add_argument("--vadj",                   default="1.2V",      help="FMC VADJ value", choices=["1.2V", "1.8V", "2.5V", "3.3V"])
+    sdopts.add_argument("--with-spi-sdcard",        action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",            action="store_true", help="Enable SDCard support.")
+    parser.add_argument("--with-sata",              action="store_true", help="Enable SATA support (over FMCRAID).")
+    parser.add_argument("--sata-gen",               default="2",         help="SATA Gen.", choices=["1", "2"])
+    parser.add_argument("--vadj",                   default="1.2V",      help="FMC VADJ value.", choices=["1.2V", "1.8V", "2.5V", "3.3V"])
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI)")
-    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI)")
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI).")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)
@@ -176,6 +179,7 @@ def main():
         sys_clk_freq           = int(float(args.sys_clk_freq)),
         with_ethernet          = args.with_ethernet,
         with_sata              = args.with_sata,
+        sata_gen               = "gen" + args.sata_gen,
         vadj                   = args.vadj,
         with_video_terminal    = args.with_video_terminal,
         with_video_framebuffer = args.with_video_framebuffer,

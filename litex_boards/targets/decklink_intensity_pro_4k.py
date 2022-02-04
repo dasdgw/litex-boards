@@ -6,6 +6,8 @@
 # Copyright (c) 2021 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+# Work-In-Progress...
+
 import os
 import argparse
 
@@ -45,8 +47,7 @@ class BaseSoC(SoCCore):
         # SoCCore ----------------------------------------------------------------------------------
         kwargs["uart_name"] = "crossover"
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Blackmagic Decklink Intensity Pro 4K",
-            ident_version  = True,
+            ident = "LiteX SoC on Blackmagic Decklink Intensity Pro 4K",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -62,12 +63,12 @@ class BaseSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC Blackmagic Decklink Intensity Pro 4K.")
-    parser.add_argument("--build",        action="store_true", help="Build bitstream")
-    parser.add_argument("--load",         action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq", default=125e6,       help="System clock frequency (default: 125MHz)")
-    parser.add_argument("--with-pcie",    action="store_true", help="Enable PCIe support")
-    parser.add_argument("--driver",       action="store_true", help="Generate PCIe driver")
+    parser = argparse.ArgumentParser(description="LiteX SoC Blackmagic Decklink Intensity Pro 4K")
+    parser.add_argument("--build",        action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",         action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq", default=125e6,       help="System clock frequency.")
+    parser.add_argument("--with-pcie",    action="store_true", help="Enable PCIe support.")
+    parser.add_argument("--driver",       action="store_true", help="Generate PCIe driver.")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)
@@ -75,7 +76,7 @@ def main():
 
     soc = BaseSoC(
         sys_clk_freq = int(float(args.sys_clk_freq)),
-        with_pcie    = args.with_pcie,
+        with_pcie    = args.with_pcie | True, # FIXME: Always enable PCIe for now.
         **soc_core_argdict(args)
     )
     builder = Builder(soc, **builder_argdict(args))

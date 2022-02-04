@@ -54,13 +54,14 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), with_ethernet=False, with_etherbone=False, with_video_terminal=False, with_video_framebuffer=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(75e6), with_ethernet=False, with_etherbone=False,
+                 with_led_chaser=True, with_video_terminal=False, with_video_framebuffer=False,
+                 **kwargs):
         platform = nexys4ddr.Platform()
 
         # SoCCore ----------------------------------_-----------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Nexys4DDR",
-            ident_version  = True,
+            ident = "LiteX SoC on Nexys4DDR",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -97,26 +98,27 @@ class BaseSoC(SoCCore):
                 self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Nexys4DDR")
-    parser.add_argument("--build",                  action="store_true", help="Build bitstream")
-    parser.add_argument("--load",                   action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",           default=75e6,        help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--build",                  action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                   action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",           default=75e6,        help="System clock frequency.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",         action="store_true", help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone",        action="store_true", help="Enable Etherbone support")
+    ethopts.add_argument("--with-ethernet",         action="store_true", help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone",        action="store_true", help="Enable Etherbone support.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",        action="store_true", help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",            action="store_true", help="Enable SDCard support")
+    sdopts.add_argument("--with-spi-sdcard",        action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",            action="store_true", help="Enable SDCard support.")
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (VGA)")
-    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (VGA)")
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (VGA).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (VGA).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

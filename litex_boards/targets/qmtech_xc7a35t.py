@@ -26,11 +26,6 @@ from litex.soc.cores.led import LedChaser
 from litedram.modules import MT41J128M16
 from litedram.phy import s7ddrphy
 
-from litespi.modules import MT25QL128
-from litespi.opcodes import SpiNorFlashOpCodes as Codes
-from litespi.phy.generic import LiteSPIPHY
-from litespi import LiteSPI
-
 from liteeth.phy.mii import LiteEthPHYMII
 
 # CRG ----------------------------------------------------------------------------------------------
@@ -76,14 +71,16 @@ class _CRG(Module):
 class BaseSoC(SoCCore):
     def __init__(self, toolchain="vivado", sys_clk_freq=int(100e6), with_daughterboard=False,
                  with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50", eth_dynamic_ip=False,
-                 with_video_terminal=False, with_video_framebuffer=False,
-                 ident_version=True, with_jtagbone=True, with_mapped_flash=False, **kwargs):
+                 with_led_chaser=True, with_video_terminal=False, with_video_framebuffer=False,
+                 with_jtagbone=True, with_spi_flash=False, **kwargs):
         platform = qmtech_xc7a35t.Platform(toolchain=toolchain, with_daughterboard=with_daughterboard)
 
         # SoCCore ----------------------------------------------------------------------------------
+        if (kwargs["uart_name"] == "serial") and (not with_daughterboard):
+            kwargs["uart_name"] = "gpio_serial"
+
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on QMTech XC7A35T" + (" + Daughterboard" if with_daughterboard else ""),
-            ident_version  = ident_version,
+            ident = "LiteX SoC on QMTech XC7A35T" + (" + Daughterboard" if with_daughterboard else ""),
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -117,12 +114,11 @@ class BaseSoC(SoCCore):
         if with_jtagbone:
             self.add_jtagbone()
 
-        # Flash (through LiteSPI, experimental).
-        if with_mapped_flash:
-            self.submodules.spiflash_phy  = LiteSPIPHY(platform.request("spiflash4x"), MT25QL128(Codes.READ_1_1_1))
-            self.submodules.spiflash_mmap = LiteSPI(self.spiflash_phy, clk_freq=sys_clk_freq, mmap_endianness=self.cpu.endianness)
-            spiflash_region = SoCRegion(origin=self.mem_map.get("spiflash", None), size=MT25QL128.total_size, cached=False)
-            self.bus.add_slave(name="spiflash", slave=self.spiflash_mmap.bus, region=spiflash_region)
+        # SPI Flash --------------------------------------------------------------------------------
+        if with_spi_flash:
+            from litespi.modules import MT25QL128
+            from litespi.opcodes import SpiNorFlashOpCodes as Codes
+            self.add_spi_flash(mode="4x", module=MT25QL128(Codes.READ_1_1_1), with_master=True)
 
         # Video ------------------------------------------------------------------------------------
         if with_video_terminal or with_video_framebuffer:
@@ -133,9 +129,10 @@ class BaseSoC(SoCCore):
                 self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
         if not with_daughterboard and kwargs["uart_name"] == "serial":
             kwargs["uart_name"] = "jtag_serial"
@@ -144,25 +141,24 @@ class BaseSoC(SoCCore):
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on QMTech XC7A35T")
-    parser.add_argument("--toolchain",           default="vivado",                 help="Toolchain use to build (default: vivado)")
-    parser.add_argument("--build",               action="store_true",              help="Build bitstream")
-    parser.add_argument("--load",                action="store_true",              help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",        default=100e6,                    help="System clock frequency (default: 100MHz)")
-    parser.add_argument("--with-daughterboard",  action="store_true",              help="Whether the core board is plugged into the QMTech daughterboard")
+    parser.add_argument("--toolchain",           default="vivado",                 help="FPGA toolchain (vivado or symbiflow).")
+    parser.add_argument("--build",               action="store_true",              help="Build bitstream.")
+    parser.add_argument("--load",                action="store_true",              help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",        default=100e6,                    help="System clock frequency.")
+    parser.add_argument("--with-daughterboard",  action="store_true",              help="Board plugged into the QMTech daughterboard.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",      action="store_true",              help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone",     action="store_true",              help="Enable Etherbone support")
-    parser.add_argument("--eth-ip",              default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address")
-    parser.add_argument("--eth-dynamic-ip",      action="store_true",              help="Enable dynamic Ethernet IP addresses setting")
+    ethopts.add_argument("--with-ethernet",      action="store_true",              help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone",     action="store_true",              help="Enable Etherbone support.")
+    parser.add_argument("--eth-ip",              default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
+    parser.add_argument("--eth-dynamic-ip",      action="store_true",              help="Enable dynamic Ethernet IP addresses setting.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",     action="store_true",              help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",         action="store_true",              help="Enable SDCard support")
-    parser.add_argument("--no-ident-version",    action="store_false",             help="Disable build time output")
-    parser.add_argument("--with-jtagbone",       action="store_true",              help="Enable Jtagbone support")
-    parser.add_argument("--with-mapped-flash",   action="store_true",              help="Enable Memory Mapped Flash")
+    sdopts.add_argument("--with-spi-sdcard",     action="store_true",              help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",         action="store_true",              help="Enable SDCard support.")
+    parser.add_argument("--with-jtagbone",       action="store_true",              help="Enable Jtagbone support.")
+    parser.add_argument("--with-spi-flash",      action="store_true",              help="Enable SPI Flash (MMAPed).")
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (VGA)")
-    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (VGA)")
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (VGA).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (VGA).")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)
@@ -176,9 +172,8 @@ def main():
         with_etherbone         = args.with_etherbone,
         eth_ip                 = args.eth_ip,
         eth_dynamic_ip         = args.eth_dynamic_ip,
-        ident_version          = args.no_ident_version,
         with_jtagbone          = args.with_jtagbone,
-        with_mapped_flash      = args.with_mapped_flash,
+        with_spi_flash         = args.with_spi_flash,
         with_video_terminal    = args.with_video_terminal,
         with_video_framebuffer = args.with_video_framebuffer,
         **soc_core_argdict(args)

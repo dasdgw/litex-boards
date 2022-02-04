@@ -20,6 +20,9 @@ from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
+from litex.soc.cores.gpio import GPIOTristate
+from litex.soc.cores.video import VideoDVIPHY
+from litex.soc.cores.bitbang import I2CMaster
 
 from litedram.modules import MT41J256M16
 from litedram.phy import ECP5DDRPHY
@@ -111,13 +114,18 @@ class _CRGSDRAM(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), toolchain="trellis", with_ethernet=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(75e6), toolchain="trellis",
+        with_ethernet          = False,
+        with_video_terminal    = False,
+        with_video_framebuffer = False,
+        with_led_chaser        = True,
+        with_pmod_gpio         = False,
+        **kwargs):
         platform = trellisboard.Platform(toolchain=toolchain)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Trellis Board",
-            ident_version  = True,
+            ident = "LiteX SoC on Trellis Board",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -134,7 +142,7 @@ class BaseSoC(SoCCore):
             self.add_sdram("sdram",
                 phy           = self.ddrphy,
                 module        = MT41J256M16(sys_clk_freq, "1:2"),
-                l2_cache_size = kwargs.get("l2_size", 8192)
+                l2_cache_size = kwargs.get("l2_size", 8192),
             )
 
         # Ethernet ---------------------------------------------------------------------------------
@@ -144,31 +152,60 @@ class BaseSoC(SoCCore):
                 pads       = self.platform.request("eth"))
             self.add_ethernet(phy=self.ethphy)
 
+        # HDMI -------------------------------------------------------------------------------------
+        if with_video_terminal or with_video_framebuffer:
+            # PHY + TP410 I2C initialization.
+            hdmi_pads = platform.request("hdmi")
+            self.submodules.videophy = VideoDVIPHY(hdmi_pads, clock_domain="init")
+            self.submodules.videoi2c = I2CMaster(hdmi_pads)
+            self.videoi2c.add_init(addr=0x38, init=[
+                (0x08, 0x35) # CTL_1_MODE: Normal operation, 24-bit, HSYNC/VSYNC.
+            ])
+
+            # Video Terminal/Framebuffer.
+            if with_video_terminal:
+                self.add_video_terminal(phy=self.videophy, timings="640x480@75Hz", clock_domain="init")
+            if with_video_framebuffer:
+                self.add_video_framebuffer(phy=self.videophy, timings="640x480@75Hz", clock_domain="init")
+
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
+
+        # GPIOs ------------------------------------------------------------------------------------
+        if with_pmod_gpio:
+            platform.add_extension(trellisboard.raw_pmod_io("pmoda"))
+            self.submodules.gpio = GPIOTristate(platform.request("pmoda"))
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Trellis Board")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain",       default="trellis",   help="FPGA toolchain: trellis (default) or diamond")
-    parser.add_argument("--sys-clk-freq",    default=75e6,        help="System clock frequency (default: 75MHz)")
-    parser.add_argument("--with-ethernet",   action="store_true", help="Enable Ethernet support")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--toolchain",       default="trellis",   help="FPGA toolchain (trellis or diamond).")
+    parser.add_argument("--sys-clk-freq",    default=75e6,        help="System clock frequency.")
+    parser.add_argument("--with-ethernet",   action="store_true", help="Enable Ethernet support.")
+    viopts = parser.add_mutually_exclusive_group()
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (HDMI).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (HDMI).")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support")
+    sdopts.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support.")
+    parser.add_argument("--with-pmod-gpio",  action="store_true", help="Enable GPIOs through PMOD.") # FIXME: Temporary test.
     builder_args(parser)
     soc_core_args(parser)
     trellis_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq  = int(float(args.sys_clk_freq)),
-        with_ethernet = args.with_ethernet,
+        sys_clk_freq           = int(float(args.sys_clk_freq)),
+        with_ethernet          = args.with_ethernet,
+        with_video_terminal    = args.with_video_terminal,
+        with_video_framebuffer = args.with_video_framebuffer,
+        with_pmod_gpio         = args.with_pmod_gpio,
         **soc_core_argdict(args)
     )
     if args.with_spi_sdcard:

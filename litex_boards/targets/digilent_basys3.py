@@ -29,7 +29,7 @@ class _CRG(Module):
         self.clock_domains.cd_vga       = ClockDomain(reset_less=True)
 
         self.submodules.pll = pll = S7MMCM(speedgrade=-1)
-        self.comb += pll.reset.eq(~platform.request("user_btnc") | self.rst)
+        self.comb += pll.reset.eq(platform.request("user_btnc") | self.rst)
 
         pll.register_clkin(platform.request("clk100"), 100e6)
         pll.create_clkout(self.cd_sys, sys_clk_freq)
@@ -40,13 +40,12 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), with_video_terminal=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(75e6), with_led_chaser=True, with_video_terminal=False, **kwargs):
         platform = basys3.Platform()
 
         # SoCCore ----------------------------------_-----------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Basys3",
-            ident_version  = True,
+            ident = "LiteX SoC on Basys3",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -59,22 +58,23 @@ class BaseSoC(SoCCore):
                 self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------  
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Basys3")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream")
-    parser.add_argument("--sys-clk-freq",        default=75e6,        help="System clock frequency (default: 75MHz)")
+    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
+    parser.add_argument("--sys-clk-freq",        default=75e6,        help="System clock frequency.")
     sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",     action="store_true", help="Enable SPI-mode SDCard support")
-    sdopts.add_argument("--with-sdcard",         action="store_true", help="Enable SDCard support")
-    parser.add_argument("--sdcard-adapter",      type=str,            help="SDCard PMOD adapter: digilent (default) or numato")
+    sdopts.add_argument("--with-spi-sdcard",     action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",         action="store_true", help="Enable SDCard support.")
+    parser.add_argument("--sdcard-adapter",      type=str,            help="SDCard PMOD adapter (digilent or numato).")
     viopts = parser.add_mutually_exclusive_group()
-    viopts.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA)")
+    viopts.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

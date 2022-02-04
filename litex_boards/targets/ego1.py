@@ -19,8 +19,7 @@ from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
-
-from litevideo.terminal.core import Terminal
+from litex.soc.cores.video import VideoVGAPHY
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -39,46 +38,38 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(100e6), with_vga=False, **kwargs):
+    def __init__(self, sys_clk_freq=int(100e6), with_led_chaser=True, with_video_terminal=False, **kwargs):
         platform = ego1.Platform()
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on EGO1 Board",
-            ident_version  = True,
+            ident = "LiteX SoC on EGO1 Board",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
         self.submodules.crg = _CRG(platform, sys_clk_freq)
 
         # VGA terminal -----------------------------------------------------------------------------
-        if with_vga:
-            self.submodules.terminal = terminal = Terminal()
-            self.bus.add_slave("terminal", self.terminal.bus, region=SoCRegion(origin=0x30000000, size=0x10000))
-            vga_pads = platform.request("vga")
-            self.comb += [
-                vga_pads.vsync.eq(terminal.vsync),
-                vga_pads.hsync.eq(terminal.hsync),
-                vga_pads.red.eq(terminal.red[4:8]),
-                vga_pads.green.eq(terminal.green[4:8]),
-                vga_pads.blue.eq(terminal.blue[4:8])
-            ]
+        if with_video_terminal:
+            self.submodules.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
+            self.add_video_terminal(phy=self.videophy, timings="640x480@75Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
-        self.add_csr("leds")
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
+            self.add_csr("leds")
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on EGO1")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--flash",           action="store_true", help="Flash bitstream")
-    parser.add_argument("--with-vga",        action="store_true", help="Enagle VGA Terminal")
-    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency (default: 100MHz)")
+    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
+    parser.add_argument("--flash",               action="store_true", help="Flash bitstream.")
+    parser.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal.")
+    parser.add_argument("--sys-clk-freq",        default=100e6,       help="System clock frequency.")
 
     builder_args(parser)
     soc_core_args(parser)
@@ -86,8 +77,8 @@ def main():
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq   = int(float(args.sys_clk_freq)),
-        with_vga       = args.with_vga,
+        sys_clk_freq        = int(float(args.sys_clk_freq)),
+        with_video_terminal = args.with_video_terminal,
         **soc_core_argdict(args)
     )
 

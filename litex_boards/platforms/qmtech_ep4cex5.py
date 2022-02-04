@@ -19,13 +19,6 @@ _io = [
     ("key", 0, Pins("Y13"),  IOStandard("3.3-V LVTTL")),
     ("key", 1, Pins("W13"),  IOStandard("3.3-V LVTTL")),
 
-    # Serial
-    ("serial", 0,
-        # Compatible with cheap FT232 based cables (ex: Gaoominy 6Pin Ftdi Ft232Rl Ft232)
-        Subsignal("tx", Pins("J3:7"), IOStandard("3.3-V LVTTL")), # GPIO_07 (JP1 Pin 10)
-        Subsignal("rx", Pins("J3:8"), IOStandard("3.3-V LVTTL"))  # GPIO_05 (JP1 Pin 8)
-    ),
-
     # SPIFlash (W25Q64)
     ("spiflash", 0,
         # clk
@@ -129,10 +122,19 @@ _connectors = [
 class Platform(AlteraPlatform):
     default_clk_name   = "clk50"
     default_clk_period = 1e9/50e6
-    core_resources = [ ("user_led", 0, Pins("E4"), IOStandard("3.3-V LVTTL")) ]
+    core_resources = [
+        ("user_led", 0, Pins("E4"), IOStandard("3.3-V LVTTL")),
+        ("serial", 0,
+            Subsignal("tx", Pins("J3:7"), IOStandard("3.3-V LVTTL")),
+            Subsignal("rx", Pins("J3:8"), IOStandard("3.3-V LVTTL"))
+        ),
+    ]
 
-    def __init__(self, with_daughterboard=False):
-        device = "EP4CE15F23C8"
+    def __init__(self, variant="ep4ce15", with_daughterboard=False):
+        device = {
+            "ep4ce15": "EP4CE15F23C8",
+            "ep4ce55": "EP4CE55F23C8"
+        }[variant]
         io = _io
         connectors = _connectors
 

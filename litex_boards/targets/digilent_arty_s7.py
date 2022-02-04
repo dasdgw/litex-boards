@@ -51,13 +51,12 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, variant="s7-50", sys_clk_freq=int(100e6), **kwargs):
+    def __init__(self, variant="s7-50", sys_clk_freq=int(100e6), with_spi_flash=False, with_led_chaser=True, **kwargs):
         platform = arty_s7.Platform(variant=variant)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Arty S7",
-            ident_version  = True,
+            ident = "LiteX SoC on Arty S7",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -75,27 +74,36 @@ class BaseSoC(SoCCore):
                 l2_cache_size = kwargs.get("l2_size", 8192)
             )
 
+        # SPI Flash --------------------------------------------------------------------------------
+        if with_spi_flash:
+            from litespi.modules import S25FL128S
+            from litespi.opcodes import SpiNorFlashOpCodes as Codes
+            self.add_spi_flash(mode="4x", module=S25FL128S(Codes.READ_1_1_4), with_master=True)
+
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Arty S7")
-    parser.add_argument("--build",        action="store_true", help="Build bitstream")
-    parser.add_argument("--load",         action="store_true", help="Load bitstream")
-    parser.add_argument("--variant",      default="s7-50",     help="Board variant: s7-50 (default) or s7-25")
-    parser.add_argument("--sys-clk-freq", default=100e6,       help="System clock frequency (default: 100MHz)")
+    parser.add_argument("--build",          action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",           action="store_true", help="Load bitstream.")
+    parser.add_argument("--variant",        default="s7-50",     help="Board variant (s7-50 or s7-25).")
+    parser.add_argument("--sys-clk-freq",   default=100e6,       help="System clock frequency.")
+    parser.add_argument("--with-spi-flash", action="store_true", help="Enable SPI Flash (MMAPed).")
     builder_args(parser)
     soc_core_args(parser)
     vivado_build_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        variant      = args.variant,
-        sys_clk_freq = int(float(args.sys_clk_freq)),
+        variant        = args.variant,
+        sys_clk_freq   = int(float(args.sys_clk_freq)),
+        with_spi_flash = args.with_spi_flash,
         **soc_core_argdict(args)
     )
     builder = Builder(soc, **builder_argdict(args))

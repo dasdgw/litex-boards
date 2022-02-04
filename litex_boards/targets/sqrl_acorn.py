@@ -72,13 +72,13 @@ class CRG(Module):
 # BaseSoC -----------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, variant="cle-215+", sys_clk_freq=int(100e6), with_pcie=False, with_sata=False, **kwargs):
+    def __init__(self, variant="cle-215+", sys_clk_freq=int(100e6), with_led_chaser=True,
+                 with_pcie=False, with_sata=False, **kwargs):
         platform = acorn.Platform(variant=variant)
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on Acorn CLE-101/215(+)",
-            ident_version  = True,
+            ident = "LiteX SoC on Acorn CLE-101/215(+)",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -103,12 +103,12 @@ class BaseSoC(SoCCore):
                 data_width = 128,
                 bar0_size  = 0x20000)
             self.add_pcie(phy=self.pcie_phy, ndmas=1)
-            # FIXME: Improve (Make it generic and apply it to all targets).
-            platform.toolchain.pre_placement_commands.append("set_clock_groups -group [get_clocks main_crg_clkout0] -group [get_clocks userclk2] -asynchronous",)
-            platform.toolchain.pre_placement_commands.append("set_clock_groups -group [get_clocks main_crg_clkout0] -group [get_clocks clk_125mhz] -asynchronous")
-            platform.toolchain.pre_placement_commands.append("set_clock_groups -group [get_clocks main_crg_clkout0] -group [get_clocks clk_250mhz] -asynchronous")
-            platform.toolchain.pre_placement_commands.append("set_clock_groups -group [get_clocks clk_125mhz] -group [get_clocks clk_250mhz] -asynchronous")
-
+            # FIXME: Apply it to all targets (integrate it in LitePCIe?).
+            platform.add_period_constraint(self.crg.cd_sys.clk, 1e9/sys_clk_freq)
+            platform.toolchain.pre_placement_commands.add("set_clock_groups -group [get_clocks {sys_clk}] -group [get_clocks userclk2] -asynchronous", sys_clk=self.crg.cd_sys.clk)
+            platform.toolchain.pre_placement_commands.add("set_clock_groups -group [get_clocks {sys_clk}] -group [get_clocks clk_125mhz] -asynchronous", sys_clk=self.crg.cd_sys.clk)
+            platform.toolchain.pre_placement_commands.add("set_clock_groups -group [get_clocks {sys_clk}] -group [get_clocks clk_250mhz] -asynchronous", sys_clk=self.crg.cd_sys.clk)
+            platform.toolchain.pre_placement_commands.add("set_clock_groups -group [get_clocks clk_125mhz] -group [get_clocks clk_250mhz] -asynchronous")
 
             # ICAP (For FPGA reload over PCIe).
             from litex.soc.cores.icap import ICAP
@@ -116,7 +116,7 @@ class BaseSoC(SoCCore):
             self.icap.add_reload()
             self.icap.add_timing_constraints(platform, sys_clk_freq, self.crg.cd_sys.clk)
 
-            # Flash (For SPIFlash update over PCIe). FIXME: Should probably be updated to use SpiFlashSingle/SpiFlashDualQuad (so MMAPed and do the update with bit-banging)
+            # Flash (For SPIFlash update over PCIe).
             from litex.soc.cores.gpio import GPIOOut
             from litex.soc.cores.spi_flash import S7SPIFlash
             self.submodules.flash_cs_n = GPIOOut(platform.request("flash_cs_n"))
@@ -157,24 +157,25 @@ class BaseSoC(SoCCore):
             self.add_sata(phy=self.sata_phy, mode="read+write")
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = platform.request_all("user_led"),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = platform.request_all("user_led"),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Acorn CLE-101/215(+)")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--flash",           action="store_true", help="Flash bitstream")
-    parser.add_argument("--variant",         default="cle-215+",  help="Board variant: cle-215+ (default), cle-215 or cle-101")
-    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency (default: 100MHz)")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--flash",           action="store_true", help="Flash bitstream.")
+    parser.add_argument("--variant",         default="cle-215+",  help="Board variant (cle-215+, cle-215 or cle-101).")
+    parser.add_argument("--sys-clk-freq",    default=100e6,       help="System clock frequency.")
     pcieopts = parser.add_mutually_exclusive_group()
-    pcieopts.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support")
-    parser.add_argument("--driver",          action="store_true", help="Generate PCIe driver")
-    parser.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support (requires SDCard adapter on P2)")
-    pcieopts.add_argument("--with-sata",     action="store_true", help="Enable SATA support (over PCIe2SATA)")
+    pcieopts.add_argument("--with-pcie",     action="store_true", help="Enable PCIe support.")
+    parser.add_argument("--driver",          action="store_true", help="Generate PCIe driver.")
+    parser.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support (requires SDCard adapter on P2).")
+    pcieopts.add_argument("--with-sata",     action="store_true", help="Enable SATA support (over PCIe2SATA).")
     builder_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()

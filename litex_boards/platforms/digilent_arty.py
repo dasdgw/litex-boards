@@ -98,7 +98,7 @@ _io = [
     ("spiflash4x", 0,
         Subsignal("cs_n", Pins("L13")),
         Subsignal("clk",  Pins("L16")),
-        Subsignal("dq",   Pins("K17", "K18", "L14", "M14")),
+        Subsignal("dq",   Pins("K17 K18 L14 M14")),
         IOStandard("LVCMOS33")
     ),
 
@@ -250,6 +250,9 @@ _connectors = [
 
 # PMODS --------------------------------------------------------------------------------------------
 
+def raw_pmod_io(pmod):
+    return [(pmod, 0, Pins(" ".join([f"{pmod}:{i:d}" for i in range(8)])), IOStandard("LVCMOS33"))]
+
 def usb_pmod_io(pmod):
     return [
         # USB-UART PMOD: https://store.digilentinc.com/pmod-usbuart-usb-to-uart-interface/
@@ -292,7 +295,7 @@ def sdcard_pmod_io(pmod):
             Subsignal("mosi", Pins(f"{pmod}:1"), Misc("PULLUP True")),
             Subsignal("cs_n", Pins(f"{pmod}:0"), Misc("PULLUP True")),
             Subsignal("miso", Pins(f"{pmod}:2"), Misc("PULLUP True")),
-            Misc("SLEW=FAST"),
+            Misc("SLEW=FAST"), #NOTE: this is not supported by yosys+nextprn toolchain
             IOStandard("LVCMOS33"),
         ),
         ("sdcard", 0,
@@ -300,7 +303,7 @@ def sdcard_pmod_io(pmod):
             Subsignal("cmd",  Pins(f"{pmod}:1"), Misc("PULLUP True")),
             Subsignal("clk",  Pins(f"{pmod}:3")),
             Subsignal("cd",   Pins(f"{pmod}:6")),
-            Misc("SLEW=FAST"),
+            Misc("SLEW=FAST"), #NOTE: this and all Misc() is not supported by yosys+nextprn toolchain
             IOStandard("LVCMOS33"),
         ),
 ]
@@ -346,7 +349,8 @@ class Platform(XilinxPlatform):
         self.toolchain.additional_commands = \
             ["write_cfgmem -force -format bin -interface spix4 -size 16 "
              "-loadbit \"up 0x0 {build_name}.bit\" -file {build_name}.bin"]
-        self.add_platform_command("set_property INTERNAL_VREF 0.675 [get_iobanks 34]")
+        if toolchain != "yosys+nextpnr": #this is not supported by yosys+pnr
+            self.add_platform_command("set_property INTERNAL_VREF 0.675 [get_iobanks 34]")
 
     def create_programmer(self):
         bscan_spi = "bscan_spi_xc7a100t.bit" if "xc7a100t" in self.device else "bscan_spi_xc7a35t.bit"
@@ -354,5 +358,4 @@ class Platform(XilinxPlatform):
 
     def do_finalize(self, fragment):
         XilinxPlatform.do_finalize(self, fragment)
-        from litex.build.xilinx import symbiflow
         self.add_period_constraint(self.lookup_request("clk100", loose=True), 1e9/100e6)

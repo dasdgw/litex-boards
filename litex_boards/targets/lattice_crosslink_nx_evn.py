@@ -17,7 +17,6 @@ from litex_boards.platforms import crosslink_nx_evn
 
 from litex.soc.cores.ram import NXLRAM
 from litex.soc.cores.clock import NXPLL
-from litex.soc.cores.spi_flash import SpiFlash
 from litex.build.io import CRG
 from litex.build.generic_platform import *
 
@@ -68,9 +67,8 @@ class BaseSoC(SoCCore):
         "sram" : 0x40000000,
         "csr"  : 0xf0000000,
     }
-    def __init__(self, sys_clk_freq=int(75e6), toolchain="radiant", **kwargs):
-        platform = crosslink_nx_evn.Platform(toolchain=toolchain)
-        platform.add_platform_command("ldc_set_sysconfig {{MASTER_SPI_PORT=SERIAL}}")
+    def __init__(self, sys_clk_freq=int(75e6), device="LIFCL-40-9BG400C", toolchain="radiant", with_led_chaser=True, **kwargs):
+        platform = crosslink_nx_evn.Platform(device=device, toolchain=toolchain)
 
         # Disable Integrated SRAM since we want to instantiate LRAM specifically for it
         kwargs["integrated_sram_size"] = 0
@@ -80,8 +78,7 @@ class BaseSoC(SoCCore):
 
         # SoCCore -----------------------------------------_----------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident         = "LiteX SoC on Crosslink-NX Evaluation Board",
-            ident_version = True,
+            ident = "LiteX SoC on Crosslink-NX Evaluation Board",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -93,20 +90,22 @@ class BaseSoC(SoCCore):
         self.register_mem("sram", self.mem_map["sram"], self.spram.bus, size)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
-            pads         = Cat(*[platform.request("user_led", i) for i in range(14)]),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            self.submodules.leds = LedChaser(
+                pads         = Cat(*[platform.request("user_led", i) for i in range(14)]),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Crosslink-NX Eval Board")
-    parser.add_argument("--build",         action="store_true", help="Build bitstream")
-    parser.add_argument("--load",          action="store_true", help="Load bitstream")
-    parser.add_argument("--toolchain",     default="radiant",   help="FPGA toolchain: radiant (default) or prjoxide")
-    parser.add_argument("--sys-clk-freq",  default=75e6,        help="System clock frequency (default: 75MHz)")
-    parser.add_argument("--serial",        default="serial",    help="UART Pins: serial (default, requires R15 and R17 to be soldered) or serial_pmod[0-2]")
-    parser.add_argument("--prog-target",   default="direct",    help="Programming Target: direct or flash")
+    parser.add_argument("--build",         action="store_true",        help="Build bitstream.")
+    parser.add_argument("--load",          action="store_true",        help="Load bitstream.")
+    parser.add_argument("--toolchain",     default="radiant",          help="FPGA toolchain (radiant or prjoxide).")
+    parser.add_argument("--device",        default="LIFCL-40-9BG400C", help="FPGA device (LIFCL-40-9BG400C or LIFCL-40-8BG400CES).")
+    parser.add_argument("--sys-clk-freq",  default=75e6,               help="System clock frequency.")
+    parser.add_argument("--serial",        default="serial",           help="UART Pins (serial (requires R15 and R17 to be soldered) or serial_pmod[0-2]).")
+    parser.add_argument("--prog-target",   default="direct",           help="Programming Target (direct or flash).")
     builder_args(parser)
     soc_core_args(parser)
     oxide_args(parser)
@@ -114,6 +113,7 @@ def main():
 
     soc = BaseSoC(
         sys_clk_freq = int(float(args.sys_clk_freq)),
+        device       = args.device,
         toolchain    = args.toolchain,
         **soc_core_argdict(args)
     )

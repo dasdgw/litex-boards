@@ -78,13 +78,13 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, device="85F", sys_clk_freq=int(75e6), with_ethernet=False, with_etherbone=False, **kwargs):
+    def __init__(self, device="85F", sys_clk_freq=int(75e6), with_ethernet=False,
+                 with_etherbone=False, with_led_chaser=True, **kwargs):
         platform = ecpix5.Platform(device=device, toolchain="trellis")
 
         # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident          = "LiteX SoC on ECPIX-5",
-            ident_version  = True,
+            ident = "LiteX SoC on ECPIX-5",
             **kwargs)
 
         # CRG --------------------------------------------------------------------------------------
@@ -115,28 +115,29 @@ class BaseSoC(SoCCore):
                 self.add_etherbone(phy=self.ethphy)
 
         # Leds -------------------------------------------------------------------------------------
-        leds_pads = []
-        for i in range(4):
-            rgb_led_pads = platform.request("rgb_led", i)
-            self.comb += [getattr(rgb_led_pads, n).eq(1) for n in "gb"] # Disable Green/Blue Leds.
-            leds_pads += [getattr(rgb_led_pads, n) for n in "r"]
-        self.submodules.leds = LedChaser(
-            pads         = Cat(leds_pads),
-            sys_clk_freq = sys_clk_freq)
+        if with_led_chaser:
+            leds_pads = []
+            for i in range(4):
+                rgb_led_pads = platform.request("rgb_led", i)
+                self.comb += [getattr(rgb_led_pads, n).eq(1) for n in "gb"] # Disable Green/Blue Leds.
+                leds_pads += [getattr(rgb_led_pads, n) for n in "r"]
+            self.submodules.leds = LedChaser(
+                pads         = Cat(leds_pads),
+                sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on ECPIX-5")
-    parser.add_argument("--build",           action="store_true", help="Build bitstream")
-    parser.add_argument("--load",            action="store_true", help="Load bitstream")
-    parser.add_argument("--flash",           action="store_true", help="Flash bitstream to SPI Flash")
-    parser.add_argument("--device",          default="85F",       help="ECP5 device (default: 85F)")
-    parser.add_argument("--sys-clk-freq",    default=75e6,        help="System clock frequency (default: 75MHz)")
-    parser.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support")
+    parser.add_argument("--build",           action="store_true", help="Build bitstream.")
+    parser.add_argument("--load",            action="store_true", help="Load bitstream.")
+    parser.add_argument("--flash",           action="store_true", help="Flash bitstream to SPI Flash.")
+    parser.add_argument("--device",          default="85F",       help="ECP5 device (45F or 85F).")
+    parser.add_argument("--sys-clk-freq",    default=75e6,        help="System clock frequency.")
+    parser.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support.")
     ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support")
-    ethopts.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support")
+    ethopts.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support.")
 
     builder_args(parser)
     soc_core_args(parser)
