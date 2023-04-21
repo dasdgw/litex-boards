@@ -6,15 +6,14 @@
 # Copyright (c) 2019 msloniewski <marcin.sloniewski@gmail.com>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
+from litex.gen import *
+
 from litex.build.io import DDROutput
 
-from litex_boards.platforms import de10lite
+from litex_boards.platforms import terasic_de10lite
 
 from litex.soc.cores.clock import Max10PLL
 from litex.soc.integration.soc import SoCRegion
@@ -28,12 +27,12 @@ from litedram.phy import GENSDRPHY
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys    = ClockDomain()
-        self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
-        self.clock_domains.cd_vga    = ClockDomain(reset_less=True)
+        self.rst       = Signal()
+        self.cd_sys    = ClockDomain()
+        self.cd_sys_ps = ClockDomain()
+        self.cd_vga    = ClockDomain()
 
         # # #
 
@@ -41,7 +40,7 @@ class _CRG(Module):
         clk50 = platform.request("clk50")
 
         # PLL
-        self.submodules.pll = pll = Max10PLL(speedgrade="-7")
+        self.pll = pll = Max10PLL(speedgrade="-7")
         self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(clk50, 50e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
@@ -54,21 +53,21 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(50e6), with_led_chaser=True, with_video_terminal=False,
-                 **kwargs):
-        platform = de10lite.Platform()
-
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on DE10-Lite",
-            **kwargs)
+    def __init__(self, sys_clk_freq=50e6,
+        with_led_chaser     = True,
+        with_video_terminal = False,
+        **kwargs):
+        platform = terasic_de10lite.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on DE10-Lite", **kwargs)
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
+            self.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
                 phy           = self.sdrphy,
                 module        = IS42S16320(sys_clk_freq, "1:1"),
@@ -77,38 +76,36 @@ class BaseSoC(SoCCore):
 
         # Video Terminal ---------------------------------------------------------------------------
         if with_video_terminal:
-            self.submodules.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
+            self.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
             self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on DE10-Lite")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq",        default=50e6,        help="System clock frequency.")
-    parser.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA).")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=terasic_de10lite.Platform, description="LiteX SoC on DE10-Lite.")
+    parser.add_target_argument("--sys-clk-freq",        default=50e6, type=float, help="System clock frequency.")
+    parser.add_target_argument("--with-video-terminal", action="store_true",      help="Enable Video Terminal (VGA).")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq        = int(float(args.sys_clk_freq)),
+        sys_clk_freq        = args.sys_clk_freq,
         with_video_terminal = args.with_video_terminal,
-        **soc_core_argdict(args)
+        **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".sof"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

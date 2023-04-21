@@ -12,7 +12,7 @@
 # RHSResearchLLC that are documented at: https://github.com/RHSResearchLLC/NiteFury-and-LiteFury.
 
 from litex.build.generic_platform import *
-from litex.build.xilinx import XilinxPlatform, VivadoProgrammer
+from litex.build.xilinx import Xilinx7SeriesPlatform, VivadoProgrammer
 from litex.build.openocd import OpenOCD
 
 # IOs ----------------------------------------------------------------------------------------------
@@ -105,18 +105,18 @@ _sdcard_io = [
 
 # Platform -----------------------------------------------------------------------------------------
 
-class Platform(XilinxPlatform):
+class Platform(Xilinx7SeriesPlatform):
     default_clk_name   = "clk200"
     default_clk_period = 1e9/200e6
 
-    def __init__(self, variant="cle-215+"):
+    def __init__(self, variant="cle-215+", toolchain="vivado"):
         device = {
             "cle-101":  "xc7a100t-fgg484-2",
             "cle-215":  "xc7a200t-fbg484-2",
             "cle-215+": "xc7a200t-fbg484-3"
         }[variant]
 
-        XilinxPlatform.__init__(self, device, _io, toolchain="vivado")
+        Xilinx7SeriesPlatform.__init__(self, device, _io, toolchain=toolchain)
         self.add_extension(_serial_io)
         self.add_extension(_sdcard_io)
         self.add_platform_command("set_property INTERNAL_VREF 0.750 [get_iobanks 34]")
@@ -153,5 +153,5 @@ class Platform(XilinxPlatform):
             return VivadoProgrammer(flash_part='s25fl256sxxxxxx0-spi-x1_x2_x4')
 
     def do_finalize(self, fragment):
-        XilinxPlatform.do_finalize(self, fragment)
+        Xilinx7SeriesPlatform.do_finalize(self, fragment)
         self.add_period_constraint(self.lookup_request("clk200", loose=True), 1e9/200e6)

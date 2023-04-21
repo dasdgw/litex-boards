@@ -40,18 +40,14 @@
 # Etherbone stack that need to be optimized. It was initially just used to validate the reversed
 # pinout but happens to work on hardware...
 
-import os
-import argparse
-import sys
-
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from litex.gen import *
 
 from litex.build.io import DDROutput
 
 from litex_boards.platforms import colorlight_5a_75b, colorlight_5a_75e
-
-from litex.build.lattice.trellis import trellis_args, trellis_argdict
 
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
@@ -65,15 +61,15 @@ from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq, use_internal_osc=False, with_usb_pll=False, with_rst=True, sdram_rate="1:1"):
-        self.rst = Signal()
-        self.clock_domains.cd_sys    = ClockDomain()
+        self.rst    = Signal()
+        self.cd_sys = ClockDomain()
         if sdram_rate == "1:2":
-            self.clock_domains.cd_sys2x    = ClockDomain()
-            self.clock_domains.cd_sys2x_ps = ClockDomain(reset_less=True)
+            self.cd_sys2x    = ClockDomain()
+            self.cd_sys2x_ps = ClockDomain()
         else:
-            self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
+            self.cd_sys_ps = ClockDomain()
 
         # # #
 
@@ -92,7 +88,7 @@ class _CRG(Module):
         rst_n = 1 if not with_rst else platform.request("user_btn_n", 0)
 
         # PLL
-        self.submodules.pll = pll = ECP5PLL()
+        self.pll = pll = ECP5PLL()
         self.comb += pll.reset.eq(~rst_n | self.rst)
         pll.register_clkin(clk, clk_freq)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
@@ -104,11 +100,11 @@ class _CRG(Module):
 
         # USB PLL
         if with_usb_pll:
-            self.submodules.usb_pll = usb_pll = ECP5PLL()
+            self.usb_pll = usb_pll = ECP5PLL()
             self.comb += usb_pll.reset.eq(~rst_n | self.rst)
             usb_pll.register_clkin(clk, clk_freq)
-            self.clock_domains.cd_usb_12 = ClockDomain()
-            self.clock_domains.cd_usb_48 = ClockDomain()
+            self.cd_usb_12 = ClockDomain()
+            self.cd_usb_48 = ClockDomain()
             usb_pll.create_clkout(self.cd_usb_12, 12e6, margin=0)
             usb_pll.create_clkout(self.cd_usb_48, 48e6, margin=0)
 
@@ -119,33 +115,42 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, board, revision, sys_clk_freq=60e6, with_ethernet=False,
-                 with_etherbone=False, eth_ip="192.168.1.50", eth_phy=0, with_led_chaser=True,
-                 use_internal_osc=False, sdram_rate="1:1", **kwargs):
+    def __init__(self, board, revision, sys_clk_freq=60e6, toolchain="trellis",
+        with_ethernet    = False,
+        with_etherbone   = False,
+        eth_ip           = "192.168.1.50",
+        eth_phy          = 0,
+        with_led_chaser  = True,
+        use_internal_osc = False,
+        sdram_rate       = "1:1",
+        **kwargs):
         board = board.lower()
         assert board in ["5a-75b", "5a-75e"]
         if board == "5a-75b":
-            platform = colorlight_5a_75b.Platform(revision=revision)
+            platform = colorlight_5a_75b.Platform(revision=revision, toolchain=toolchain)
         elif board == "5a-75e":
-            platform = colorlight_5a_75e.Platform(revision=revision)
+            platform = colorlight_5a_75e.Platform(revision=revision, toolchain=toolchain)
 
         if board == "5a-75e" and revision == "6.0" and (with_etherbone or with_ethernet):
             assert use_internal_osc, "You cannot use the 25MHz clock as system clock since it is provided by the Ethernet PHY and will stop during PHY reset."
 
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, int(sys_clk_freq),
-            ident = "LiteX SoC on Colorlight " + board.upper(),
-            **kwargs)
-
         # CRG --------------------------------------------------------------------------------------
-        with_rst = kwargs["uart_name"] not in ["serial", "crossover"] # serial_rx shared with user_btn_n.
+        with_rst     = kwargs["uart_name"] not in ["serial", "crossover"] # serial_rx shared with user_btn_n.
         with_usb_pll = kwargs.get("uart_name", None) == "usb_acm"
-        self.submodules.crg = _CRG(platform, sys_clk_freq, use_internal_osc=use_internal_osc, with_usb_pll=with_usb_pll,with_rst=with_rst, sdram_rate=sdram_rate)
+        self.crg = _CRG(platform, sys_clk_freq,
+            use_internal_osc = use_internal_osc,
+            with_usb_pll     = with_usb_pll,
+            with_rst         = with_rst,
+            sdram_rate       = sdram_rate
+        )
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, int(sys_clk_freq), ident="LiteX SoC on Colorlight " + board.upper(), **kwargs)
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
             sdrphy_cls = HalfRateGENSDRPHY if sdram_rate == "1:2" else GENSDRPHY
-            self.submodules.sdrphy = sdrphy_cls(platform.request("sdram"), sys_clk_freq)
+            self.sdrphy = sdrphy_cls(platform.request("sdram"), sys_clk_freq)
             if board == "5a-75e" and revision == "6.0":
                 sdram_cls  = M12L64322A
             else:
@@ -160,59 +165,58 @@ class BaseSoC(SoCCore):
 
         # Ethernet / Etherbone ---------------------------------------------------------------------
         if with_ethernet or with_etherbone:
-            self.submodules.ethphy = LiteEthPHYRGMII(
+            self.ethphy = LiteEthPHYRGMII(
                 clock_pads = self.platform.request("eth_clocks", eth_phy),
                 pads       = self.platform.request("eth", eth_phy),
                 tx_delay   = 0e-9)
             if with_ethernet:
-                self.add_ethernet(phy=self.ethphy)
+                self.add_ethernet(phy=self.ethphy, data_width=32)
             if with_etherbone:
-                self.add_etherbone(phy=self.ethphy, ip_address=eth_ip)
+                self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32)
 
         # Leds -------------------------------------------------------------------------------------
         # Disable leds when serial is used.
         if platform.lookup_request("serial", loose=True) is None and with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led_n"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Colorlight 5A-75X")
-    parser.add_argument("--build",             action="store_true",              help="Build bitstream.")
-    parser.add_argument("--load",              action="store_true",              help="Load bitstream.")
-    parser.add_argument("--board",             default="5a-75b",                 help="Board type (5a-75b or 5a-75e).")
-    parser.add_argument("--revision",          default="7.0", type=str,          help="Board revision (6.0, 6.1, 7.0 or 8.0).")
-    parser.add_argument("--sys-clk-freq",      default=60e6,                     help="System clock frequency")
-    ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",    action="store_true",              help="Enable Ethernet support.")
-    ethopts.add_argument("--with-etherbone",   action="store_true",              help="Enable Etherbone support.")
-    parser.add_argument("--eth-ip",            default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
-    parser.add_argument("--eth-phy",           default=0, type=int,              help="Ethernet PHY (0 or 1).")
-    parser.add_argument("--use-internal-osc",  action="store_true",              help="Use internal oscillator.")
-    parser.add_argument("--sdram-rate",        default="1:1",                    help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
-    builder_args(parser)
-    soc_core_args(parser)
-    trellis_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=colorlight_5a_75b.Platform, description="LiteX SoC on Colorlight 5A-75X.")
+    parser.add_target_argument("--board",             default="5a-75b",         help="Board type (5a-75b or 5a-75e).")
+    parser.add_target_argument("--revision",          default="7.0",            help="Board revision (6.0, 6.1, 7.0 or 8.0).")
+    parser.add_target_argument("--sys-clk-freq",      default=60e6, type=float, help="System clock frequency.")
+    ethopts = parser.target_group.add_mutually_exclusive_group()
+    ethopts.add_argument("--with-ethernet",           action="store_true",    help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone",          action="store_true",    help="Enable Etherbone support.")
+    parser.add_target_argument("--eth-ip",            default="192.168.1.50", help="Ethernet/Etherbone IP address.")
+    parser.add_target_argument("--eth-phy",           default=0, type=int,    help="Ethernet PHY (0 or 1).")
+    parser.add_target_argument("--use-internal-osc",  action="store_true",    help="Use internal oscillator.")
+    parser.add_target_argument("--sdram-rate",        default="1:1",          help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
     args = parser.parse_args()
 
     soc = BaseSoC(board=args.board, revision=args.revision,
-        sys_clk_freq     = int(float(args.sys_clk_freq)),
+        sys_clk_freq     = args.sys_clk_freq,
+        toolchain        = args.toolchain,
         with_ethernet    = args.with_ethernet,
         with_etherbone   = args.with_etherbone,
         eth_ip           = args.eth_ip,
         eth_phy          = args.eth_phy,
         use_internal_osc = args.use_internal_osc,
         sdram_rate       = args.sdram_rate,
-        **soc_core_argdict(args)
+        **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(**trellis_argdict(args), run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".svf"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram", ext=".svf")) # FIXME
 
 if __name__ == "__main__":
     main()

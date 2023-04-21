@@ -8,15 +8,15 @@
 # Copyright (c) 2019 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-
 from migen import *
 
-from litex_boards.platforms import c10lprefkit
+from litex.gen import *
+
+from litex_boards.platforms import trenz_c10lprefkit
 
 from litex.soc.cores.clock import Cyclone10LPPLL
 from litex.soc.integration.soc_core import *
+from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
 
@@ -25,15 +25,15 @@ from litedram.phy import GENSDRPHY
 
 from liteeth.phy.mii import LiteEthPHYMII
 
-from litehyperbus.core.hyperbus import HyperRAM
+from litex.soc.cores.hyperbus import HyperRAM
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys    = ClockDomain()
-        self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
+        self.rst       = Signal()
+        self.cd_sys    = ClockDomain()
+        self.cd_sys_ps = ClockDomain()
 
         # # #
 
@@ -41,7 +41,7 @@ class _CRG(Module):
         clk12 = platform.request("clk12")
 
         # PLL
-        self.submodules.pll = pll = Cyclone10LPPLL(speedgrade="-A7")
+        self.pll = pll = Cyclone10LPPLL(speedgrade="-A7")
         self.comb += pll.reset.eq(~platform.request("cpu_reset") | self.rst)
         pll.register_clkin(clk12, 12e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
@@ -58,27 +58,26 @@ class BaseSoC(SoCCore):
     }
     mem_map.update(SoCCore.mem_map)
 
-    def __init__(self, sys_clk_freq=int(50e6), with_led_chaser=True,
-        with_ethernet=False, with_etherbone=False,
+    def __init__(self, sys_clk_freq=50e6,
+        with_led_chaser = True,
+        with_ethernet   = False,
+        with_etherbone  = False,
         **kwargs):
-        platform = c10lprefkit.Platform()
-
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on C10 LP RefKit",
-            **kwargs)
+        platform = trenz_c10lprefkit.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on C10 LP RefKit", **kwargs)
 
         # HyperRam ---------------------------------------------------------------------------------
-        self.submodules.hyperram = HyperRAM(platform.request("hyperram"))
-        self.add_wb_slave(self.mem_map["hyperram"], self.hyperram.bus)
-        self.add_memory_region("hyperram", self.mem_map["hyperram"], 8*1024*1024)
+        self.hyperram = HyperRAM(platform.request("hyperram"), sys_clk_freq=sys_clk_freq)
+        self.bus.add_slave("hyperram", slave=self.hyperram.bus, region=SoCRegion(origin=0x20000000, size=8*1024*1024))
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
+            self.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
                 phy           = self.sdrphy,
                 module        = MT48LC16M16(sys_clk_freq, "1:1"),
@@ -87,7 +86,7 @@ class BaseSoC(SoCCore):
 
         # Ethernet / Etherbone ---------------------------------------------------------------------
         if with_ethernet or with_etherbone:
-            self.submodules.ethphy = LiteEthPHYMII(
+            self.ethphy = LiteEthPHYMII(
                 clock_pads = self.platform.request("eth_clocks"),
                 pads       = self.platform.request("eth"))
             if with_ethernet:
@@ -97,35 +96,33 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on C10 LP RefKit")
-    parser.add_argument("--build",          action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",           action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq",   default=50e6,        help="System clock frequency.")
-    parser.add_argument("--with-ethernet",  action="store_true", help="Enable Ethernet support.")
-    parser.add_argument("--with-etherbone", action="store_true", help="Enable Etherbone support.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=trenz_c10lprefkit.Platform, description="LiteX SoC on C10 LP RefKit.")
+    parser.add_target_argument("--sys-clk-freq",   default=50e6, type=float, help="System clock frequency.")
+    parser.add_target_argument("--with-ethernet",  action="store_true",      help="Enable Ethernet support.")
+    parser.add_target_argument("--with-etherbone", action="store_true",      help="Enable Etherbone support.")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq   = int(float(args.sys_clk_freq)),
+        sys_clk_freq   = args.sys_clk_freq,
         with_ethernet  = args.with_ethernet,
         with_etherbone = args.with_etherbone,
-        **soc_core_argdict(args)
+        **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".sof"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

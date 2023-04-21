@@ -6,12 +6,11 @@
 # Copyright (c) 2020-2021 Xuanyu Hu <xuanyu.hu@whu.edu.cn>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-
 from migen import *
 
-from litex_boards.platforms import basys3
+from litex.gen import *
+
+from litex_boards.platforms import digilent_basys3
 
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc import SoCRegion
@@ -22,13 +21,13 @@ from litex.soc.cores.led import LedChaser
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys       = ClockDomain()
-        self.clock_domains.cd_vga       = ClockDomain(reset_less=True)
+        self.rst    = Signal()
+        self.cd_sys = ClockDomain()
+        self.cd_vga = ClockDomain()
 
-        self.submodules.pll = pll = S7MMCM(speedgrade=-1)
+        self.pll = pll = S7MMCM(speedgrade=-1)
         self.comb += pll.reset.eq(platform.request("user_btnc") | self.rst)
 
         pll.register_clkin(platform.request("clk100"), 100e6)
@@ -40,65 +39,57 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(75e6), with_led_chaser=True, with_video_terminal=False, **kwargs):
-        platform = basys3.Platform()
-
-        # SoCCore ----------------------------------_-----------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Basys3",
-            **kwargs)
+    def __init__(self, sys_clk_freq=75e6, with_led_chaser=True, with_video_terminal=False, **kwargs):
+        platform = digilent_basys3.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------_-----------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Basys3", **kwargs)
 
         # Video ------------------------------------------------------------------------------------
         if with_video_terminal:
-            self.submodules.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
+            self.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
             if with_video_terminal:
                 self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------  
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Basys3")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq",        default=75e6,        help="System clock frequency.")
-    sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",     action="store_true", help="Enable SPI-mode SDCard support.")
-    sdopts.add_argument("--with-sdcard",         action="store_true", help="Enable SDCard support.")
-    parser.add_argument("--sdcard-adapter",      type=str,            help="SDCard PMOD adapter (digilent or numato).")
-    viopts = parser.add_mutually_exclusive_group()
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=digilent_basys3.Platform, description="LiteX SoC on Basys3.")
+    parser.add_target_argument("--sys-clk-freq", default=75e6, type=float, help="System clock frequency.")
+    sdopts = parser.target_group.add_mutually_exclusive_group()
+    sdopts.add_argument("--with-spi-sdcard",       action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",           action="store_true", help="Enable SDCard support.")
+    parser.add_target_argument("--sdcard-adapter",                      help="SDCard PMOD adapter (digilent or numato).")
+    viopts = parser.target_group.add_mutually_exclusive_group()
     viopts.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA).")
-    builder_args(parser)
-    soc_core_args(parser)
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq           = int(float(args.sys_clk_freq)),
-        with_video_terminal    = args.with_video_terminal,
-        **soc_core_argdict(args)
+        sys_clk_freq        = args.sys_clk_freq,
+        with_video_terminal = args.with_video_terminal,
+        **parser.soc_argdict
     )
-    soc.platform.add_extension(basys3._sdcard_pmod_io)
+    soc.platform.add_extension(digilent_basys3._sdcard_pmod_io)
     if args.with_spi_sdcard:
         soc.add_spi_sdcard()
     if args.with_sdcard:
         soc.add_sdcard()
-    if args.with_spi_sdcard:
-        soc.add_spi_sdcard()
-    if args.with_sdcard:
-        soc.add_sdcard()
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

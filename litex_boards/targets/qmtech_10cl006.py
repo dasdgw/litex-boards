@@ -6,11 +6,10 @@
 # Copyright (c) 2021 Hans Baier <hansfbaier@gmail.com>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from litex.gen import *
 
 from litex.build.io import DDROutput
 
@@ -29,16 +28,16 @@ from liteeth.phy.mii import LiteEthPHYMII
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq, sdram_rate="1:1"):
-        self.rst = Signal()
-        self.clock_domains.cd_sys          = ClockDomain()
+        self.rst    = Signal()
+        self.cd_sys = ClockDomain()
 
         if sdram_rate == "1:2":
-            self.clock_domains.cd_sys2x    = ClockDomain()
-            self.clock_domains.cd_sys2x_ps = ClockDomain(reset_less=True)
+            self.cd_sys2x    = ClockDomain()
+            self.cd_sys2x_ps = ClockDomain()
         else:
-            self.clock_domains.cd_sys_ps   = ClockDomain(reset_less=True)
+            self.cd_sys_ps   = ClockDomain()
 
         # # #
 
@@ -46,7 +45,7 @@ class _CRG(Module):
         clk50 = platform.request("clk50")
 
         # PLL
-        self.submodules.pll = pll = Cyclone10LPPLL(speedgrade="-C8")
+        self.pll = pll = Cyclone10LPPLL(speedgrade="-C8")
         self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(clk50, 50e6)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
@@ -64,31 +63,37 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(50e6), with_daughterboard=False,
-                 with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50", eth_dynamic_ip=False,
-                 with_led_chaser=True, with_video_terminal=False, with_video_framebuffer=False,
-                 sdram_rate="1:1", **kwargs):
+    def __init__(self, sys_clk_freq=50e6, with_daughterboard=False,
+        with_ethernet          = False,
+        with_etherbone         = False,
+        eth_ip                 = "192.168.1.50",
+        eth_dynamic_ip         = False,
+        with_led_chaser        = True,
+        with_video_terminal    = False,
+        with_video_framebuffer = False,
+        sdram_rate             = "1:1",
+        **kwargs):
         platform = qmtech_10cl006.Platform(with_daughterboard=with_daughterboard)
 
-        # unfornunately not even SERV would fit the devices
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = _CRG(platform, sys_clk_freq, sdram_rate=sdram_rate)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        # Unfornunately not even SERV would fit the devices
         kwargs["cpu_type"]  = None
         kwargs["integrated_sram_size"]  = 0
 
-        # interact with the sdram with uartbone by default
+        # Interact with the sdram with uartbone by default
         kwargs["uart_name"] = "uartbone"
-
-        # SoCCore ----------------------------------------------------------------------------------
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident = "LiteX SoC on QMTECH 10CL006" + (" + Daughterboard" if with_daughterboard else ""),
-            **kwargs)
-
-        # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq, sdram_rate=sdram_rate)
+            **kwargs
+        )
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
             sdrphy_cls = HalfRateGENSDRPHY if sdram_rate == "1:2" else GENSDRPHY
-            self.submodules.sdrphy = sdrphy_cls(platform.request("sdram"), sys_clk_freq)
+            self.sdrphy = sdrphy_cls(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
                 phy           = self.sdrphy,
                 module        = W9825G6KH6(sys_clk_freq, sdram_rate),
@@ -97,33 +102,30 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on QMTECH 10CL006")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq",        default=50e6,        help="System clock frequency.")
-    parser.add_argument("--sdram-rate",          default="1:2",       help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
-    parser.add_argument("--with-daughterboard",  action="store_true", help="Board plugged into the QMTech daughterboard.")
-    sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",     action="store_true", help="Enable SPI-mode SDCard support.")
-    sdopts.add_argument("--with-sdcard",         action="store_true", help="Enable SDCard support.")
-    parser.add_argument("--with-spi-flash",      action="store_true", help="Enable SPI Flash (MMAPed).")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=qmtech_10cl006.Platform, description="LiteX SoC on QMTECH 10CL006.")
+    parser.add_target_argument("--sys-clk-freq",        default=50e6,  type=float, help="System clock frequency.")
+    parser.add_target_argument("--sdram-rate",          default="1:2",             help="SDRAM Rate (1:1 Full Rate or 1:2 Half Rate).")
+    parser.add_target_argument("--with-daughterboard",  action="store_true",       help="Board plugged into the QMTech daughterboard.")
+    sdopts = parser.target_group.add_mutually_exclusive_group()
+    sdopts.add_argument("--with-spi-sdcard",        action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",            action="store_true", help="Enable SDCard support.")
+    parser.add_target_argument("--with-spi-flash",  action="store_true", help="Enable SPI Flash (MMAPed).")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq = int(float(args.sys_clk_freq)),
-        with_daughterboard     = args.with_daughterboard,
-        with_spi_flash         = args.with_spi_flash,
-        sdram_rate             = args.sdram_rate,
-        **soc_core_argdict(args)
+        sys_clk_freq       = args.sys_clk_freq,
+        with_daughterboard = args.with_daughterboard,
+        with_spi_flash     = args.with_spi_flash,
+        sdram_rate         = args.sdram_rate,
+        **parser.soc_argdict
     )
 
     if args.with_spi_sdcard:
@@ -131,12 +133,13 @@ def main():
     if args.with_sdcard:
         soc.add_sdcard()
 
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".sof"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

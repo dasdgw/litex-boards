@@ -16,6 +16,7 @@ from litex.soc.integration.builder import *
 class TestTargets(unittest.TestCase):
     excluded_platforms = [
         "qmtech_daughterboard",              # Reason: Not a real platform.
+        "enclustra_st1",                     # Readon: Not a real platform.
         "quicklogic_quickfeather",           # Reason: No default clock.
         "efinix_titanium_ti60_f225_dev_kit", # Reason: Require Efinity toolchain.
         "efinix_trion_t120_bga576_dev_kit",  # Reason: Require Efinity toolchain.
@@ -24,6 +25,9 @@ class TestTargets(unittest.TestCase):
         "efinix_xyloni_dev_kit",             # Reason: Require Efinity toolchain.
         "sipeed_tang_primer",                # Reason: Require Anlogic toolchain.
         "jungle_electronics_fireant",        # Reason: Require Efinity toolchain.
+        "efinix_t8f81_dev_kit",              # Reason: Require Efinity toolchain.
+        "adi_plutosdr",                      # Reason: No default clock.
+        "newae_cw305",                       # Reason: No default clock.
     ]
     excluded_targets   = [
         "simple",                            # Reason: Generic target.
@@ -35,6 +39,7 @@ class TestTargets(unittest.TestCase):
         "efinix_xyloni_dev_kit",             # Reason: Require Efinity toolchain.
         "sipeed_tang_primer",                # Reason: Require Anlogic toolchain.
         "jungle_electronics_fireant",        # Reason: Require Efinity toolchain.
+        "efinix_t8f81_dev_kit",              # Reason: Require Efinity toolchain.
     ]
 
     # Build simple design for all platforms.
@@ -53,9 +58,9 @@ class TestTargets(unittest.TestCase):
                 os.system("rm -rf build")
                 cmd = """\
 python3 -m litex_boards.targets.simple litex_boards.platforms.{} \
-    --no-compile-software   \
-    --no-compile-gateware   \
-    --uart-name="stub"      \
+    --build            \
+    --no-compile       \
+    --uart-name="stub" \
 """.format(name)
                 subprocess.check_call(cmd, shell=True)
 
@@ -77,7 +82,7 @@ python3 -m litex_boards.targets.simple litex_boards.platforms.{} \
 python3 -m litex_boards.targets.{} \
     --cpu-type=vexriscv     \
     --cpu-variant=minimal   \
-    --no-compile-software   \
-    --no-compile-gateware   \
+    --build                 \
+    --no-compile            \
 """.format(name)
                 subprocess.check_call(cmd, shell=True)

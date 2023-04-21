@@ -8,7 +8,7 @@
 # https://github.com/wuxx/icesugar-pro
 
 from litex.build.generic_platform import *
-from litex.build.lattice import LatticePlatform
+from litex.build.lattice import LatticeECP5Platform
 from litex.build.lattice.programmer import EcpDapProgrammer
 
 # IOs ----------------------------------------------------------------------------------------------
@@ -89,14 +89,30 @@ _io = [
     # GPDI
     ("gpdi", 0,
         Subsignal("clk_p",   Pins("E2"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
-        # Subsignal("clk_n",   Pins("D3"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
+        Subsignal("clk_n",   Pins("D3"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
         Subsignal("data0_p", Pins("G1"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
-        # Subsignal("data0_n", Pins("F1"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
+        Subsignal("data0_n", Pins("F1"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
         Subsignal("data1_p", Pins("J1"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
-        # Subsignal("data1_n", Pins("H2"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
+        Subsignal("data1_n", Pins("H2"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
         Subsignal("data2_p", Pins("L1"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
-        # Subsignal("data2_n", Pins("K2"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
+        Subsignal("data2_n", Pins("K2"), IOStandard("LVCMOS33"), Misc("DRIVE=4")),
     ),
+
+    # RMII Ethernet PHY (WaveShare Board)
+    # Assumed to be modified to be PMOD-compatible (TX1 tied to MDIO)
+    # Position is P4 header "top half" (toward the GPDI connector)
+    ("eth_clocks", 0,
+        Subsignal("ref_clk", Pins("D5")),
+        IOStandard("LVCMOS33"),
+    ),
+    ("eth", 0,
+        Subsignal("rx_data", Pins("D4 C3")),
+        Subsignal("crs_dv",  Pins("C4")),
+        Subsignal("tx_en",   Pins("E4")),
+        Subsignal("tx_data", Pins("E3 R7")),
+        IOStandard("LVCMOS33"),
+    ),
+
 ]
 
 # from colorlight_i5.py adapted to icesugar pro
@@ -108,7 +124,7 @@ _connectors = [
 
 # Platform -----------------------------------------------------------------------------------------
 
-class Platform(LatticePlatform):
+class Platform(LatticeECP5Platform):
     default_clk_name   = "clk25"
     default_clk_period = 1e9/25e6
 
@@ -116,11 +132,11 @@ class Platform(LatticePlatform):
         device     = "LFE5U-25F-6BG256C"
         io         = _io
         connectors = _connectors
-        LatticePlatform.__init__(self, device, io, connectors=connectors, toolchain=toolchain)
+        LatticeECP5Platform.__init__(self, device, io, connectors=connectors, toolchain=toolchain)
 
     def create_programmer(self):
         return EcpDapProgrammer()
 
     def do_finalize(self, fragment):
-        LatticePlatform.do_finalize(self, fragment)
+        LatticeECP5Platform.do_finalize(self, fragment)
         self.add_period_constraint(self.lookup_request("clk25", loose=True), 1e9/25e6)

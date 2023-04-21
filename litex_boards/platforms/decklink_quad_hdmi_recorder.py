@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from litex.build.generic_platform import *
-from litex.build.xilinx import XilinxPlatform, VivadoProgrammer
+from litex.build.xilinx import XilinxUSPlatform, VivadoProgrammer
 
 # IOs ----------------------------------------------------------------------------------------------
 
@@ -25,6 +25,14 @@ _io = [
     ("debug", 1, Pins("AM34"), IOStandard("LVCMOS15")),
     ("debug", 2, Pins("AN34"), IOStandard("LVCMOS15")),
     ("debug", 3, Pins("AP34"), IOStandard("LVCMOS15")),
+
+
+    # Serial
+    ("serial", 0,
+        Subsignal("tx", Pins("AP9")),
+        Subsignal("rx", Pins("AN9")),
+        IOStandard("LVCMOS15")
+    ),
 
     # SPIFlash (MX25L25645GSXDI).
 
@@ -156,18 +164,18 @@ _io = [
 
 # Platform -----------------------------------------------------------------------------------------
 
-class Platform(XilinxPlatform):
+class Platform(XilinxUSPlatform):
     default_clk_name   = "clk200"
     default_clk_period = 1e9/200e6
 
-    def __init__(self):
-        XilinxPlatform.__init__(self, "xcku040-ffva1156-2-e", _io, toolchain="vivado")
+    def __init__(self, toolchain="vivado"):
+        XilinxUSPlatform.__init__(self, "xcku040-ffva1156-2-e", _io, toolchain=toolchain)
 
     def create_programmer(self):
         return VivadoProgrammer()
 
     def do_finalize(self, fragment):
-        XilinxPlatform.do_finalize(self, fragment)
+        XilinxUSPlatform.do_finalize(self, fragment)
         self.add_period_constraint(self.lookup_request("clk24",  loose=True), 1e9/24e6)
         self.add_period_constraint(self.lookup_request("clk200", loose=True), 1e9/200e6)
         self.add_platform_command("set_property INTERNAL_VREF 0.75 [get_iobanks 44]")

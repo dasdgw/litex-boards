@@ -7,10 +7,11 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 import os
-import argparse
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from litex.gen import *
 
 from litex_boards.platforms import pano_logic_g2
 
@@ -23,10 +24,10 @@ from liteeth.phy import LiteEthPHY
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, clk_freq, with_ethernet=False):
-        self.rst = Signal()
-        self.clock_domains.cd_sys    = ClockDomain()
+        self.rst    = Signal()
+        self.cd_sys = ClockDomain()
 
         # # #
 
@@ -35,7 +36,7 @@ class _CRG(Module):
             # See https://github.com/tomverbeure/panologic-g2#fpga-external-clocking-architecture
             self.comb += platform.request("eth_rst_n").eq(1)
 
-        self.submodules.pll = pll = S6PLL(speedgrade=-2)
+        self.pll = pll = S6PLL(speedgrade=-2)
         self.comb += pll.reset.eq(~platform.request("user_btn_n") | self.rst)
         pll.register_clkin(platform.request("clk125"), 125e6)
         pll.create_clkout(self.cd_sys, clk_freq)
@@ -44,23 +45,26 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, revision, sys_clk_freq=int(50e6), with_ethernet=False, with_etherbone=False,
-                 eth_ip="192.168.1.50", with_led_chaser=True, **kwargs):
+    def __init__(self, revision, sys_clk_freq=50e6,
+        with_ethernet   = False,
+        with_etherbone  = False,
+        eth_ip          = "192.168.1.50",
+        with_led_chaser = True,
+        **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         if with_etherbone:
             sys_clk_freq = int(125e6)
 
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Pano Logic G2",
-            **kwargs)
-
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq, with_ethernet=with_ethernet or with_etherbone)
+        with_ethernet = (with_ethernet or with_etherbone)
+        self.crg = _CRG(platform, sys_clk_freq, with_ethernet=with_ethernet)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Pano Logic G2", **kwargs)
 
         # Ethernet / Etherbone ---------------------------------------------------------------------
         if with_ethernet or with_etherbone:
-            self.submodules.ethphy = LiteEthPHY(
+            self.ethphy = LiteEthPHY(
                 clock_pads         = self.platform.request("eth_clocks"),
                 pads               = self.platform.request("eth"),
                 clk_freq           = sys_clk_freq,
@@ -72,40 +76,38 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Pano Logic G2")
-    parser.add_argument("--build",           action="store_true",              help="Build bitstream.")
-    parser.add_argument("--load",            action="store_true",              help="Load bitstream.")
-    parser.add_argument("--revision",        default="c",                      help="Board revision (b or c).")
-    parser.add_argument("--sys-clk-freq",    default=50e6,                     help="System clock frequency.")
-    ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",  action="store_true",              help="Enable Ethernet support.")
-    ethopts.add_argument("--with-etherbone", action="store_true",              help="Enable Etherbone support.")
-    parser.add_argument("--eth-ip",          default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=pano_logic_g2.Platform, description="LiteX SoC on Pano Logic G2.")
+    parser.add_target_argument("--revision",        default="c",              help="Board revision (b or c).")
+    parser.add_target_argument("--sys-clk-freq",    default=50e6, type=float, help="System clock frequency.")
+    ethopts = parser.target_group.add_mutually_exclusive_group()
+    ethopts.add_argument("--with-ethernet",  action="store_true",    help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone", action="store_true",    help="Enable Etherbone support.")
+    parser.add_target_argument("--eth-ip",   default="192.168.1.50", help="Ethernet/Etherbone IP address.")
     args = parser.parse_args()
 
     soc = BaseSoC(
         revision       = args.revision,
-        sys_clk_freq   = int(float(args.sys_clk_freq)),
+        sys_clk_freq   = args.sys_clk_freq,
         with_ethernet  = args.with_ethernet,
         with_etherbone = args.with_etherbone,
         eth_ip         = args.eth_ip,
-        **soc_core_argdict(args)
+        **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

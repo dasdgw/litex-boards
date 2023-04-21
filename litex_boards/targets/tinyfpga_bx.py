@@ -6,11 +6,9 @@
 # Copyright (c) 2020 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import sys
-import argparse
-
 from migen import *
+
+from litex.gen import *
 
 from litex.build.io import CRG
 
@@ -27,19 +25,16 @@ mB = 1024*kB
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, bios_flash_offset, sys_clk_freq=int(16e6), with_led_chaser=True, **kwargs):
+    def __init__(self, bios_flash_offset, sys_clk_freq=16e6, with_led_chaser=True, **kwargs):
         platform = tinyfpga_bx.Platform()
 
-        # Disable Integrated ROM since too large for iCE40.
-        kwargs["integrated_rom_size"]  = 0
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = CRG(platform.request("clk16"))
 
         # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on TinyFPGA BX",
-            **kwargs)
-
-        # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = CRG(platform.request("clk16"))
+        # Disable Integrated ROM since too large for iCE40.
+        kwargs["integrated_rom_size"]  = 0
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on TinyFPGA BX", **kwargs)
 
         # SPI Flash --------------------------------------------------------------------------------
         from litespi.modules import AT25SF081
@@ -56,28 +51,27 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on TinyFPGA BX")
-    parser.add_argument("--build",             action="store_true", help="Build bitstream.")
-    parser.add_argument("--bios-flash-offset", default="0x50000",   help="BIOS offset in SPI Flash.")
-    parser.add_argument("--sys-clk-freq",      default=16e6,        help="System clock frequency.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=tinyfpga_bx.Platform, description="LiteX SoC on TinyFPGA BX.")
+    parser.add_target_argument("--bios-flash-offset", default="0x50000",         help="BIOS offset in SPI Flash.")
+    parser.add_target_argument("--sys-clk-freq",      default=16e6, type=float,  help="System clock frequency.")
     args = parser.parse_args()
 
     soc = BaseSoC(
          bios_flash_offset = int(args.bios_flash_offset, 0),
-         sys_clk_freq      = int(float(args.sys_clk_freq)),
-         **soc_core_argdict(args)
+         sys_clk_freq      = args.sys_clk_freq,
+         **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
 if __name__ == "__main__":
     main()

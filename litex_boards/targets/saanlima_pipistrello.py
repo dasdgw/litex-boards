@@ -10,15 +10,14 @@
 # Copyright (c) 2019 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-
 from fractions import Fraction
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
-from litex_boards.platforms import pipistrello
+from litex.gen import *
+
+from litex_boards.platforms import saanlima_pipistrello
 
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
@@ -29,13 +28,13 @@ from litedram.phy import s6ddrphy
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys           = ClockDomain()
-        self.clock_domains.cd_sdram_half    = ClockDomain()
-        self.clock_domains.cd_sdram_full_wr = ClockDomain()
-        self.clock_domains.cd_sdram_full_rd = ClockDomain()
+        self.rst              = Signal()
+        self.cd_sys           = ClockDomain()
+        self.cd_sdram_half    = ClockDomain()
+        self.cd_sdram_full_wr = ClockDomain()
+        self.cd_sdram_full_rd = ClockDomain()
 
         self.reset = Signal()
 
@@ -105,7 +104,7 @@ class _CRG(Module):
 
         # Power on reset
         reset = platform.request("user_btn") | self.reset | self.rst
-        self.clock_domains.cd_por = ClockDomain()
+        self.cd_por = ClockDomain()
         por = Signal(max=1 << 11, reset=(1 << 11) - 1)
         self.sync.por += If(por != 0, por.eq(por - 1))
         self.specials += AsyncResetSynchronizer(self.cd_por, reset)
@@ -114,6 +113,7 @@ class _CRG(Module):
         self.specials += Instance("BUFG", i_I=pll_sys, o_O=self.cd_sys.clk)
         self.comb += self.cd_por.clk.eq(self.cd_sys.clk)
         self.specials += AsyncResetSynchronizer(self.cd_sys, ~pll_lckd | (por > 0))
+        platform.add_period_constraint(self.cd_sys.clk, 1e9/sys_clk_freq)
 
         # SDRAM clocks -----------------------------------------------------------------------------
         self.clk4x_wr_strb = Signal()
@@ -155,20 +155,17 @@ class _CRG(Module):
 class BaseSoC(SoCCore):
     def __init__(self, with_led_chaser=True, **kwargs):
         sys_clk_freq = (83 + Fraction(1, 3))*1000*1000
-        platform     = pipistrello.Platform()
-
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Pipistrello",
-            **kwargs)
+        platform     = saanlima_pipistrello.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
-        self.platform.add_period_constraint(self.crg.cd_sys.clk, 1e9/sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Pipistrello", **kwargs)
 
         # LPDDR SDRAM ------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.ddrphy = s6ddrphy.S6HalfRateDDRPHY(platform.request("ddram"),
+            self.ddrphy = s6ddrphy.S6HalfRateDDRPHY(platform.request("ddram"),
                 memtype           = "LPDDR",
                 rd_bitslip        = 1,
                 wr_bitslip        = 3,
@@ -185,27 +182,25 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Pipistrello")
-    parser.add_argument("--build",        action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",         action="store_true", help="Load bitstream.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=saanlima_pipistrello.Platform, description="LiteX SoC on Pipistrello.")
     args = parser.parse_args()
 
-    soc = BaseSoC(**soc_core_argdict(args))
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    soc = BaseSoC(**parser.soc_argdict)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

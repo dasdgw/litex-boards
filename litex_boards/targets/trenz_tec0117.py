@@ -7,12 +7,12 @@
 # Copyright (c) 2021 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-import os
-import argparse
-import importlib
-
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from litex.gen import *
+
+from litex_boards.platforms import trenz_tec0117
 
 from litex.build.io import DDROutput
 
@@ -22,8 +22,6 @@ from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
 
-from litex_boards.platforms import tec0117
-
 from litedram.modules import MT48LC4M16  # FIXME: use EtronTech reference.
 from litedram.phy import GENSDRPHY, HalfRateGENSDRPHY
 
@@ -32,11 +30,11 @@ mB = 1024*kB
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys   = ClockDomain()
-        self.clock_domains.cd_sys2x = ClockDomain()
+        self.rst      = Signal()
+        self.cd_sys   = ClockDomain()
+        self.cd_sys2x = ClockDomain()
 
         # # #
 
@@ -45,7 +43,7 @@ class _CRG(Module):
         rst_n  = platform.request("rst_n")
 
         # PLL
-        self.submodules.pll = pll = GW1NPLL(devicename=platform.devicename, device=platform.device)
+        self.pll = pll = GW1NPLL(devicename=platform.devicename, device=platform.device)
         self.comb += pll.reset.eq(~rst_n)
         pll.register_clkin(clk100, 100e6)
         pll.create_clkout(self.cd_sys2x, 2*sys_clk_freq, with_reset=False)
@@ -60,20 +58,18 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, bios_flash_offset=0x0000, sys_clk_freq=int(25e6), sdram_rate="1:1",
-                 with_led_chaser=True, **kwargs):
-        platform = tec0117.Platform()
-
-        # Disable Integrated ROM.
-        kwargs["integrated_rom_size"] = 0
-
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on TEC0117",
-            **kwargs)
+    def __init__(self, bios_flash_offset=0x0000, sys_clk_freq=25e6, sdram_rate="1:1",
+        with_led_chaser = True,
+        **kwargs):
+        platform = trenz_tec0117.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        # Disable Integrated ROM.
+        kwargs["integrated_rom_size"] = 0
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on TEC0117", **kwargs)
 
         # SPI Flash --------------------------------------------------------------------------------
         from litespi.modules import W74M64FV
@@ -108,7 +104,7 @@ class BaseSoC(SoCCore):
             self.specials += DDROutput(0, 1, sdram_pads.clk, sdram_clk)
 
             sdrphy_cls = HalfRateGENSDRPHY if sdram_rate == "1:2" else GENSDRPHY
-            self.submodules.sdrphy = sdrphy_cls(sdram_pads, sys_clk_freq)
+            self.sdrphy = sdrphy_cls(sdram_pads, sys_clk_freq)
             self.add_sdram("sdram",
                 phy           = self.sdrphy,
                 module        = MT48LC4M16(sys_clk_freq, sdram_rate), # FIXME.
@@ -117,7 +113,7 @@ class BaseSoC(SoCCore):
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
@@ -126,7 +122,7 @@ class BaseSoC(SoCCore):
 def flash(bios_flash_offset):
     # Create FTDI <--> SPI Flash proxy bitstream and load it.
     # -------------------------------------------------------
-    platform = tec0117.Platform()
+    platform = trenz_tec0117.Platform()
     flash    = platform.request("spiflash", 0)
     bus      = platform.request("spiflash", 1)
     module = Module()
@@ -138,7 +134,7 @@ def flash(bios_flash_offset):
     ]
     platform.build(module)
     prog = platform.create_programmer()
-    prog.load_bitstream("build/impl/pnr/project.fs")
+    prog.flash(0, builder.get_bitstream_filename(mode="flash", ext=".fs")) # FIXME
 
     # Flash Image through proxy Bitstream.
     # ------------------------------------
@@ -155,40 +151,38 @@ def flash(bios_flash_offset):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on TEC0117")
-    parser.add_argument("--build",             action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",              action="store_true", help="Load bitstream.")
-    parser.add_argument("--bios-flash-offset", default="0x0000",    help="BIOS offset in SPI Flash.")
-    parser.add_argument("--flash",             action="store_true", help="Flash Bitstream and BIOS.")
-    parser.add_argument("--sys-clk-freq",      default=25e6,        help="System clock frequency.")
-    sdopts = parser.add_mutually_exclusive_group()
-    sdopts.add_argument("--with-spi-sdcard",     action="store_true", help="Enable SPI-mode SDCard support.")
-    sdopts.add_argument("--with-sdcard",         action="store_true", help="Enable SDCard support.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=trenz_tec0117.Platform, description="LiteX SoC on TEC0117.")
+    parser.add_target_argument("--bios-flash-offset", default="0x0000",         help="BIOS offset in SPI Flash.")
+    parser.add_target_argument("--flash",             action="store_true",      help="Flash Bitstream and BIOS.")
+    parser.add_target_argument("--sys-clk-freq",      default=25e6, type=float, help="System clock frequency.")
+    sdopts = parser.target_group.add_mutually_exclusive_group()
+    sdopts.add_argument("--with-spi-sdcard", action="store_true", help="Enable SPI-mode SDCard support.")
+    sdopts.add_argument("--with-sdcard",     action="store_true", help="Enable SDCard support.")
     args = parser.parse_args()
 
     soc = BaseSoC(
         bios_flash_offset = int(args.bios_flash_offset, 0),
-        sys_clk_freq      = int(float(args.sys_clk_freq)),
-        **soc_core_argdict(args)
+        sys_clk_freq      = args.sys_clk_freq,
+        **parser.soc_argdict
     )
-    soc.platform.add_extension(tec0117._sdcard_pmod_io)
+    soc.platform.add_extension(trenz_tec0117._sdcard_pmod_io)
     if args.with_spi_sdcard:
         soc.add_spi_sdcard()
     if args.with_sdcard:
         soc.add_sdcard()
 
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, "impl", "pnr", "project.fs"))
+        prog.flash(0, builder.get_bitstream_filename(mode="sram"))
 
     if args.flash:
         prog = soc.platform.create_programmer()
-        prog.flash(0, os.path.join(builder.gateware_dir, "impl", "pnr", "project.fs"))
+        prog.flash(0, builder.get_bitstream_filename(mode="flash", ext=".fs")) # FIXME
         flash(int(args.bios_flash_offset, 0))
 
 if __name__ == "__main__":

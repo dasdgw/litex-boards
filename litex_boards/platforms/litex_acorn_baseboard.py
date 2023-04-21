@@ -8,7 +8,7 @@
 # https://github.com/enjoy-digital/litex-acorn-baseboard
 
 from litex.build.generic_platform import *
-from litex.build.lattice import LatticePlatform
+from litex.build.lattice import LatticeECP5Platform
 from litex.build.openfpgaloader import OpenFPGALoader
 
 # IOs ----------------------------------------------------------------------------------------------
@@ -79,11 +79,25 @@ _io = [
         IOStandard("LVCMOS33"),
     ),
 
+    # SerDes
+    ("refclk", 0,
+        Subsignal("p", Pins("Y11")),
+        Subsignal("n", Pins("Y12")),
+    ),
+
     # M2
     ("m2_devslp", 0, Pins("U18"), IOStandard("LVCMOS33")),
     ("m2_perst",  0, Pins("U17"), IOStandard("LVCMOS33")),
     ("m2_pewake", 0, Pins("R16"), IOStandard("LVCMOS33")),
     ("m2_pedet",  0, Pins("T17"), IOStandard("LVCMOS33")),
+    ("m2_tx", 0,
+        Subsignal("p", Pins("W4")),
+        Subsignal("n", Pins("W5")),
+    ),
+    ("m2_rx", 0,
+        Subsignal("p", Pins("Y5")),
+        Subsignal("n", Pins("Y6")),
+    ),
 
     # HDMI
     ("hdmi_i2c", 0,
@@ -110,16 +124,16 @@ _connectors = [
 
 # Platform -----------------------------------------------------------------------------------------
 
-class Platform(LatticePlatform):
+class Platform(LatticeECP5Platform):
     default_clk_name   = "clk50"
     default_clk_period = 1e9/506
 
     def __init__(self, toolchain="trellis", **kwargs):
-        LatticePlatform.__init__(self, "LFE5UM5G-45F-8BG381I", _io, _connectors, toolchain=toolchain, **kwargs)
+        LatticeECP5Platform.__init__(self, "LFE5UM5G-45F-8BG381I", _io, _connectors, toolchain=toolchain, **kwargs)
 
     def create_programmer(self):
         return OpenFPGALoader("ecpix5")
 
     def do_finalize(self, fragment):
-        LatticePlatform.do_finalize(self, fragment)
+        LatticeECP5Platform.do_finalize(self, fragment)
         self.add_period_constraint(self.lookup_request("clk50", loose=True), 1e9/50e6)

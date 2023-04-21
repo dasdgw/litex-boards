@@ -14,11 +14,12 @@
 # litex_term crossover
 
 import os
-import argparse
 
 from migen import *
 
-from litex_boards.platforms import quad_hdmi_recorder
+from litex.gen import *
+
+from litex_boards.platforms import decklink_quad_hdmi_recorder
 
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
@@ -33,50 +34,48 @@ from litepcie.software import generate_litepcie_software
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.clock_domains.cd_sys    = ClockDomain()
-        self.clock_domains.cd_sys4x  = ClockDomain(reset_less=True)
-        self.clock_domains.cd_pll4x  = ClockDomain(reset_less=True)
-        self.clock_domains.cd_idelay = ClockDomain()
+        self.cd_sys    = ClockDomain()
+        self.cd_sys4x  = ClockDomain()
+        self.cd_pll4x  = ClockDomain()
+        self.cd_idelay = ClockDomain()
 
         # # #
 
-        self.submodules.pll = pll = USMMCM(speedgrade=-2)
+        self.pll = pll = USMMCM(speedgrade=-2)
         pll.register_clkin(platform.request("clk200"), 200e6)
         pll.create_clkout(self.cd_pll4x, sys_clk_freq*4, buf=None, with_reset=False)
         pll.create_clkout(self.cd_idelay, 200e6)
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
         self.specials += [
-            Instance("BUFGCE_DIV", name="main_bufgce_div",
+            Instance("BUFGCE_DIV",
                 p_BUFGCE_DIVIDE=4,
                 i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys.clk),
-            Instance("BUFGCE", name="main_bufgce",
+            Instance("BUFGCE",
                 i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
         ]
-        self.submodules.idelayctrl = USIDELAYCTRL(cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
+        self.idelayctrl = USIDELAYCTRL(cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(200e6), with_pcie=False, **kwargs):
-        platform = quad_hdmi_recorder.Platform()
+    def __init__(self, sys_clk_freq=200e6, with_pcie=False, pcie_lanes=4, **kwargs):
+        platform = decklink_quad_hdmi_recorder.Platform()
+
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = _CRG(platform, sys_clk_freq)
 
         # SoCCore ----------------------------------------------------------------------------------
         kwargs["uart_name"] = "crossover"
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Blackmagic Decklink Quad HDMI Recorder",
-            **kwargs)
-
-        # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Blackmagic Decklink Quad HDMI Recorder", **kwargs)
 
         # JTAGBone  --------------------------------------------------------------------------------
         self.add_jtagbone()
 
         # DDR3 SDRAM -------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.ddrphy = usddrphy.USDDRPHY(
+            self.ddrphy = usddrphy.USDDRPHY(
                 pads             = PHYPadsReducer(platform.request("ddram"), [0, 1, 2, 3]),
                 memtype          = "DDR3",
                 sys_clk_freq     = sys_clk_freq,
@@ -88,10 +87,16 @@ class BaseSoC(SoCCore):
             )
 
         # PCIe -------------------------------------------------------------------------------------
+        # FIXME: Does not seem to be working when also enabling DRAM. Has been tested succesfully by
+        # disabling DRAM with --integrated-main-ram-size=0x100.
         if with_pcie:
-            self.submodules.pcie_phy = USPCIEPHY(platform, platform.request("pcie_x4"),
+            data_width = {
+                4 : 128,
+                8 : 256,
+            }[pcie_lanes]
+            self.pcie_phy = USPCIEPHY(platform, platform.request(f"pcie_x{pcie_lanes}"),
                 speed      = "gen3",
-                data_width = 128,
+                data_width = data_width,
                 bar0_size  = 0x20000)
             self.add_pcie(phy=self.pcie_phy, ndmas=1)
             # False Paths (FIXME: Improve integration).
@@ -101,30 +106,28 @@ class BaseSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Blackmagic Decklink Quad HDMI Recorder")
-    parser.add_argument("--build",        action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",         action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq", default=200e6,       help="System clock frequency.")
-    parser.add_argument("--with-pcie",    action="store_true", help="Enable PCIe support.")
-    parser.add_argument("--driver",       action="store_true", help="Generate PCIe driver.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=decklink_quad_hdmi_recorder.Platform, description="LiteX SoC on Blackmagic Decklink Quad HDMI Recorder.")
+    parser.add_target_argument("--sys-clk-freq", default=200e6, type=float, help="System clock frequency.")
+    parser.add_target_argument("--with-pcie",    action="store_true",       help="Enable PCIe support.")
+    parser.add_target_argument("--driver",       action="store_true",       help="Generate PCIe driver.")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq   = int(float(args.sys_clk_freq)),
-        with_pcie      = args.with_pcie,
-        **soc_core_argdict(args)
+        sys_clk_freq = args.sys_clk_freq,
+        with_pcie    = args.with_pcie,
+        **parser.soc_argdict
 	)
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()

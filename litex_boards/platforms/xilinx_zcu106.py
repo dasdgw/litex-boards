@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from litex.build.generic_platform import *
-from litex.build.xilinx import XilinxPlatform, VivadoProgrammer
+from litex.build.xilinx import XilinxUSPPlatform, VivadoProgrammer
 
 # IOs ----------------------------------------------------------------------------------------------
 
@@ -41,6 +41,35 @@ _io = [
         Subsignal("tx",  Pins("AL17")),
         Subsignal("rx",  Pins("AH17")),
         IOStandard("LVCMOS12")
+    ),
+
+    # PCIe
+    ("pcie_x1", 0,
+        Subsignal("rst_n", Pins("L8"), IOStandard("LVCMOS33")),
+        Subsignal("clk_p", Pins("AB8")),
+        Subsignal("clk_n", Pins("AB7")),
+        Subsignal("rx_p",  Pins("AE2")),
+        Subsignal("rx_n",  Pins("AE1")),
+        Subsignal("tx_p",  Pins("AD4")),
+        Subsignal("tx_n",  Pins("AD3")),
+    ),
+    ("pcie_x2", 0,
+        Subsignal("rst_n", Pins("L8"), IOStandard("LVCMOS33")),
+        Subsignal("clk_p", Pins("AB8")),
+        Subsignal("clk_n", Pins("AB7")),
+        Subsignal("rx_p",  Pins("AE2 AF4")),
+        Subsignal("rx_n",  Pins("AE1 AF3")),
+        Subsignal("tx_p",  Pins("AD4 AE6")),
+        Subsignal("tx_n",  Pins("AD3 AE5")),
+    ),
+    ("pcie_x4", 0,
+        Subsignal("rst_n", Pins("L8"), IOStandard("LVCMOS33")),
+        Subsignal("clk_p", Pins("AB8")),
+        Subsignal("clk_n", Pins("AB7")),
+        Subsignal("rx_p",  Pins("AE2 AF4 AG2 AJ2")),
+        Subsignal("rx_n",  Pins("AE1 AF3 AG1 AJ1")),
+        Subsignal("tx_p",  Pins("AD4 AE6 AG6 AH4")),
+        Subsignal("tx_n",  Pins("AD3 AE5 AG5 AH3")),
     ),
 
     # DDR4 SDRAM
@@ -91,18 +120,18 @@ _io = [
 
 # Platform -----------------------------------------------------------------------------------------
 
-class Platform(XilinxPlatform):
+class Platform(XilinxUSPPlatform):
     default_clk_name   = "clk125"
     default_clk_period = 1e9/125e6
 
-    def __init__(self):
-        XilinxPlatform.__init__(self, "xczu7ev-ffvc1156-2-e", _io, toolchain="vivado")
+    def __init__(self, toolchain="vivado"):
+        XilinxUSPPlatform.__init__(self, "xczu7ev-ffvc1156-2-e", _io, toolchain=toolchain)
 
     def create_programmer(self):
         return VivadoProgrammer()
 
     def do_finalize(self, fragment):
-        XilinxPlatform.do_finalize(self, fragment)
+        XilinxUSPPlatform.do_finalize(self, fragment)
         self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
         self.add_platform_command("set_property INTERNAL_VREF 0.84 [get_iobanks 64]")
         self.add_platform_command("set_property INTERNAL_VREF 0.84 [get_iobanks 65]")

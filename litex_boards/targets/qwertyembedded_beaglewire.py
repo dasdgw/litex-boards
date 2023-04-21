@@ -7,13 +7,13 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 import os
-import sys
-import argparse
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
-from litex_boards.platforms import beaglewire
+from litex.gen import *
+
+from litex_boards.platforms import qwertyembedded_beaglewire
 
 from litex.build.io import DDROutput
 
@@ -32,11 +32,11 @@ mB = 1024*kB
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq):
-        self.rst = Signal()
-        self.clock_domains.cd_sys = ClockDomain()
-        self.clock_domains.cd_por = ClockDomain(reset_less=True)
+        self.rst    = Signal()
+        self.cd_sys = ClockDomain()
+        self.cd_por = ClockDomain()
 
         # # #
 
@@ -52,7 +52,7 @@ class _CRG(Module):
         self.sync.por += If(~por_done, por_count.eq(por_count - 1))
 
         # PLL
-        self.submodules.pll = pll = iCE40PLL()
+        self.pll = pll = iCE40PLL()
         self.comb += pll.reset.eq(rst_n) # FIXME: Add proper iCE40PLL reset support and add back | self.rst.
         pll.register_clkin(clk100, 100e6)
         pll.create_clkout(self.cd_sys, sys_clk_freq, with_reset=False)
@@ -65,24 +65,22 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, bios_flash_offset, sys_clk_freq=int(50e6), **kwargs):
-        platform = beaglewire.Platform()
+    def __init__(self, bios_flash_offset, sys_clk_freq=50e6, **kwargs):
+        platform = qwertyembedded_beaglewire.Platform()
 
         # Disable Integrated ROM since too large for iCE40.
         kwargs["integrated_rom_size"]  = 0
         kwargs["integrated_sram_size"] = 2*kB
 
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Beaglewire",
-            **kwargs)
-
         # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Beaglewire", **kwargs)
 
         # SDR SDRAM --------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
-            self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
+            self.sdrphy = GENSDRPHY(platform.request("sdram"), sys_clk_freq)
             self.add_sdram("sdram",
                 phy                     = self.sdrphy,
                 module                  = MT48LC32M8(sys_clk_freq, "1:1"),
@@ -103,28 +101,27 @@ class BaseSoC(SoCCore):
         self.cpu.set_reset_address(self.bus.regions["rom"].origin)
 
         # Leds -------------------------------------------------------------------------------------
-        self.submodules.leds = LedChaser(
+        self.leds = LedChaser(
             pads         = platform.request_all("user_led"),
             sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on Beaglewire")
-    parser.add_argument("--build",             action="store_true", help="Build bitstream.")
-    parser.add_argument("--bios-flash-offset", default="0x60000",   help="BIOS offset in SPI Flash.")
-    parser.add_argument("--sys-clk-freq",      default=50e6,        help="System clock frequency.")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=qwertyembedded_beaglewire.Platform, description="LiteX SoC on Beaglewire.")
+    parser.add_target_argument("--bios-flash-offset", default="0x60000",        help="BIOS offset in SPI Flash.")
+    parser.add_target_argument("--sys-clk-freq",      default=50e6, type=float, help="System clock frequency.")
     args = parser.parse_args()
 
     soc = BaseSoC(
          bios_flash_offset = int(args.bios_flash_offset, 0),
-         sys_clk_freq      = int(float(args.sys_clk_freq)),
-         **soc_core_argdict(args)
+         sys_clk_freq      = args.sys_clk_freq,
+         **parser.soc_argdict
     )
-    builder = Builder(soc,  **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc,  **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
 if __name__ == "__main__":
     main()

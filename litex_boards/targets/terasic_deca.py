@@ -10,11 +10,10 @@
 # ./terasic_deca.py --uart-name jtag_uart --build --load
 # litex_term --jtag-config ../prog/openocd_max10_blaster2.cfg jtag
 
-import os
-import argparse
-
 from migen import *
-from litex_boards.platforms import deca
+from litex_boards.platforms import terasic_deca
+
+from litex.gen import *
 
 from litex.soc.cores.clock import Max10PLL
 from litex.soc.integration.soc_core import *
@@ -26,12 +25,12 @@ from liteeth.phy.mii import LiteEthPHYMII
 
 # CRG ----------------------------------------------------------------------------------------------
 
-class _CRG(Module):
+class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq, with_usb_pll=False):
-        self.rst = Signal()
-        self.clock_domains.cd_sys    = ClockDomain()
-        self.clock_domains.cd_hdmi   = ClockDomain()
-        self.clock_domains.cd_usb    = ClockDomain()
+        self.rst     = Signal()
+        self.cd_sys  = ClockDomain()
+        self.cd_hdmi = ClockDomain()
+        self.cd_usb  = ClockDomain()
 
         # # #
 
@@ -39,7 +38,7 @@ class _CRG(Module):
         clk50 = platform.request("clk50")
 
         # PLL
-        self.submodules.pll = pll = Max10PLL(speedgrade="-6")
+        self.pll = pll = Max10PLL(speedgrade="-6")
         self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(clk50, 50e6)
         pll.create_clkout(self.cd_sys,  sys_clk_freq)
@@ -49,7 +48,7 @@ class _CRG(Module):
         if with_usb_pll:
             ulpi  = platform.request("ulpi")
             self.comb += ulpi.cs.eq(1) # Enable ULPI chip to enable the ULPI clock.
-            self.submodules.usb_pll = pll = Max10PLL(speedgrade="-6")
+            self.usb_pll = pll = Max10PLL(speedgrade="-6")
             self.comb += pll.reset.eq(self.rst)
             pll.register_clkin(ulpi.clk, 60e6)
             pll.create_clkout(self.cd_usb, 60e6, phase=-120) # -120° from DECA's example (also validated with LUNA).
@@ -57,12 +56,23 @@ class _CRG(Module):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCCore):
-    def __init__(self, sys_clk_freq=int(50e6), with_led_chaser=True, with_uartbone=False, with_jtagbone=False, with_video_terminal=False,
-                 with_ethernet=False, with_etherbone=False, eth_ip="192.168.1.50",
-                 eth_dynamic_ip=False,
-                 **kwargs):
-        self.platform = platform = deca.Platform()
+    def __init__(self, sys_clk_freq=50e6,
+        with_led_chaser     = True,
+        with_uartbone       = False,
+        with_jtagbone       = False,
+        with_video_terminal = False,
+        with_spi_sdcard     = False,
+        with_ethernet       = False,
+        with_etherbone      = False,
+        eth_ip              = "192.168.1.50",
+        eth_dynamic_ip      = False,
+        **kwargs):
+        self.platform = platform = terasic_deca.Platform()
 
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = self.crg = _CRG(platform, sys_clk_freq, with_usb_pll=False)
+
+        # SoCCore ----------------------------------------------------------------------------------
         # Defaults to JTAG-UART since no hardware UART.
         real_uart_name = kwargs["uart_name"]
         if real_uart_name == "serial":
@@ -72,14 +82,7 @@ class BaseSoC(SoCCore):
                 kwargs["uart_name"] = "jtag_uart"
         if with_uartbone:
             kwargs["uart_name"] = "crossover"
-
-        # SoCCore ----------------------------------------------------------------------------------
-        SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "LiteX SoC on Terasic DECA",
-            **kwargs)
-
-        # CRG --------------------------------------------------------------------------------------
-        self.submodules.crg = self.crg = _CRG(platform, sys_clk_freq, with_usb_pll=False)
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on Terasic DECA", **kwargs)
 
         # UARTbone ---------------------------------------------------------------------------------
         if with_uartbone:
@@ -88,7 +91,7 @@ class BaseSoC(SoCCore):
         # JTAGbone ---------------------------------------------------------------------------------
         if with_jtagbone:
             self.add_jtagbone()
-        
+
         # Ethernet ---------------------------------------------------------------------------------
         if with_ethernet or with_etherbone:
             self.platform.toolchain.additional_sdc_commands += [
@@ -98,7 +101,7 @@ class BaseSoC(SoCCore):
                 'set_false_path -from [get_clocks {sys_clk}] -to [get_clocks {eth_tx_clk}]',
                 'set_false_path -from [get_clocks {eth_rx_clk}] -to [get_clocks {eth_tx_clk}]',
             ]
-            self.submodules.ethphy = LiteEthPHYMII(
+            self.ethphy = LiteEthPHYMII(
                 clock_pads = self.platform.request("eth_clocks"),
                 pads       = self.platform.request("eth"))
             if with_ethernet:
@@ -108,51 +111,69 @@ class BaseSoC(SoCCore):
 
         # Video ------------------------------------------------------------------------------------
         if with_video_terminal:
-            self.submodules.videophy = VideoDVIPHY(platform.request("hdmi"), clock_domain="hdmi")
+            self.videophy = VideoDVIPHY(platform.request("hdmi"), clock_domain="hdmi")
             self.add_video_terminal(phy=self.videophy, timings="800x600@60Hz", clock_domain="hdmi")
+
+        # SPI SD card ------------------------------------------------------------------------------
+        if with_spi_sdcard:
+            self.add_spi_sdcard()
+
+            sd_aux = self.platform.request("spisdcard_aux")
+
+            # Set the SD card supply to 3.3V
+            self.comb += sd_aux.sel.eq(0)
+
+            # Set the direction of the level shifter (0 = SD to FPGA; 1 = FPGA to SD)
+            self.comb += sd_aux.cmd_dir.eq(1)
+            self.comb += sd_aux.d0_dir.eq(0)
+            self.comb += sd_aux.d123_dir.eq(1)
+
+            # Keep the unused data lines high
+            self.comb += sd_aux.dat1.eq(1)
+            self.comb += sd_aux.dat2.eq(1)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
-            self.submodules.leds = LedChaser(
+            self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on DECA")
-    parser.add_argument("--build",               action="store_true", help="Build bitstream.")
-    parser.add_argument("--load",                action="store_true", help="Load bitstream.")
-    parser.add_argument("--sys-clk-freq",        default=50e6,        help="System clock frequency.")
-    ethopts = parser.add_mutually_exclusive_group()
-    ethopts.add_argument("--with-ethernet",      action="store_true", help="Enable Ethernet support.")
-    ethopts.add_argument("--with-etherbone",     action="store_true", help="Enable Etherbone support.")
-    parser.add_argument("--eth-ip",              default="192.168.1.50", type=str, help="Ethernet/Etherbone IP address.")
-    parser.add_argument("--eth-dynamic-ip",      action="store_true", help="Enable dynamic Ethernet IP addresses setting.")
-    parser.add_argument("--with-uartbone",       action="store_true", help="Enable UARTbone support.")
-    parser.add_argument("--with-jtagbone",       action="store_true", help="Enable JTAGbone support.")
-    parser.add_argument("--with-video-terminal", action="store_true", help="Enable Video Terminal (VGA).")
-    builder_args(parser)
-    soc_core_args(parser)
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=terasic_deca.Platform, description="LiteX SoC on DECA.")
+    parser.add_target_argument("--sys-clk-freq", default=50e6, type=float, help="System clock frequency.")
+    ethopts = parser.target_group.add_mutually_exclusive_group()
+    ethopts.add_argument("--with-ethernet",             action="store_true",    help="Enable Ethernet support.")
+    ethopts.add_argument("--with-etherbone",            action="store_true",    help="Enable Etherbone support.")
+    parser.add_target_argument("--eth-ip",              default="192.168.1.50", help="Ethernet/Etherbone IP address.")
+    parser.add_target_argument("--eth-dynamic-ip",      action="store_true",    help="Enable dynamic Ethernet IP addresses setting.")
+    parser.add_target_argument("--with-uartbone",       action="store_true",    help="Enable UARTbone support.")
+    parser.add_target_argument("--with-jtagbone",       action="store_true",    help="Enable JTAGbone support.")
+    parser.add_target_argument("--with-video-terminal", action="store_true",    help="Enable Video Terminal (VGA).")
+    parser.add_target_argument("--with-spi-sdcard",     action="store_true",    help="Enable SPI SD card controller.")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq             = int(float(args.sys_clk_freq)),
-        with_ethernet            = args.with_ethernet,
-        with_etherbone           = args.with_etherbone,
-        eth_ip                   = args.eth_ip,
-        eth_dynamic_ip           = args.eth_dynamic_ip,
-        with_uartbone            = args.with_uartbone,
-        with_jtagbone            = args.with_jtagbone,
-        with_video_terminal      = args.with_video_terminal,
-        **soc_core_argdict(args)
+        sys_clk_freq        = args.sys_clk_freq,
+        with_ethernet       = args.with_ethernet,
+        with_etherbone      = args.with_etherbone,
+        eth_ip              = args.eth_ip,
+        eth_dynamic_ip      = args.eth_dynamic_ip,
+        with_uartbone       = args.with_uartbone,
+        with_jtagbone       = args.with_jtagbone,
+        with_video_terminal = args.with_video_terminal,
+        with_spi_sdcard     = args.with_spi_sdcard,
+        **parser.soc_argdict
     )
-    builder = Builder(soc, **builder_argdict(args))
-    builder.build(run=args.build)
+    builder = Builder(soc, **parser.builder_argdict)
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
 
     if args.load:
         prog = soc.platform.create_programmer()
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".sof"))
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
     main()
