@@ -52,6 +52,8 @@ _io = [
     ),
 
     # DDR2 SDRAM
+    # Micron MT47H32M16NF-25E
+    # https://www.micron.com/parts/dram/ddr2-sdram/mt47h32m16nf-25e?pc=%7B4064C2CD-AB47-4DB0-AB9A-A91579FD303A%7D
     ("ddram_clock_a", 0,
         Subsignal("p", Pins("H20")),
         Subsignal("n", Pins("J19")),
