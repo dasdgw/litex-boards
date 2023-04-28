@@ -126,6 +126,17 @@ _io = [
         Subsignal("crs",     Pins("W4")),
         IOStandard("LVCMOS33")
     ),
+
+    # USB ULPI
+    ("ulpi", 0,
+        Subsignal("clk",   Pins("C12")),
+        Subsignal("stp",   Pins("A5")),
+        Subsignal("dir",   Pins("C7")),
+        Subsignal("nxt",   Pins("C5")),
+        Subsignal("reset", Pins("C9")),
+        Subsignal("data",  Pins("A7 B8 A8 D6 C6 B6 A6 A4")),
+        IOStandard("LVCMOS33")
+    ),
 ]
 
 # Platform -----------------------------------------------------------------------------------------
