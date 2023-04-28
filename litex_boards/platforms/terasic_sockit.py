@@ -192,7 +192,7 @@ class Platform(AlteraPlatform):
         AlteraPlatform.__init__(self, _device_map[revision], _io, connectors=_connectors_hsmc_gpio_daughterboard, toolchain=toolchain)
 
     def create_programmer(self):
-        return USBBlaster(cable_name="CV SoCKit")
+        return USBBlaster(cable_name="CV SoCKit", device_id=1)
 
     def do_finalize(self, fragment):
         AlteraPlatform.do_finalize(self, fragment)
