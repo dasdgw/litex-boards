@@ -137,6 +137,47 @@ _io = [
         Subsignal("data",  Pins("A7 B8 A8 D6 C6 B6 A6 A4")),
         IOStandard("LVCMOS33")
     ),
+
+    # videoi2c chrontel
+    ("videoi2c", 0,
+        Subsignal("sda",     Pins("D9")),
+        Subsignal("scl",     Pins("E8")),
+        IOStandard("LVCMOS33")
+     ),
+
+    # DVI
+    ("dvi", 0,
+        Subsignal("d",       Pins("D17 A14 A15 A16 A17 A18 D14 B14 B16 B18 E16 D15")),
+        Subsignal("de",      Pins("F14")),
+        Subsignal("clk_p",   Pins("E14")),
+        Subsignal("clk_n",   Pins("F15")),
+        Subsignal("vsync",   Pins("C16")),
+        Subsignal("hsync",   Pins("F12")),
+        Subsignal("sda",     Pins("C17")),
+        Subsignal("scl",     Pins("C14")),
+#        Subsignal("sda",     Pins("D9")),
+#        Subsignal("scl",     Pins("E8")),
+        # hot-plug detect interrupt (input, active low)
+        Subsignal("hp_int",  Pins("D13")),
+        Subsignal("rst_n",   Pins("C15")),
+        IOStandard("LVCMOS33")
+    ),
+
+    # HDMI
+    ("hdmi", 0,
+        Subsignal("d",       Pins("T18 U16 V17 V19 V18 W17 Y17 Y15 Y18 Y19 AB21 T17")),
+        Subsignal("de",      Pins("AB16")),
+        Subsignal("clk",     Pins("T15")),
+        Subsignal("vsync",   Pins("T16")),
+        Subsignal("hsync",   Pins("AB15")),
+        Subsignal("sda",     Pins("AB19")),
+        Subsignal("scl",     Pins("AA21")),
+#        Subsignal("sda",     Pins("D9")),
+#        Subsignal("scl",     Pins("E8")),
+        Subsignal("hp_int",  Pins("AB18")),
+        Subsignal("rst_n",   Pins("W18")),
+        IOStandard("LVCMOS33")
+    ),
 ]
 
 # Platform -----------------------------------------------------------------------------------------
