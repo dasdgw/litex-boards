@@ -178,6 +178,20 @@ _io = [
         Subsignal("rst_n",   Pins("W18")),
         IOStandard("LVCMOS33")
     ),
+
+    # ADUIO wolfson
+    ("audio", 0,
+        Subsignal("BCLK",   Pins("AB13")),
+        Subsignal("ADCLRC", Pins("W9")),
+        Subsignal("ADCDAT", Pins("R13")),
+        Subsignal("DACLRC", Pins("U6")),
+        Subsignal("DACDAT", Pins("Y14")),
+        Subsignal("MCLK",   Pins("W14")),
+        Subsignal("SCLK",   Pins("U17")),
+        Subsignal("SDIN",   Pins("AB17")),
+        IOStandard("LVCMOS33")
+    ),
+
 ]
 
 # Platform -----------------------------------------------------------------------------------------
