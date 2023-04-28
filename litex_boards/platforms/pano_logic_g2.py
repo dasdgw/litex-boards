@@ -208,4 +208,4 @@ class Platform(XilinxSpartan6Platform):
         self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
 
     def create_programmer(self):
-        return OpenOCD("openocd_xc6_ft232.cfg")
+        return OpenOCD("openocd_xc6_ft2232.cfg")
