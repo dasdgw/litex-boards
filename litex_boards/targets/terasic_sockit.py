@@ -25,11 +25,12 @@ from litedram.phy import HalfRateGENSDRPHY, GENSDRPHY
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
-    def __init__(self, platform, sys_clk_freq, with_sdram=False, sdram_rate="1:2", with_video_terminal=False):
+    def __init__(self, platform, sys_clk_freq, with_sdram=False, sdram_rate="1:2",
+                 with_video_terminal=False, with_video_framebuffer=False, with_video_colorbars=False):
         self.sdram_rate = sdram_rate
         self.rst    = Signal()
         self.cd_sys = ClockDomain()
-        if with_video_terminal:
+        if (with_video_colorbars or with_video_framebuffer or with_video_terminal):
             self.cd_vga = ClockDomain()
         if with_sdram:
             if sdram_rate == "1:2":
@@ -47,8 +48,9 @@ class _CRG(LiteXModule):
         pll.register_clkin(clk50, 50e6)
         pll.create_clkout(self.cd_sys, sys_clk_freq)
 
-        if with_video_terminal:
-            pll.create_clkout(self.cd_vga, 65e6)
+        if (with_video_colorbars or with_video_framebuffer or with_video_terminal):
+            #pll.create_clkout(self.cd_vga, 65e6)
+            pll.create_clkout(self.cd_vga, 148e6)
 
         if with_sdram:
             if sdram_rate == "1:2":
@@ -66,16 +68,20 @@ class _CRG(LiteXModule):
 
 class BaseSoC(SoCCore):
     def __init__(self, sys_clk_freq=50e6, revision="revd", sdram_rate="1:2", mister_sdram=None,
-        with_led_chaser     = True,
-        with_video_terminal = False,
+        with_led_chaser        = True,
+        with_video_terminal    = False,
+        with_video_framebuffer = False,
+        with_video_colorbars   = False,
         **kwargs):
         platform = terasic_sockit.Platform(revision)
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = _CRG(platform, sys_clk_freq,
-            with_sdram          = mister_sdram != None,
-            sdram_rate          = sdram_rate,
-            with_video_terminal = with_video_terminal
+            with_sdram             = mister_sdram != None,
+            sdram_rate             = sdram_rate,
+            with_video_terminal    = with_video_terminal,
+            with_video_framebuffer = with_video_framebuffer,
+            with_video_colorbars   = with_video_colorbars,
         )
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -94,13 +100,22 @@ class BaseSoC(SoCCore):
                 l2_cache_size = kwargs.get("l2_size", 8192)
             )
 
-        # Video Terminal ---------------------------------------------------------------------------
-        if with_video_terminal:
+        # Video Options ----------------------------------------------------------------------------
+        if (with_video_colorbars or with_video_framebuffer or with_video_terminal):
             vga_pads = platform.request("vga")
             self.comb += [ vga_pads.sync_n.eq(0), vga_pads.blank_n.eq(1) ]
-            self.specials += DDROutput(i1=1, i2=0, o=vga_pads.clk, clk=ClockSignal("vga"))
+            # already done in video.py
+            #self.specials += DDROutput(i1=1, i2=0, o=vga_pads.clk, clk=ClockSignal("vga"))
             self.videophy = VideoVGAPHY(vga_pads, clock_domain="vga")
-            self.add_video_terminal(phy=self.videophy, timings="1024x768@60Hz", clock_domain="vga")
+            if with_video_colorbars:
+                #self.add_video_colorbars(phy=self.videophy, timings="1024x768@60Hz", clock_domain="vga")
+                self.add_video_colorbars(phy=self.videophy, timings="1920x1080@60Hz", clock_domain="vga")
+            if with_video_terminal:
+                #self.add_video_terminal(phy=self.videophy, timings="1024x768@60Hz", clock_domain="vga")
+                self.add_video_terminal(phy=self.videophy, timings="1920x1080@60Hz", clock_domain="vga")
+            if with_video_framebuffer:
+                #self.add_video_framebuffer(phy=self.videophy, timings="1024x768@60Hz", clock_domain="vga")
+                self.add_video_framebuffer(phy=self.videophy, timings="1920x1080@60Hz", clock_domain="vga")
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -118,15 +133,20 @@ def main():
     parser.add_target_argument("--mister-sdram-xs-v24", action="store_true",      help="Use optional MiSTer SDRAM module XS v2.4 on J2 on GPIO daughter card.")
     parser.add_target_argument("--revision",            default="revd",           help="Board revision (revb, revc or revd).")
     parser.add_target_argument("--sys-clk-freq",        default=50e6, type=float, help="System clock frequency.")
-    parser.add_target_argument("--with-video-terminal", action="store_true",      help="Enable Video Terminal (VGA).")
+    viopts = parser.target_group.add_mutually_exclusive_group()
+    viopts.add_argument("--with-video-terminal",    action="store_true", help="Enable Video Terminal (VGA).")
+    viopts.add_argument("--with-video-framebuffer", action="store_true", help="Enable Video Framebuffer (VGA).")
+    viopts.add_argument("--with-video-colorbars",   action="store_true", help="Enable Video Colorbars (VGA).")
     args = parser.parse_args()
 
     soc = BaseSoC(
-        sys_clk_freq        = args.sys_clk_freq,
-        revision            = args.revision,
-        sdram_rate          = "1:1" if args.single_rate_sdram else "1:2",
-        mister_sdram        = "xs_v22" if args.mister_sdram_xs_v22 else "xs_v24" if args.mister_sdram_xs_v24 else None,
-        with_video_terminal = args.with_video_terminal,
+        sys_clk_freq           = args.sys_clk_freq,
+        revision               = args.revision,
+        sdram_rate             = "1:1" if args.single_rate_sdram else "1:2",
+        mister_sdram           = "xs_v22" if args.mister_sdram_xs_v22 else "xs_v24" if args.mister_sdram_xs_v24 else None,
+        with_video_terminal    = args.with_video_terminal,
+        with_video_framebuffer = args.with_video_framebuffer,
+        with_video_colorbars   = args.with_video_colorbars,
         **parser.soc_argdict
     )
     builder = Builder(soc, **parser.builder_argdict)
