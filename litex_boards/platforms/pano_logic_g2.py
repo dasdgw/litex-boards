@@ -30,11 +30,11 @@ _io = [
     ("user_btn_n", 0, Pins("H12"), IOStandard("LVCMOS33")),
 
     # Serial
-    ("serial", 1, # hdmi
-        Subsignal("tx", Pins("AB19")),
-        Subsignal("rx", Pins("AA21")),
-        IOStandard("LVCMOS33")
-    ),
+#    ("serial", 1, # hdmi
+#        Subsignal("tx", Pins("AB19")),
+#        Subsignal("rx", Pins("AA21")),
+#        IOStandard("LVCMOS33")
+#    ),
 
     # Serial
     ("serial", 0, # dvi
