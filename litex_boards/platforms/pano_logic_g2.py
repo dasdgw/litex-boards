@@ -204,6 +204,7 @@ class Platform(XilinxSpartan6Platform):
         assert revision in ["b", "c"]
         device = {"b": "xc6slx150-2-fgg484", "c": "xc6slx100-2-fgg484"}[revision]
         XilinxSpartan6Platform.__init__(self, device, _io, toolchain=toolchain)
+        self.toolchain.bitgen_opt += " -g Compress -g ConfigRate:6"
         self.add_platform_command("""CONFIG VCCAUX="2.5";""")
         self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
 
