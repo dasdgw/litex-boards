@@ -106,9 +106,9 @@ class _CRG(LiteXModule):
             # (333MHz) sdram wr rd
             o_CLKOUT0=pll_sdram_full, p_CLKOUT0_DUTY_CYCLE=.5,
             p_CLKOUT0_PHASE=0., p_CLKOUT0_DIVIDE=p//4,
-            # unused?
-            o_CLKOUT1=pll_unused, p_CLKOUT1_DUTY_CYCLE=.5,
-            p_CLKOUT1_PHASE=0., p_CLKOUT1_DIVIDE=15,
+            # ddr2_a
+            o_CLKOUT1=pll_sdram_half_b_a, p_CLKOUT1_DUTY_CYCLE=.5,
+            p_CLKOUT1_PHASE=257., p_CLKOUT1_DIVIDE=p//2,
             # (166MHz) sdram_half - sdram dqs adr ctrl
             o_CLKOUT2=pll_sdram_half_a, p_CLKOUT2_DUTY_CYCLE=.5,
             p_CLKOUT2_PHASE=270., p_CLKOUT2_DIVIDE=p//2,
