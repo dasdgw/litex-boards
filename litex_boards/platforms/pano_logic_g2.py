@@ -206,7 +206,13 @@ class Platform(XilinxSpartan6Platform):
         XilinxSpartan6Platform.__init__(self, device, _io, toolchain=toolchain)
         self.toolchain.bitgen_opt += " -g Compress -g ConfigRate:6"
         self.add_platform_command("""CONFIG VCCAUX="2.5";""")
-        self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
+        #self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
 
     def create_programmer(self):
         return OpenOCD("openocd_xc6_ft2232.cfg")
+
+#    def do_finalize(self, fragment):
+#        XilinxSpartan6Platform.do_finalize(self, fragment)
+#        self.add_period_constraint(self.cd_sys.clk, 1e9/sys_clk_freq)
+        #self.add_period_constraint(self.lookup_request("clk50", loose=True), 1e9/50e6)
+
