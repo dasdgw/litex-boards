@@ -20,7 +20,7 @@ from litex_boards.platforms import pano_logic_g2
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
-from litex.soc.cores.video import VideoGenericPHY
+from litex.soc.cores.video import VideoDVIPHY
 from litex.soc.cores.video import video_timings
 from litex.soc.cores.bitbang import I2CMaster
 from litex.soc.cores.led import LedChaser
@@ -243,7 +243,7 @@ class BaseSoC(SoCCore):
         #output_mode = "chrontel_idf_0"
         if (with_video_colorbars or with_video_framebuffer or with_video_terminal):
             hdmi_pads = platform.request("hdmi")
-            self.videophy = VideoGenericPHY(hdmi_pads, clock_domain="hdmi", output_mode = "chrontel_idf_0", clk_clock_domain="hdmi_90")
+            self.videophy = VideoDVIPHY(hdmi_pads, clock_domain="hdmi", format="rgb565", clk_clock_domain="hdmi_90")
             #analyzer_signals += [ self.videophy.sink ]
             videoi2c_pads = platform.request("videoi2c")
             self.videoi2c = I2CMaster(videoi2c_pads)
@@ -253,7 +253,8 @@ class BaseSoC(SoCCore):
             #self.videoi2c.add_init(addr=0x76, init=[
                 (0x1c, 0x00),              # 1x DDR clocking
                 (0x1d, 0x40),              # internal clock delay
-                (0x1f, 0x80),              # input data format. Bit 4: vsp, bit 4: hsp
+                #(0x1f, 0x80),              # input data format. Bit 4: vsp, bit 4: hsp idf_0  rgb888
+                (0x1f, 0x82),              # input data format. Bit 4: vsp, bit 4: hsp  idf_2  rgb565
                 (0x21, 0x09),              # Enable VGA
                 # clk <= 65 MHz
                 (0x33, 0x08),              # charge pump settings. See table 10
@@ -278,7 +279,8 @@ class BaseSoC(SoCCore):
                 self.add_video_terminal(phy=self.videophy, timings=video_timing, clock_domain="hdmi")
             if with_video_framebuffer:
                 #self.add_video_framebuffer(phy=self.videophy, timings="640x480@60Hz", clock_domain="hdmi")
-                self.add_video_framebuffer(phy=self.videophy, timings=video_timing, clock_domain="hdmi")
+                #self.add_video_framebuffer(phy=self.videophy, timings=video_timing, clock_domain="hdmi",  format="rgb888")
+                self.add_video_framebuffer(phy=self.videophy, timings=video_timing, clock_domain="hdmi",  format="rgb565")
 
         platform.add_period_constraint(self.crg.cd_sys.clk, 1e9/sys_clk_freq)
         #platform.add_period_constraint(self.crg.cd_sdram_full.clk, 1e9/(4 * sys_clk_freq))
