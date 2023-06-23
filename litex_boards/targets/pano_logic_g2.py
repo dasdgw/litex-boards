@@ -74,7 +74,7 @@ class _CRG(LiteXModule):
         pll_sdram_full   = Signal()
         pll_sdram_half_a = Signal()
         pll_sdram_half_b = Signal()
-        pll_unused       = Signal()
+        pll_sdram_half_b_a = Signal()
         pll_sys          = Signal()
         pll_periph       = Signal()
 
