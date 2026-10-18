@@ -254,6 +254,14 @@ class BaseSoC(SoCCore):
 
         # SoCCore ----------------------------------------------------------------------------------
         # serial_index: the console lives on a DDC pair, 0 = micro-HDMI, 1 = DVI.
+        #
+        # DDR bring-up builds must be cacheless: the L2 added below is a *write-back* cache
+        # (litex/soc/interconnect/wishbone.py: "write-back wishbone cache") and so is VexRiscv's L1 D
+        # cache, i.e. byte writes get absorbed and only full-line writebacks ever reach the DRAM's DM
+        # pins -- a byte-lane/mask fault is then invisible to a CPU-side test. Use
+        #   --cpu-variant=lite --l2-size=0
+        # for the test bitstream (the BIOS executes from block RAM, so it still runs when the SDRAM is
+        # dead); see tools/ddr_bytelane.py.
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident     = "LiteX SoC on Pano Logic G2",
             uart_pads = platform.request("serial", serial_index),
