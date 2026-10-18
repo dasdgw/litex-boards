@@ -13,6 +13,7 @@
 from litex.build.generic_platform import *
 from litex.build.xilinx import XilinxSpartan6Platform
 from litex.build.openocd import OpenOCD
+from litex.build.openfpgaloader import OpenFPGALoader
 
 # IOs ----------------------------------------------------------------------------------------------
 
@@ -52,6 +53,13 @@ _io = [
     ),
 
     # DDR2 SDRAM
+    #
+    # ⚠ BYTE LANES: `dq` is listed low-byte-first (dq0-7 = first 8 pins = the *lower* physical byte
+    # lane of the chip) while `dm`/`dqs`/`dqs_n` were historically listed upper-lane-first, and
+    # litedram pairs these lists **by index** -- so lane 0 used lane 1's strobe/mask. Audited against
+    # tomverbeure's `Pano.ucf` (see RESEARCH.md §3 of the pano project notes): the order below is the
+    # corrected one (low lane first everywhere). Invisible to command training and to a word-wise
+    # memtest; corrupts byte/masked accesses. Do not "restore" the old order.
     ("ddram_clock_a", 0,
         Subsignal("p", Pins("H20")),
         Subsignal("n", Pins("J19")),
@@ -66,13 +74,13 @@ _io = [
         Subsignal("ras_n", Pins("H21"), IOStandard("SSTL18_II")),
         Subsignal("cas_n", Pins("H22"), IOStandard("SSTL18_II")),
         Subsignal("we_n",  Pins("H19"), IOStandard("SSTL18_II")),
-        Subsignal("dm",    Pins("M20 L19"), IOStandard("SSTL18_II")),
+        Subsignal("dm",    Pins("L19 M20"), IOStandard("SSTL18_II")),
         Subsignal("dq",    Pins(
             "N20 N22 M21 M22 J20 J22 K21 K22",
             "P21 P22 R20 R22 U20 U22 V21 V22"),
             IOStandard("SSTL18_II")),
-        Subsignal("dqs",   Pins("T21 L20"), IOStandard("DIFF_SSTL18_II")),
-        Subsignal("dqs_n", Pins("T22 L22"), IOStandard("DIFF_SSTL18_II")),
+        Subsignal("dqs",   Pins("L20 T21"), IOStandard("DIFF_SSTL18_II")),
+        Subsignal("dqs_n", Pins("L22 T22"), IOStandard("DIFF_SSTL18_II")),
         Subsignal("cke", Pins("D21"), IOStandard("SSTL18_II")),
         Subsignal("odt", Pins("G22"), IOStandard("SSTL18_II")),
     ),
@@ -90,13 +98,13 @@ _io = [
         Subsignal("ras_n", Pins("K5"), IOStandard("SSTL18_II")),
         Subsignal("cas_n", Pins("K4"), IOStandard("SSTL18_II")),
         Subsignal("we_n",  Pins("F2"), IOStandard("SSTL18_II")),
-        Subsignal("dm",    Pins("M3 L4"), IOStandard("SSTL18_II")),
+        Subsignal("dm",    Pins("L4 M3"), IOStandard("SSTL18_II")),
         Subsignal("dq",    Pins(
             "N3 N1 M2 M1 J3 J1 K2 K1",
             "P2 P1 R3 R1 U3 U1 V2 V1"),
             IOStandard("SSTL18_II")),
-        Subsignal("dqs",   Pins("T2 L3"), IOStandard("DIFF_SSTL18_II")),
-        Subsignal("dqs_n", Pins("T1 L1"), IOStandard("DIFF_SSTL18_II")),
+        Subsignal("dqs",   Pins("L3 T2"), IOStandard("DIFF_SSTL18_II")),
+        Subsignal("dqs_n", Pins("L1 T1"), IOStandard("DIFF_SSTL18_II")),
         Subsignal("cke", Pins("D2"), IOStandard("SSTL18_II")),
         Subsignal("odt", Pins("J6"), IOStandard("SSTL18_II")),
     ),
@@ -110,7 +118,9 @@ _io = [
         IOStandard("LVCMOS33")
     ),
     ("eth", 0,
-        Subsignal("rst_n",   Pins("R11")),
+        # rst_n is the standalone `eth_rst_n` resource above (the PHY's reset is not a LiteEth signal:
+        # liteeth never drives it, and the CRG must own it because the PHY also generates clk125).
+        # Keeping it here too would place two PADs on R11 -> ERROR:Pack:2811 at par.
         Subsignal("int_n",   Pins("AA4")),
         Subsignal("mdio",    Pins("AA2")),
         Subsignal("mdc",     Pins("AB6")),
@@ -132,12 +142,34 @@ class Platform(XilinxSpartan6Platform):
     default_clk_name   = "clk125"
     default_clk_period = 1e9/125e6
 
+    # openFPGALoader "fpga part" = device + package *without* speed grade. The Pano has no entry in
+    # openFPGALoader's board list, so --fpga-part is mandatory; it also selects the spiOverJtag
+    # (JTAG -> SPI) bridge it ships, and spiOverJtag_xc6slx100fgg484.bit.gz exists for rev C -- that
+    # is why openFPGALoader is the default here: SPI flash access needs no external proxy bitstream
+    # (bscan_spi_xc6slx100.bit has to be downloaded/built for both openocd and xc3sprog).
+    # Rev B caveat: openFPGALoader knows only the *T* LX150 (IDCODE 0x4403d093) and ships bridges
+    # for xc6slx150t{fgg484,csg484} => on rev B use --prog=openocd or build the bridge yourself
+    # (spiOverJtag/build.py in that repo).
+    ofl_parts = {"b": "xc6slx150fgg484", "c": "xc6slx100fgg484"}
+
     def __init__(self, revision="c", toolchain="ise"):
         assert revision in ["b", "c"]
+        self.revision = revision
         device = {"b": "xc6slx150-2-fgg484", "c": "xc6slx100-2-fgg484"}[revision]
         XilinxSpartan6Platform.__init__(self, device, _io, toolchain=toolchain)
         self.add_platform_command("""CONFIG VCCAUX="2.5";""")
         self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
 
-    def create_programmer(self):
-        return OpenOCD("openocd_xc6_ft232.cfg")
+    def create_programmer(self, name="openfpgaloader"):
+        # digilent_hs2 = 0x0403:0x6014 interface A == xc3sprog's `jtaghs2` cable. 6 MHz is
+        # openFPGALoader's own default (DEFAULT_FREQ); lower it if the hand-soldered adapter is sad.
+        if name == "openfpgaloader":
+            return OpenFPGALoader(
+                cable     = "digilent_hs2",
+                fpga_part = self.ofl_parts[self.revision],
+                freq      = 6e6,
+            )
+        elif name == "openocd":
+            return OpenOCD("openocd_xc6_ft232.cfg")
+        else:
+            raise ValueError(f"Unsupported programmer: {name}")
