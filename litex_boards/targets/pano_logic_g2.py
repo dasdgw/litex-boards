@@ -70,8 +70,18 @@ from litedram.core import ControllerSettings
 class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq,
         sdram_chip      = "b",
+        # sdram_clk_phase = PLL CLKOUT3, the clock handed to the DRAM CK driver (CLKOUT2/270 deg runs the
+        # sdram_half domain that drives DFI and captures read data). The DRAM launches DQ against ITS clock,
+        # so this is a pure read-eye position control and it is NOT flat: measured on a rev C board with the
+        # cacheless diagnostic SoC (10 240 test bytes + 16 byte-lane checks per point, chip b, 50 MHz sys /
+        # 200 MT/s), the clean span is 252-268 deg with 0 errors, while 250 deg -- the value inherited from
+        # the 2023-era litex-buildenv target -- already corrupts reads (BIOS 2 MiB memtest: 23078 data errors
+        # of 524288, always the same bit: lane 1, bit 2 = DQ10, even words only, spurious 1s only), and
+        # >=270 deg is catastrophic (8040-10240 bad bytes). 260 deg = centre of the window; 3/3 confirmation
+        # runs clean (Memtest OK + 0/4096 B + 0/16 lanes). Treat it as per-board tuning, not a constant:
+        # re-measure with tools/ddr_sweep.sh + tools/ddr_confirm.sh in ~/llm/tests/panologic_g2.
         sdram_half_phase = 270.,
-        sdram_clk_phase  = 250.,
+        sdram_clk_phase  = 260.,
         cpu_reset_pin    = None):
         self.rst            = Signal()
         self.cd_sys         = ClockDomain()
@@ -238,7 +248,7 @@ class BaseSoC(SoCCore):
         sdram_wr_bitslip   = 4,
         sdram_dqs_alignment = "C0",
         sdram_half_phase   = 270.,
-        sdram_clk_phase    = 250.,
+        sdram_clk_phase    = 260.,   # see _CRG: read-eye centre measured on rev C, default 250 corrupts reads
         cpu_reset_pin      = None,
         serial_index       = 0,
         **kwargs):
@@ -332,7 +342,8 @@ def main():
     parser.add_target_argument("--sdram-wr-bitslip",     default=4,    type=int, help="S6HalfRateDDRPHY wr_bitslip.")
     parser.add_target_argument("--sdram-dqs-alignment",  default="C0",         help="S6HalfRateDDRPHY dqs_ddr_alignment.")
     parser.add_target_argument("--sdram-half-phase",     default=270., type=float, help="PLL CLKOUT2 phase (sdram_half).")
-    parser.add_target_argument("--sdram-clk-phase",      default=250., type=float, help="PLL CLKOUT3 phase (SDRAM CK driver).")
+    parser.add_target_argument("--sdram-clk-phase",      default=260., type=float,
+        help="PLL CLKOUT3 phase (SDRAM CK driver). Clean read window on rev C = 252-268 deg; 250 corrupts reads.")
     # Console / reset.
     parser.add_target_argument("--serial-index",  default=0, type=int, help="Console DDC pair (0=micro-HDMI, 1=DVI).")
     parser.add_target_argument("--cpu-reset-pin", default=None,
