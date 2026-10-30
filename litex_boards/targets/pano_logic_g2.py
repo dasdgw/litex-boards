@@ -65,6 +65,9 @@ from liteeth.phy import LiteEthPHY
 from litedram.modules import MT47H32M16
 from litedram.phy import s6ddrphy
 from litedram.core import ControllerSettings
+from litex.soc.interconnect.csr import CSRStatus, CSRStorage
+from migen.genlib.cdc import MultiReg
+from migen.fhdl.specials import Tristate
 
 # ULPI Probe ---------------------------------------------------------------------------------------
 
@@ -85,14 +88,20 @@ class ULPIProbe(LiteXModule):
     conclusions. Deviation from the spec's wording ("a sys-derived *divided* clock") recorded here: a
     multiplied clock we already have is a stronger self-test than a divided one and needs no new clock.
     """
-    def __init__(self, sys_clk_freq, gate_ms = 1,
-        clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6):
+    def __init__(self, sys_clk_freq, ulpi_pads, refclk_pads = None, hub_rst_pad = None, gate_ms = 1,
+        clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6, with_analyzer = True):
         gate = int(sys_clk_freq*gate_ms/1e3)
 
         # --- measurement: the ULPI clock (C12 via cd_usb; may be absent) -----------------------------
         # width=8: the gray counter wraps every 256 edges and the sampler accumulates the differences, so
         # what matters is that the per-sys-tick increment stays far below half the range (2x sys at 50 MHz
         # sys ticks is ~2, not ~128).
+        self.rsv_spin2      = Signal(5, name="rsv_spin2")   # see RESERVED_CSR_NAMES below
+        # High bits of the ULPI edge counter, as a named signal of its own: a slice (`status[8:24]`) is a
+        # _Slice, which is unhashable, and LiteScope de-duplicates its group with a dict -- it refuses
+        # slices outright. Named, it also reads as something in the VCD instead of `x[8:24]`. Bits 8..23
+        # are the interesting ones: 60 MHz over a 1 ms gate is ~60 000, so they move once per window.
+        self.ctr_hi         = Signal(16, name="ulpi_ctr_hi")
         self.fm_ulpi     = FreqMeter(period=gate, width=8, clk=ClockSignal("usb"))
         # --- measurement: the self-test channel (known clock, real CDC) ------------------------------
         self.fm_selftest = FreqMeter(period=gate, width=8, clk=ClockSignal("sdram_half"))
@@ -107,8 +116,222 @@ class ULPIProbe(LiteXModule):
                                             f"{clk_ok_max_hz/1e6:.0f} MHz over the last {gate_ms} ms.")
         self.sync += self.clk_ok.status.eq((self.fm_ulpi.value.status >= lo) &
                                            (self.fm_ulpi.value.status <= hi))
+        self.comb += self.ctr_hi.eq(self.fm_ulpi.value.status[8:24])
         self.gate_ms = CSRStatus(16, reset=gate_ms,
             description=f"Gate window in ms; divide any *_freq by this to get Hz.")
+
+        # --- resets: registers, with the polarity included in software ------------------------------
+        #
+        # The two sources disagree and no probe reaches the pin: ULPI `RESET` is active-high by spec,
+        # tomverbeure drives `io.ulpi.reset := False` for "not in reset", the hub net is spelled
+        # `USB_RST_N`, and the 2023 wrapper held `pads.reset` at a constant 0 with a `# todo remove`
+        # (which, if the PHY is active-high, held the PHY permanently in reset). So the *logical*
+        # meaning lives in software and the polarity is a bit: assert, watch `clk_ok`, and the board
+        # decides. `*_inv=1` means the net is active-low, i.e. the pad carries the complement.
+        self.phy_rst     = CSRStorage(reset=1, description="1 = assert PHY reset (logical).")
+        self.phy_rst_inv = CSRStorage(reset=0, description="1 = the PHY reset net is active low.")
+        self.hub_rst     = CSRStorage(reset=1, description="1 = assert hub reset (logical).")
+        self.hub_rst_inv = CSRStorage(reset=1, description="1 = the hub reset net is active low "
+                                                         "(the net is named USB_RST_N).")
+
+        # --- the sequence: identical edges in every run, so the analyzer can trigger on one ---------
+        # `auto=0` gives manual stepping (the *_rst bits drive the pads directly); `auto=1` lets this
+        # FSM do it, and the wait is a register so the edge timing is not baked into a bitstream.
+        self.seq_start    = CSRStorage(description="Write 1 to run assert -> wait -> release.")
+        # reset=0: at power-up the **registers** own the resets, and `phy_rst`/`hub_rst` reset to 1, so the
+        # board comes up with both resets asserted and the bus driven idle. An auto-sequencer that took
+        # the resets over at power-up would release the PHY before anyone decided to.
+        self.seq_auto     = CSRStorage(reset=0, description="1 = the sequencer owns the resets.")
+        self.seq_wait_ms  = CSRStorage(16, reset=100, description="ms to hold each reset state.")
+        self.seq_state    = CSRStatus(3, description="0=IDLE (register-owned) 1=ASSERT 2=RELEASE 3=DONE.")
+        IDLE, ASSERT, RELEASE, DONE = [0, 1, 2, 3]
+        state    = Signal(3, reset=IDLE)
+        timer    = Signal(32)
+        target   = Signal(32)
+        asserted = Signal(reset=1)                              # logical, before polarity
+        self.sync += [
+            target.eq(self.seq_wait_ms.storage*int(sys_clk_freq/1e3)),
+            timer.eq(timer + 1),
+        ]
+        # A write, not a level: starting from the current state means the harness can re-run the same
+        # edges indefinitely, and DONE is stable (it does NOT fall back to the register) so a released
+        # PHY stays released for the measurements that follow instead of being reset again.
+        self.sync += If(self.seq_auto.storage & self.seq_start.wr_stb, state.eq(ASSERT), timer.eq(0))
+        self.sync += Case(state, {
+            IDLE    : [],
+            ASSERT  : [If(timer >= target, state.eq(RELEASE), timer.eq(0))],
+            RELEASE : [If(timer >= target, state.eq(DONE),    timer.eq(0))],
+            DONE    : [],
+        })
+        # Ownership is explicit and one-way: `auto=1` hands the resets to the FSM, `auto=0` gives them to
+        # the registers. The first version instead let state==DONE hold the release forever, which made
+        # **manual re-assertion impossible after one sequence** -- the "re-assert PHY reset" acceptance
+        # row, the one that proves the clock comes from the PHY, could never be run twice. Found by the
+        # offline model, not on the board, which is what the model is for.
+        self.comb += asserted.eq(Mux(self.seq_auto.storage, state == ASSERT, self.phy_rst.storage))
+        self.comb += self.seq_state.status.eq(state)
+
+        # --- drive the pads, polarity applied last ---------------------------------------------------
+        # A Signal, not the Mux expression: LiteScope's format_groups() de-duplicates with a dict, and a
+        # migen operator (_Operator) is unhashable -- the analyzer refuses to tap an expression. Register
+        # it and tap the register (which is also what you want in a capture: one name, one net).
+        rst_phy_net = Signal(name="rst_phy_net")
+        self.comb += [
+            rst_phy_net.eq(Mux(self.phy_rst_inv.storage, ~asserted, asserted)),
+            ulpi_pads.reset.eq(rst_phy_net),
+        ]
+        if hub_rst_pad is not None:
+            self.comb += hub_rst_pad.eq(Mux(self.hub_rst_inv.storage, ~self.hub_rst.storage,
+                                            self.hub_rst.storage))
+
+        # --- the ULPI bus: observed, never driven by anything but the idle level ---------------------
+        #
+        # `oe` here is a **level from the sequence state**, not the standards' `rst_asserted | ~dir_in`:
+        # with no `cd_usb` logic sampling `dir` synchronously, that expression would make an output
+        # enable depend on an asynchronous pad input on a bus we transmit nothing on. The standards line
+        # was amended in the same change (CODING_STANDARDS.md) so reviewer and code agree.
+        self.tri = TSTriple(8)
+        self.specials += self.tri.get_tristate(ulpi_pads.data)
+        self.comb += [
+            self.tri.oe.eq(asserted),        # drive the bus idle while the PHY is in reset (ULPI asks
+            self.tri.o.eq(0),                #   for exactly this), release it the moment it is not
+            ulpi_pads.stp.eq(0),             # never a strobe here: spin 1 transmits nothing
+        ]
+        self.oe = CSRStatus(description="Current output-enable level (the above, observed).")
+        self.comb += self.oe.status.eq(asserted)
+
+        # dir/nxt are the PHY's; a 2-FF copy *and* the raw wire are both tapped so a metastable sample
+        # in the capture is distinguishable from a real transition (they differ for one sample only).
+        self.dir_sync = Signal(1)
+        self.nxt_sync = Signal(1)
+        self.specials += [MultiReg(ulpi_pads.dir, self.dir_sync, n=2),
+                          MultiReg(ulpi_pads.nxt, self.nxt_sync, n=2)]
+        self.dir_status = CSRStatus(description="`dir` after the 2-FF synchroniser (raw is in group 0).")
+        self.comb += self.dir_status.status.eq(self.dir_sync)
+
+        # --- the analyzer: ONE instance, groups multiplexed -----------------------------------------
+        # Only group 0 is captured at full rate, so the cause-and-effect set has to live there together:
+        # sequence state, both resets, oe, clk_ok, raw+sync dir, and high bits of the clock counter. A
+        # second analyzer would halve the rate of both.
+        # The groups, exposed for the SoC to hand to LiteScope. Built here (where the signals are) but
+        # instantiated at SoC level, because `litescope_cli`'s driver looks the analyzer's own CSRs up by
+        # fixed name: nested inside `probe` they came out as `probe_analyzer_trigger_enable` and every
+        # capture died with "'LiteScopeAnalyzerDriver' object has no attribute 'trigger_enable'" (measured
+        # on the board, 2026-10-30 -- the CSRs were all present, just not under the name the client uses).
+        # --- W12 / refclk: measure before drive -------------------------------------------------------
+        #
+        # TODO (a) is the question "does the FPGA have to generate the 24 MHz", and the only instrument
+        # is this FPGA. So W12 is first an input whose level and edge activity are counted with the PHY
+        # held in reset and nothing driven; driving comes later, behind a human gate.
+        #
+        # ⚠ **The pull-up is NOT a CSR bit, and cannot be.** The spec's `w12_mode` list has
+        # "1 = input with pull-up", but on Spartan-6 PULLUP/KEEPER are **IOB attributes burned into the
+        # bitstream**, not fabric signals -- there is no runtime path to them. Asking for one would have
+        # produced a register that silently does nothing, which is the worst possible outcome for a safety
+        # knob. So the pull-up is a *build* option (`--w12-pullup`, a `NET ... PULLUP = TRUE` constraint)
+        # and the two readings are two spins; `w12_mode` keeps only what the fabric can actually switch:
+        # 0 = input (drive off), 3 = output static 0, 2 = output 24 MHz (added with the refclk PLL).
+        if refclk_pads is not None:
+            self.w12_mode = CSRStorage(2, reset=0, description="0=input (drive OFF, the power-up value), "
+                                     "3=output static 0, 2=output 24 MHz. Pull-up is --w12-pullup at build "
+                                     "time: PULLUP is a Spartan-6 IOB attribute, not runtime-selectable.")
+            self.w12_keep = CSRStorage(description="Refresh: write 1 to keep the output enable. It drops "
+                                     "itself ~50 ms after the last write -- a crashed harness, a closed "
+                                     "laptop or an agent that stops mid-experiment must not leave a net "
+                                     "driven whose other driver was never ruled out.")
+            self.w12_level   = CSRStatus(description="W12 as read (the real net level, even while driven).")
+            self.w12_edges   = CSRStatus(16, description="W12 transitions per gate window. NOT a frequency: "
+                                         "sampled in cd_sys, so a 24 MHz net aliases -- 'many' means "
+                                         "'something is driving it', which is the actual question.")
+            self.w12_drive   = CSRStatus(description="1 = the FPGA is driving W12 right now.")
+            self.w12_keep_ok = CSRStatus(description="1 = the keep bit was refreshed inside its window.")
+
+            w12_in   = Signal(name="w12_in")
+            keep_ok  = Signal(name="w12_keep_live")
+            drive_on = Signal(name="w12_drive_on")
+
+            # The pad: one IOBUF, both directions, and that is deliberate. The read-back (`o`) is the
+            # *net*, not our own output register, so "the enable dropped and the net is really not ours"
+            # is something the harness can verify instead of assume -- and `w12_level` means something in
+            # every mode, including while driving (a drive fight shows up as the level not following us).
+            # A Signal driven to 0, not `Constant(0)`: XST's Verilog reader refuses an assignment into a
+            # constant on the IOBUF's I pin (ERROR:HDLCompiler:1532 "Cannot assign to a constant value").
+            # It also has to be a signal for ticket 06, which puts the 24 MHz clock here.
+            self.w12_out = Signal(name="w12_out")     # 0 in spin 1; the refclk PLL in ticket 06
+            self.comb  += self.w12_out.eq(0)
+            self.specials += Tristate(refclk_pads, i=self.w12_out, o=w12_in, oe=drive_on)
+
+            # Count *transitions of the synchronised copy*: the pad is only ever sampled by the first flop
+            # of the 2-FF, so a metastable read cannot itself be counted as an edge.
+            w12_sync = Signal(name="w12_sync")
+            self.specials += MultiReg(w12_in, w12_sync, n=2)
+            w12_d = Signal()
+            edge  = Signal()
+            self.sync += w12_d.eq(w12_sync)
+            self.comb  += edge.eq(w12_sync ^ w12_d)
+            edges      = Signal(16)
+            gate_count = Signal(32)
+            gate       = int(sys_clk_freq*gate_ms/1e3)
+            self.sync += [
+                gate_count.eq(gate_count + 1),
+                If(edge, edges.eq(edges + 1)),
+                If(gate_count >= gate, gate_count.eq(0), edges.eq(0)),
+            ]
+            self.comb += [self.w12_level.status.eq(w12_sync), self.w12_edges.status.eq(edges)]
+
+            # The watchdog: reloaded by any write to w12_keep. ~50 ms is far above a CSR round trip and
+            # far below "somebody walked away". Note it gates the *enable*, not the mode register: the
+            # mode can say 2 or 3 and the pin still must not be driven unless the keep is live.
+            # reset=0, deliberately: **expired at power-up**. Giving the timer its full window at boot
+            # would mean "off at power-up" was only true for the first 50 ms, and the whole point of the
+            # watchdog is that a bitstream nobody is talking to cannot drive the net.
+            keep_timer = Signal(32, reset=0)
+            self.sync += If(self.w12_keep.wr_stb, keep_timer.eq(int(sys_clk_freq*50e-3)))
+            self.sync += If(keep_timer != 0, keep_timer.eq(keep_timer - 1))
+            self.comb += [
+                keep_ok.eq(keep_timer != 0),
+                # The watchdog gates the *enable*, not the mode register: `w12_mode` may say 2 or 3 and the
+                # pin still is not driven unless the keep bit is live.
+                drive_on.eq(((self.w12_mode.storage == 3) | (self.w12_mode.storage == 2)) & keep_ok),
+                self.w12_drive.status.eq(drive_on),
+                self.w12_keep_ok.status.eq(keep_ok),
+            ]
+        else:
+            refclk_pads, w12_in = None, Signal()
+            self.w12_mode   = CSRStorage(2)
+            self.w12_keep   = CSRStorage()
+            self.w12_level  = CSRStatus()
+            self.w12_edges  = CSRStatus(16)
+            self.w12_drive  = CSRStatus()
+            self.w12_keep_ok = CSRStatus()
+
+        # The groups, built last (they reference everything above) and instantiated by the SoC.
+        #
+        # ONE analyzer because groups are **multiplexed**: a second instance would halve the sampling rate
+        # of both, and group 0 is the one that has to hold the whole cause-and-effect story.
+        self.analyzer_groups = {
+            # group 0: sequence state, both resets, oe, clk_ok, raw + synchronised `dir`, and the high bits
+            # of the clock counter -- cause and effect on a single time axis.
+            0 : [state, rst_phy_net, self.hub_rst.storage, self.oe.status, self.clk_ok.status,
+                 ulpi_pads.dir, self.dir_sync, self.ctr_hi],
+            # group 1: slow/secondary, deliberately not time-critical.
+            1 : [self.nxt_sync, ulpi_pads.nxt, self.hub_rst_inv.storage, self.phy_rst_inv.storage,
+                 self.seq_auto.storage, self.tri.o],
+            # group 2: W12 -- what we asked for, whether we are actually driving, and what the net says.
+            # Separate from group 0 because "we enabled the driver and the level did not follow" is a
+            # different question from the reset/clock coupling, and merging them costs rate to both.
+            2 : [self.w12_mode.storage, self.w12_drive.status, self.w12_keep_ok.status,
+                 self.w12_level.status, w12_in],
+            # group 3: RESERVED for spin 2's ULPI bus capture (see RESERVED_* below); tied to 0 now so the
+            # slot exists in the CSV and the client can be pointed at it.
+            3 : [self.rsv_spin2],
+        }
+
+    # Spin 2 (the ULPI ID read) must land without renaming anything measured here or moving a group.
+    # It needs: ulpi_cmd/ulpi_addr/ulpi_wdata/ulpi_rdata + ulpi_go, a CDC bridge into cd_usb, and the
+    # 60 MHz bus capture. Those slots are group 2 and the names below; they are documented, not built.
+    RESERVED_CSR_NAMES  = ["ulpi_cmd", "ulpi_addr", "ulpi_wdata", "ulpi_rdata", "ulpi_go"]
+    RESERVED_GRP_NAMES  = ["ulpi_data", "ulpi_dir", "ulpi_nxt", "ulpi_stp", "ulpi_clk_ok"]
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -316,6 +539,8 @@ class BaseSoC(SoCCore):
         cpu_reset_pin      = None,
         serial_index       = 0,
         with_ulpi_probe    = False,
+        with_analyzer      = True,
+        w12_pullup         = False,
         **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         assert sdram_chip in ["a", "b"]
@@ -323,7 +548,8 @@ class BaseSoC(SoCCore):
         # CRG --------------------------------------------------------------------------------------
         # Requested once here and handed down: `platform.request()` consumes the resource, so a second
         # request for the same group anywhere else fails with "Resource not found".
-        ulpi_pads = platform.request("ulpi") if with_ulpi_probe else None
+        ulpi_pads   = platform.request("ulpi") if with_ulpi_probe else None
+        refclk_pads = platform.request("usb_refclk") if with_ulpi_probe else None
 
         self.crg = _CRG(platform, sys_clk_freq,
             sdram_chip       = sdram_chip,
@@ -428,7 +654,27 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
 
         # ULPI Probe -------------------------------------------------------------------------------
         if with_ulpi_probe:
-            self.probe = ULPIProbe(sys_clk_freq=sys_clk_freq)
+            self.probe = ULPIProbe(sys_clk_freq = sys_clk_freq,
+                ulpi_pads    = ulpi_pads,
+                refclk_pads  = refclk_pads,
+                hub_rst_pad  = platform.request("usb_hub_rst_n"),
+                with_analyzer= with_analyzer)
+            if w12_pullup and refclk_pads is not None:
+                # The pull-up half of "floating or actively held". An attribute on the NET, because that
+                # is all PULLUP is on this FPGA -- see the W12 block in ULPIProbe.
+                platform.add_platform_command('NET "{pad}" PULLUP = TRUE;', pad=refclk_pads)
+
+            if with_analyzer:
+                # Named `analyzer` at the TOP level: LiteScope's client looks up `analyzer_trigger_enable`
+                # & co by fixed name, so a prefix breaks it (see ULPIProbe.analyzer_groups).
+                from litescope import LiteScopeAnalyzer
+                self.analyzer = LiteScopeAnalyzer(self.probe.analyzer_groups,
+                    depth        = 2**14,
+                    samplerate   = sys_clk_freq,  # sets the VCD time base; wrong here = wrong axis later
+                    clock_domain = "sys",
+                    with_rle     = True, rle_length = 256,  # stretches the window over the quiet holds
+                    csr_csv      = "analyzer.csv",
+                )
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -460,6 +706,12 @@ def main():
         help="Add the ULPI Probe (PHY/hub reset CSRs, frequency measurement, analyzer). Permanent: the\n"
              "product SoC keeps it. Pair with --cpu-type=None for the bring-up spin (no BIOS, so the DDC\n"
              "pair is the remote channel and not a console); see ~/llm/tests/panologic_g2/MILESTONE1.md.")
+    parser.add_target_argument("--w12-pullup", action="store_true",
+        help="Constrain usb_refclk (W12) with PULLUP for the 'does the level follow our pull' half of "
+             "TODO (a). On Spartan-6 PULLUP is an IOB attribute, so floating and pulled are TWO builds; "
+             "it cannot be a CSR bit.")
+    parser.add_target_argument("--no-analyzer", action="store_true",
+        help="Drop the LiteScope analyzer from the probe (faster rebuild; the CSR matrix still works).")
     parser.add_target_argument("--cpu-reset-pin", default=None,
         help="Also reset from this platform resource (active low, e.g. user_btn_n). Default: boot counter only.")
     ethopts = parser.target_group.add_mutually_exclusive_group()
@@ -487,6 +739,8 @@ def main():
         cpu_reset_pin       = args.cpu_reset_pin,
         serial_index        = args.serial_index,
         with_ulpi_probe     = args.with_ulpi_probe,
+        with_analyzer       = not args.no_analyzer,
+        w12_pullup          = args.w12_pullup,
         **parser.soc_argdict
     )
     builder = Builder(soc, **parser.builder_argdict)
