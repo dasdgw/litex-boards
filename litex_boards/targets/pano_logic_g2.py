@@ -335,6 +335,26 @@ class ULPIProbe(LiteXModule):
             self.w12_pll_lock = CSRStatus(description="1 = the refclk PLL is locked. Mode 2 will not drive "
                                      "without it: an unlocked PLL can sit at any frequency, and 'the PHY "
                                      "did not answer' would then be a measurement of nothing.")
+            # --- the two seams that were invisible, added 2026-10-30 after the board refused to answer ---
+            #
+            # `w12_drive` is cd_sys's *intent*. What arms the pad is `drive_on` after it has been carried
+            # into cd_refclk -- and if that domain has no clock, the intent is 1, the enable is 0, the pad
+            # sits at the tri-state ODDR2's INIT=1 (hi-Z), and every register still says "driving". That is
+            # not a hypothetical: driving static 1 on the board read the net at 0 (7 of 8 samples) while
+            # `w12_drive` and `w12_keep_ok` both read 1, and the same net followed a 50 kOhm pull-up --
+            # which a 4 mA driver cannot lose to, physically. So the pad's own view gets a register.
+            self.w12_drive_r = CSRStatus(description="1 = cd_refclk itself holds the enable up, i.e. what the "
+                                     "pad cell actually sees. If `w12_drive`=1 while this is 0, cd_refclk is "
+                                     "not clocking and the pad never left hi-Z (INIT=1 on the tri-state "
+                                     "ODDR2) -- the failure mode that makes every other register lie.")
+            self.w12_tog     = CSRStatus(description="1 = the refclk-domain heartbeat toggle is moving. 0 "
+                                     "while w12_pll_lock=1 means the PLL claims lock but its clock is not "
+                                     "reaching the fabric (BUFG/routing), which is the same fault seen from "
+                                     "the other side.")
+            # An independent count of the *internal* 24 MHz: not the pad, not the PHY, just PLL -> BUFG ->
+            # fabric. 24000 per 1 ms gate when alive. Cheap, and it separates 'the clock does not exist'
+            # from 'the clock exists but never got to the pin' -- the two answers that need opposite fixes.
+            self.fm_refclk = FreqMeter(period=gate, width=8, clk=ClockSignal("refclk"))
             self.w12_keep_ok = CSRStatus(description="1 = the keep bit was refreshed inside its window.")
 
             w12_in   = Signal(name="w12_in")
@@ -427,6 +447,11 @@ class ULPIProbe(LiteXModule):
             # flops (which is why MultiReg rather than two hand-written flops), so the pair stays in one
             # slice; the false-path constraint for the crossing itself belongs to the domain, see
             # RefclkPLL + add_false_path_constraints in BaseSoC.
+            # A heartbeat in the pad's domain: if cd_refclk has no clock this never toggles, which is a
+            # *positive* statement about the clock rather than the absence of one.
+            tog = Signal(name="w12_refclk_tog")
+            self.sync.refclk += tog.eq(~tog)   # the pad domain, not cd_sys
+            tog_r = Signal(name="w12_refclk_tog_sys")
             sel_clock_r = Signal(name="w12_sel_clock_r")
             sel_one_r   = Signal(name="w12_sel_one_r")
             drive_on_r  = Signal(name="w12_drive_on_r")
@@ -499,10 +524,16 @@ class ULPIProbe(LiteXModule):
             # level*, not a clock, and the refclk's only source is this PLL fed from cd_sys: if it stops,
             # cd_sys stopped too and the board is not being driven by anything any more. Power-cycling
             # clears it. Worth knowing before the drive step, and worth a meter if the pin is ever reachable.
+            # Reading the pad domain's state back into cd_sys for the CSRs (levels, both quasi-static).
+            drive_on_r_sys = Signal(name="w12_drive_on_r_sys")
+            self.specials += [MultiReg(drive_on_r, drive_on_r_sys, odomain="sys", n=2),
+                              MultiReg(tog, tog_r, odomain="sys", n=2)]
             self.comb += [
                 self.w12_drive.status.eq(drive_on),
                 self.w12_keep_ok.status.eq(keep_ok),
                 self.w12_pll_lock.status.eq(pll_lock),
+                self.w12_drive_r.status.eq(drive_on_r_sys),
+                self.w12_tog.status.eq(tog_r),
             ]
         else:
             refclk_pads, w12_in = None, Signal()
@@ -528,8 +559,16 @@ class ULPIProbe(LiteXModule):
             # group 2: W12 -- what we asked for, whether we are actually driving, and what the net says.
             # Separate from group 0 because "we enabled the driver and the level did not follow" is a
             # different question from the reset/clock coupling, and merging them costs rate to both.
+            # ⚠ Tap the ODDR2's **D inputs**, never its Q: pulling `w12_drv`/`w12_t_r` into fabric logic
+            # makes the packer refuse the design (`ERROR:Pack:2531 - The dual data rate register "ODDR2_5"
+            # failed to join the OLOGIC/IOSWITCH pad`, measured 2026-10-30 on the first attempt at exactly
+            # this instrumentation). The D side is the same information one clock earlier, and `d0/d1` are
+            # already the decoded (D0,D1) pair, so nothing is lost: `d0=1,d1=1` + enable up + `w12_in`=0 is
+            # a NET problem (something holds it), while the enable up and `d0/d1` not moving is a FABRIC
+            # problem (the pad domain never clocked). Those two look identical from the CSR side and need
+            # opposite fixes, which is the whole reason this group carries them.
             2 : [self.w12_mode.storage, self.w12_drive.status, self.w12_keep_ok.status,
-                 self.w12_level.status, w12_in, self.w12_pll_lock.status],
+                 self.w12_level.status, w12_in, self.w12_pll_lock.status, d0, d1, tog],
             # group 3: RESERVED for spin 2's ULPI bus capture (see RESERVED_* below); tied to 0 now so the
             # slot exists in the CSV and the client can be pointed at it.
             3 : [self.rsv_spin2],
