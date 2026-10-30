@@ -251,6 +251,7 @@ class BaseSoC(SoCCore):
         sdram_clk_phase    = 260.,   # see _CRG: read-eye centre measured on rev C, default 250 corrupts reads
         cpu_reset_pin      = None,
         serial_index       = 0,
+        with_ulpi_probe    = False,
         **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         assert sdram_chip in ["a", "b"]
@@ -272,10 +273,46 @@ class BaseSoC(SoCCore):
         #   --cpu-variant=lite --l2-size=0
         # for the test bitstream (the BIOS executes from block RAM, so it still runs when the SDRAM is
         # dead); see tools/ddr_bytelane.py.
+        # The probe build (see ~/llm/tests/panologic_g2/.scratch/ulpi-probe/spec.md) is CPU-less on
+        # purpose: the DDC pair is either a **console** or the **remote channel**, never both, because
+        # they are the same two wires. No BIOS => no console => the host can read CSRs and run the logic
+        # analyzer over UARTBone, and the LED chaser is the only "alive" signal.
+        if with_ulpi_probe:
+            kwargs["with_uart"]     = False
+            kwargs["with_uartbone"] = False   # added below, from the pads this target actually requested
+
+        # Requested once and reused: platform.request() consumes the resource, so asking for the same
+        # index twice dies with "Resource not found: serial:1".
+        uart_pads = platform.request("serial", serial_index)
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident     = "LiteX SoC on Pano Logic G2",
-            uart_pads = platform.request("serial", serial_index),
+            uart_pads = uart_pads,
             **kwargs)
+
+        # UARTBone from the *requested* pads ---------------------------------------------------------
+        #
+        # Why this is hand-built instead of `--with-uartbone`: SoCCore.add_uartbone() ignores the pads a
+        # target passes and re-requests the platform resource by *name* --
+        #     uartbone_phy = uart.UARTPHY(self.platform.request(uart_name), ...)
+        # with uart_name defaulting to "serial" (litex/soc/integration/soc.py, verified against the
+        # pinned tree 2026-10-30). On this board `serial` has TWO indexes and _lookup() takes the first
+        # match when number is None: index 0 = the micro-HDMI DDC pair. So the stock helper puts the
+        # remote channel on wires nobody cabled, silently, while `uart_pads` (the DVI pair we are wired
+        # to) is dropped. Same class of trap as the console's --serial-index (JTAG_CABLE.md §4).
+        if with_ulpi_probe:
+            from litex.soc.cores.uart import UARTPHY, UARTBone
+            uartbone_phy = UARTPHY(uart_pads,
+                clk_freq              = sys_clk_freq,
+                baudrate              = kwargs.get("uart_baudrate", 115200),
+                with_dynamic_baudrate = kwargs.get("uart_with_dynamic_baudrate", False))
+            uartbone = UARTBone(
+                phy           = uartbone_phy,
+                clk_freq      = sys_clk_freq,
+                cd            = "sys",
+                address_width = self.bus.address_width)
+            # add_module() sets self.uartbone itself and asserts the name is free -- do not assign it first.
+            self.add_module(name="uartbone", module=uartbone)
+            self.bus.add_master(name="uartbone", master=uartbone.wishbone)
 
         # DDR2 SDRAM -------------------------------------------------------------------------------
         if not self.integrated_main_ram_size:
@@ -346,6 +383,10 @@ def main():
         help="PLL CLKOUT3 phase (SDRAM CK driver). Clean read window on rev C = 252-268 deg; 250 corrupts reads.")
     # Console / reset.
     parser.add_target_argument("--serial-index",  default=0, type=int, help="Console DDC pair (0=micro-HDMI, 1=DVI).")
+    parser.add_target_argument("--with-ulpi-probe", action="store_true",
+        help="Add the ULPI Probe (PHY/hub reset CSRs, frequency measurement, analyzer). Permanent: the\n"
+             "product SoC keeps it. Pair with --cpu-type=None for the bring-up spin (no BIOS, so the DDC\n"
+             "pair is the remote channel and not a console); see ~/llm/tests/panologic_g2/MILESTONE1.md.")
     parser.add_target_argument("--cpu-reset-pin", default=None,
         help="Also reset from this platform resource (active low, e.g. user_btn_n). Default: boot counter only.")
     ethopts = parser.target_group.add_mutually_exclusive_group()
@@ -372,6 +413,7 @@ def main():
         sdram_clk_phase     = args.sdram_clk_phase,
         cpu_reset_pin       = args.cpu_reset_pin,
         serial_index        = args.serial_index,
+        with_ulpi_probe     = args.with_ulpi_probe,
         **parser.soc_argdict
     )
     builder = Builder(soc, **parser.builder_argdict)
