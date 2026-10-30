@@ -324,10 +324,31 @@ class ULPIProbe(LiteXModule):
                                      "--w12-pullup at build time, NOT here: PULLUP is a Spartan-6 IOB "
                                      "attribute with no fabric path to it.")
             self.w12_keep = CSRStorage(description="Refresh: write 1 to keep the output enable. It drops "
-                                     "itself ~50 ms after the last write -- a crashed harness, a closed "
-                                     "laptop or an agent that stops mid-experiment must not leave a net "
-                                     "driven whose other driver was never ruled out.")
-            self.w12_level   = CSRStatus(description="W12 as read (the real net level, even while driven).")
+                                     "itself `w12_keep_ms` after the last write -- a crashed harness, a "
+                                     "closed laptop or an agent that stops mid-experiment must not leave a "
+                                     "net driven whose other driver was never ruled out.")
+            # **In transactions, not in seconds.** Measured 2026-10-30: one CSR round trip over the DDC
+            # serial link costs ~12-20 ms, so the original fixed 50 ms window is only ~2.5 transactions
+            # wide -- a harness that writes the keep bit and then reads three registers *reliably* sees the
+            # last read fall outside its own window (measured: keep_ok={0:39,1:1} while drive={1:39,0:1} in
+            # the same loop). That made a healthy board look like it was dropping the enable at random, and
+            # it voided good rows. 500 ms is still a short leash (a dead host leaves the pad driven for at
+            # most half a second) and buys ~25 transactions of margin.
+            self.w12_keep_ms = CSRStorage(16, reset=500, description="Keep-bit window in ms (default 500: "
+                                     "~25 serial transactions. Do not set it near one transaction's cost, "
+                                     "measured ~20 ms here).")
+            # ⚠ This description used to say "the real net level, **even while driven**". It cannot be true:
+            # the tri-state is an ODDR2 because ERROR:LIT:675 requires it, and using the IOLOGIC that way
+            # "eliminate[s] the use of the IOB as a bidirectional IO" -- the input path stops observing the
+            # pin exactly when the output engages, and the value you read is the one sampled *before* the
+            # pad was enabled. Measured on the same firmware twice: float spin + drive static 1 reads
+            # `1,0,0,0,0,0,0` (frozen at the floating net's 0) and pull-up spin + drive static 0 reads
+            # `0,1,1,1,1,1` (frozen at the pull-up's 1). It is what produced a phantom "something is holding
+            # W12 low" on 2026-10-30, so the pad's own view is no longer trusted silently: `w12_level_valid`
+            # says whether the number in front of you was observed or remembered.
+            self.w12_level   = CSRStatus(description="W12 as the pad's input path last observed it. "
+                                     "**Only meaningful while w12_level_valid=1**: while the output is "
+                                     "enabled the IOB is not bidirectional and this is the pre-drive value.")
             self.w12_edges   = CSRStatus(16, description="W12 transitions per gate window. NOT a frequency: "
                                          "sampled in cd_sys, so a 24 MHz net aliases -- 'many' means "
                                          "'something is driving it', which is the actual question.")
@@ -356,6 +377,14 @@ class ULPIProbe(LiteXModule):
             # from 'the clock exists but never got to the pin' -- the two answers that need opposite fixes.
             self.fm_refclk = FreqMeter(period=gate, width=8, clk=ClockSignal("refclk"))
             self.w12_keep_ok = CSRStatus(description="1 = the keep bit was refreshed inside its window.")
+            # Not a nice-to-have: without this, `w12_level` is indistinguishable from a live reading, and a
+            # live reading is what a safety gate needs. 1 = the pad is hi-Z, so `w12_level`/`w12_edges` are
+            # observations of the net. 0 = the pad is driving, so they are a memory of before it did.
+            self.w12_level_valid = CSRStatus(description="1 = the pad is tri-stated, so w12_level and "
+                                     "w12_edges are observing the net. 0 = we are driving and the IOB's "
+                                     "input path is disabled (DDR tri-state => not a bidirectional IOB): "
+                                     "those registers then hold the value from *before* the enable, which "
+                                     "is not a measurement of anything current.")
 
             w12_in   = Signal(name="w12_in")
             keep_ok  = Signal(name="w12_keep_live")
@@ -422,7 +451,16 @@ class ULPIProbe(LiteXModule):
             # below, which is how the async cone got wired in the first place).
             # reset=0, deliberately: **expired at power-up** -- see the note in the original place below.
             keep_timer = Signal(32, reset=0)
-            self.sync += If(self.w12_keep.wr_stb, keep_timer.eq(int(sys_clk_freq*50e-3)))
+            # `keep_timer` itself, in ~1 ms units (>>10 of sys cycles: 65535*1024/50000 = 1342 ms of range).
+            # Added 2026-10-30 because the board produced a row where `w12_drive` read 0 while its own
+            # complement `w12_level_valid` and its crossed copy `w12_drive_r` both said the enable was UP --
+            # three reads each, so not a one-off. Either the window is really expiring between the keep
+            # write and the read, or the read is wrong, and those need opposite fixes. This register ends
+            # the argument: it is the countdown, not an inference from a status bit.
+            self.w12_keep_left = CSRStatus(16, description="keep_timer >> 10, i.e. ~ms of window left "
+                                     "(1024 sys cycles per count). 0 = expired.")
+            self.sync += If(self.w12_keep.wr_stb,
+                            keep_timer.eq(self.w12_keep_ms.storage*int(sys_clk_freq/1e3)))
             self.sync += If(keep_timer != 0, keep_timer.eq(keep_timer - 1))
 
             # `LOCKED` is an asynchronous level as far as the fabric is concerned, and it gates mode 2.
@@ -436,7 +474,15 @@ class ULPIProbe(LiteXModule):
             else:
                 self.comb += pll_lock.eq(1)
 
-            self.comb += [
+            # **Registered, and that is a measured decision, not a style preference.** As combinational
+            # signals the CSR bridge reads them mid-glitch: `keep_timer != 0` is a 32-bit reduction that
+            # re-evaluates on all 50 million decrements a second, and `drive_on` inherits every one of them.
+            # The symptom on the board (2026-10-30): a status bit wrong ~1 read in 25 with nothing having
+            # changed -- caught because `w12_drive` and `w12_level_valid` are *complements* and came back
+            # AGREED (both 0) in the same row. That is impossible for the logic and entirely possible for a
+            # read. One such read voided a healthy drive row and the harness refused, correctly, to build a
+            # clock step on it. A flop can be read one cycle stale; it cannot be read mid-transition.
+            self.sync += [
                 keep_ok.eq(keep_timer != 0),
                 # The watchdog gates the *enable*, not the mode register: `w12_mode` may say 2 or 3 and the
                 # pin still is not driven unless the keep bit is live.
@@ -532,6 +578,8 @@ class ULPIProbe(LiteXModule):
                 self.w12_drive.status.eq(drive_on),
                 self.w12_keep_ok.status.eq(keep_ok),
                 self.w12_pll_lock.status.eq(pll_lock),
+                self.w12_level_valid.status.eq(~drive_on),
+                self.w12_keep_left.status.eq(keep_timer >> 10),
                 self.w12_drive_r.status.eq(drive_on_r_sys),
                 self.w12_tog.status.eq(tog_r),
             ]
