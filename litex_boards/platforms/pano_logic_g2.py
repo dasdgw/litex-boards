@@ -44,6 +44,43 @@ _io = [
         IOStandard("LVCMOS33")
     ),
 
+    # USB ULPI (SMSC/USB3300 PHY -> USB2514 hub -> 4x USB-A)
+    #
+    # Ported from the 2023-era fork branch `legacy-2023` of this file: this group exists *there* and
+    # nowhere else (not on `pano-linux`, not upstream), and it is the only handle we have on the PHY.
+    #
+    # DATA BIT ORDER -- a known suspect, checked rather than trusted, and it is CORRECT:
+    #   LiteX `Pins("A7 B8 A8 D6 C6 B6 A6 A4")` assigns by index, i.e. data[0]=A7 ... data[7]=A4.
+    #   tomverbeure's `Pano.ucf` (table reproduced in RESEARCH.md, "confirmed identical in
+    #   litex-buildenv") lists ULPI_DATA[0]=A7, [1]=B8, [2]=A8, [3]=D6, [4]=C6, [5]=B6, [6]=A6,
+    #   [7]=A4 -- the *same* mapping read in the opposite textual order. The two sources agree; do
+    #   not "fix" this by reversing the list, that would be the actual bug. If ULPI traffic ever
+    #   shows a bit-permuted byte, re-derive from the UCF, do not start here.
+    #
+    # Reset polarity on `reset` (net USB3300_RESET) is NOT settled: ULPI RESET is active-high by
+    # spec, tomverbeure drives `io.ulpi.reset := False` for "not in reset", and the 2023 core wrapper
+    # held pads.reset at a constant 0 with a `# todo remove`. It is a CSR polarity bit upstream, so
+    # the board decides; nothing here bakes in a direction.
+    ("ulpi", 0,
+        Subsignal("clk",   Pins("C12")),  # 60 MHz FROM the PHY (input): present == PHY alive
+        Subsignal("stp",   Pins("A5")),
+        Subsignal("dir",   Pins("C7")),
+        Subsignal("nxt",   Pins("C5")),
+        Subsignal("reset", Pins("C9")),
+        Subsignal("data",  Pins("A7 B8 A8 D6 C6 B6 A6 A4")),
+        IOStandard("LVCMOS33")
+    ),
+
+    # USB reference clock: the 24 MHz the USB3300 (and per tomverbeure the USB2514 hub too) needs to
+    # start. Direction is UNPROVEN -- `USB_CLK` appears in Pano.ucf only as a commented-out pin under
+    # "USB Clock Generation", and the board's only oscillator (25 MHz) feeds the Marvell PHY, not USB.
+    # Whether the FPGA must drive it is TODO (a); treat every use as measure-before-drive.
+    ("usb_refclk", 0, Pins("W12"), IOStandard("LVCMOS33")),
+
+    # Hub reset (net USB_RST_N, the on-board USB2514). Independent of the PHY reset above; the two
+    # are never driven as one signal.
+    ("usb_hub_rst_n", 0, Pins("W11"), IOStandard("LVCMOS33")),
+
     # SPIFlash
     ("spiflash", 0,
         Subsignal("cs_n", Pins("T5"),   IOStandard("LVCMOS33")),
@@ -157,8 +194,17 @@ class Platform(XilinxSpartan6Platform):
         self.revision = revision
         device = {"b": "xc6slx150-2-fgg484", "c": "xc6slx100-2-fgg484"}[revision]
         XilinxSpartan6Platform.__init__(self, device, _io, toolchain=toolchain)
+        # Do not remove: the ULPI bank's VCCAUX is 2.5 V on this board, which is also what openFPGALoader's
+        # own spiOverJtag proxy bitfiles for xc6slx100fgg484 are built at. (The ULPI *IOs* are LVCMOS33 --
+        # tomverbeure's UCF -- and that pairing is unverified by meter; see the ULPI Probe failure tree.)
         self.add_platform_command("""CONFIG VCCAUX="2.5";""")
         self.add_period_constraint(self.lookup_request("clk125", loose=True), 1e9/125e6)
+        # NOTE for whoever adds the USB logic: `ulpi_clk` (C12, 60 MHz from the PHY) is constrained in the
+        # *SoC*, with the `cd_usb` domain that buffers it -- not here. `lookup_request()` only resolves
+        # resources a design has already *requested* (it walks `matched`, not `available`), so a
+        # `add_period_constraint(lookup_request("ulpi_clk", loose=True), ...)` here silently resolves to
+        # None and returns without constraining anything (measured 2026-10-30: it prints None on this
+        # platform even with the group present).
 
     def create_programmer(self, name="openfpgaloader"):
         # digilent_hs2 = 0x0403:0x6014 interface A == xc3sprog's `jtaghs2` cable. 6 MHz is
