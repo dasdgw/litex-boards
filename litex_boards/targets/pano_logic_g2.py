@@ -58,6 +58,7 @@ from litex.soc.cores.clock import *
 from litex.soc.integration.soc import *
 from litex.soc.integration.builder import *
 from litex.soc.cores.led import LedChaser
+from litex.soc.cores.freqmeter import FreqMeter
 
 from liteeth.phy import LiteEthPHY
 
@@ -65,11 +66,56 @@ from litedram.modules import MT47H32M16
 from litedram.phy import s6ddrphy
 from litedram.core import ControllerSettings
 
+# ULPI Probe ---------------------------------------------------------------------------------------
+
+class ULPIProbe(LiteXModule):
+    """The instrument half of the ULPI Probe: count clocks over a **gate window**, and prove the meter
+    is not lying before anything it says about the PHY is believed.
+
+    Everything is in `cd_sys`. `cd_usb` cannot hold state because the PHY's clock stops when the PHY is
+    in reset, so a counter there would freeze exactly when the answer is "no clock".
+
+    Registers are **edges per gate window**, not Hz: with the default 1 ms window the numbers read as
+    Hz/1000 (60 MHz -> ~60 000). Keep the gate in one place (`gate_ms`) so the harness can divide.
+
+    The self-test channel measures `cd_sdram_half` -- 2x sys, a clock this design already generates and
+    that is *not* on the far side of a PHY. It is a genuine clock-domain crossing (unlike measuring sys
+    with sys, which would exercise no CDC at all), and it is what distinguishes "the PHY is dead" from
+    "the counter is dead", which are otherwise indistinguishable and lead to opposite, expensive
+    conclusions. Deviation from the spec's wording ("a sys-derived *divided* clock") recorded here: a
+    multiplied clock we already have is a stronger self-test than a divided one and needs no new clock.
+    """
+    def __init__(self, sys_clk_freq, gate_ms = 1,
+        clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6):
+        gate = int(sys_clk_freq*gate_ms/1e3)
+
+        # --- measurement: the ULPI clock (C12 via cd_usb; may be absent) -----------------------------
+        # width=8: the gray counter wraps every 256 edges and the sampler accumulates the differences, so
+        # what matters is that the per-sys-tick increment stays far below half the range (2x sys at 50 MHz
+        # sys ticks is ~2, not ~128).
+        self.fm_ulpi     = FreqMeter(period=gate, width=8, clk=ClockSignal("usb"))
+        # --- measurement: the self-test channel (known clock, real CDC) ------------------------------
+        self.fm_selftest = FreqMeter(period=gate, width=8, clk=ClockSignal("sdram_half"))
+
+        # --- the derived claim `clk_ok` --------------------------------------------------------------
+        # A band, not equality: the PHY's 60 MHz is only as good as its 24 MHz reference's tolerance, and
+        # a gate window that starts/stops on a sys edge quantises by +-1 edge. Registered so the value is
+        # stable for the whole window instead of glitching while the counter is being latched.
+        lo = int(clk_ok_min_hz*gate_ms/1e3)
+        hi = int(clk_ok_max_hz*gate_ms/1e3)
+        self.clk_ok = CSRStatus(description=f"1 = ULPI clock within {clk_ok_min_hz/1e6:.0f}-"
+                                            f"{clk_ok_max_hz/1e6:.0f} MHz over the last {gate_ms} ms.")
+        self.sync += self.clk_ok.status.eq((self.fm_ulpi.value.status >= lo) &
+                                           (self.fm_ulpi.value.status <= hi))
+        self.gate_ms = CSRStatus(16, reset=gate_ms,
+            description=f"Gate window in ms; divide any *_freq by this to get Hz.")
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq,
         sdram_chip      = "b",
+        ulpi_pads       = None,
         # sdram_clk_phase = PLL CLKOUT3, the clock handed to the DRAM CK driver (CLKOUT2/270 deg runs the
         # sdram_half domain that drives DFI and captures read data). The DRAM launches DQ against ITS clock,
         # so this is a pure read-eye position control and it is NOT flat: measured on a rev C board with the
@@ -223,6 +269,24 @@ class _CRG(LiteXModule):
         self.specials += Instance("BUFG", name="sdram_half_b_bufg",
             i_I=pll_sdram_half_b, o_O=clk_sdram_half_shifted)
 
+        # ULPI clock domain (`cd_usb`) ---------------------------------------------------------------
+        # C12 is the 60 MHz the PHY outputs when it is out of reset. `reset_less` **because** that clock
+        # can vanish: there is no usable synchronous reset in a domain whose clock may be absent, and the
+        # boot-counter pattern is the only one that is (CODING_STANDARDS.md). Spin 1 of the ULPI Probe puts
+        # no synchronous logic in here beyond FreqMeter's gray counter, so the boot counter is not needed
+        # yet -- the domain is declared so the CDC boundary and the constraint exist once, not twice.
+        if ulpi_pads is not None:
+            self.cd_usb = ClockDomain(reset_less=True)
+            # IBUFG, not a bare input: this is a clock and must reach the global network. If par refuses
+            # this pin, that is itself the finding (it would mean the PHY's 60 MHz cannot clock fabric at
+            # all) -- do not "fix" it by dropping the buffer.
+            self.specials += Instance("IBUFG", name="ulpi_clk_bufg",
+                i_I = ulpi_pads.clk, o_O = self.cd_usb.clk)
+            platform.add_period_constraint(self.cd_usb.clk, 1e9/60e6)
+            # The crossing to cd_usb is gray-code and deliberately asynchronous (FreqMeter does the CDC),
+            # so no timing relationship is claimed between the two domains.
+            platform.add_false_path_constraints(self.cd_sys.clk, self.cd_usb.clk)
+
         output_clk = Signal()
         clk = platform.request(f"ddram_clock_{sdram_chip}")
         self.specials += Instance("ODDR2", p_DDR_ALIGNMENT="NONE",
@@ -257,8 +321,13 @@ class BaseSoC(SoCCore):
         assert sdram_chip in ["a", "b"]
 
         # CRG --------------------------------------------------------------------------------------
+        # Requested once here and handed down: `platform.request()` consumes the resource, so a second
+        # request for the same group anywhere else fails with "Resource not found".
+        ulpi_pads = platform.request("ulpi") if with_ulpi_probe else None
+
         self.crg = _CRG(platform, sys_clk_freq,
             sdram_chip       = sdram_chip,
+            ulpi_pads        = ulpi_pads,
             sdram_half_phase = sdram_half_phase,
             sdram_clk_phase  = sdram_clk_phase,
             cpu_reset_pin    = cpu_reset_pin)
@@ -356,6 +425,10 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 eth_clocks_rx = platform.lookup_request("eth_clocks").rx,
                 eth_clocks_tx = platform.lookup_request("eth_clocks").tx,
             )
+
+        # ULPI Probe -------------------------------------------------------------------------------
+        if with_ulpi_probe:
+            self.probe = ULPIProbe(sys_clk_freq=sys_clk_freq)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
