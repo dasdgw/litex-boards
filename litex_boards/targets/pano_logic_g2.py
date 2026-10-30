@@ -71,6 +71,83 @@ from migen.fhdl.specials import Tristate
 
 # ULPI Probe ---------------------------------------------------------------------------------------
 
+class RefclkPLL(LiteXModule):
+    """24.000 MHz for the USB PHY's reference clock, derived from `cd_sys` in a PLL of its own.
+
+    **Why not a spare output of the CRG's PLL:** the CRG deliberately takes the *highest legal VCO*
+    (1000 MHz on this -2 part, which is also what litex-buildenv proved on this exact board) because the
+    DRAM PHY needs 4x and 2x taps of it -- and 1000/24 is not an integer, so no divider on that VCO can
+    make 24 MHz. From the 50 MHz sys clock: VCO = 50x12 = 600 MHz, /25 = **exactly 24 MHz**, PFD 50 MHz
+    (inside the 19-500 window). The accuracy is inherited from the Marvell-PHY oscillator that the 125 MHz
+    GbE reference also comes from, which is well inside USB's +-500 ppm.
+
+    Fed from `cd_sys` (already BUFG'd) instead of the CRG's BUFIO2 so that this PLL cannot perturb the DRAM
+    clock tree: adding a load there is the one change in this milestone that could break memory we already
+    proved working. If par objects to a BUFG driving PLL_ADV's CLKIN1, the fallback is `clk125_b`.
+    """
+
+    def __init__(self, ref_freq = 50e6, out_freq = 24e6):
+        # Solved, not hardcoded: a build at another sys_clk_freq must fail here with a clear message rather
+        # than quietly emit 24.something MHz to a PHY that expects 24.
+        best = None
+        for m in range(1, 257):
+            vco = ref_freq*m
+            if not (400e6 <= vco <= 1000e6):
+                continue
+            n = vco/out_freq
+            if abs(n - round(n)) > 1e-9 or not (1 <= n <= 128):
+                continue
+            if best is None or m < best[0]:
+                best = (m, int(round(n)), vco)
+        if best is None:
+            raise ValueError(
+                f"Cannot synthesize {out_freq/1e6} MHz from {ref_freq/1e6} MHz on a Spartan-6 PLL: no VCO "
+                f"in [400, 1000] MHz is an integer multiple of the target with N<=128.")
+        m, n, vco = best
+        print("[refclk] {} MHz x{} -> VCO {} MHz -> {} MHz (N={})".format(
+            ref_freq/1e6, m, vco/1e6, out_freq/1e6, n))
+
+        self.clk    = Signal()
+        self.lock   = Signal()
+        # **A declared clock domain, not just a wire, and that is the whole Score-173 story.**
+        #
+        # `ulpi_t08` failed with `Timing Score: 173 (Setup: 173)`. trce named exactly one endpoint:
+        # `keep_timer<6> (cd_sys) -> ODDR2_6` (the pad's tri-state cell), **requirement 0.833 ns** --
+        # XST had auto-derived `TS_refclk_pll_clk = TSsys_clk / 0.48` and therefore analysed every
+        # cd_sys -> refclk path as a *synchronous* path with a sub-nanosecond requirement. Nothing was
+        # wrong with the logic; the relationship between the two clocks had simply never been declared,
+        # so the tool guessed the wrong one. Proven minimally: a 60-line design (PLL + keep-timer + the
+        # two ODDR2s) reproduces it as Score 1509 with the identical endpoint, and goes green on the
+        # same netlist with only LiteX's `add_false_path_constraints()` added
+        # (`~/fpga/forkbuild/repro_w12/loop.sh`, 18 s per run).
+        #
+        # Declared here rather than patched with a hand-written TIG so that the constraint and the logic
+        # that relies on it live together, exactly like `cd_usb` below (same file, same reason).
+        self.cd_refclk = ClockDomain(reset_less=True)   # reset-less: the ODDR2s use S/R tied to 0 and
+                                                        # MultiReg's flops are reset_less by construction.
+        self.out_freq  = out_freq
+        fb        = Signal()
+        spare     = Signal()
+        self.specials += Instance("PLL_ADV",
+            p_SIM_DEVICE = "SPARTAN6", p_BANDWIDTH = "OPTIMIZED",
+            p_COMPENSATION = "INTERNAL", p_REF_JITTER = .01,
+            i_DADDR = 0, i_DCLK = 0, i_DEN = 0, i_DI = 0, i_DWE = 0, i_RST = 0, i_REL = 0,
+            i_CLKIN1 = ClockSignal("sys"), p_CLKIN1_PERIOD = 1e9/ref_freq,
+            i_CLKIN2 = 0, p_CLKIN2_PERIOD = 0., i_CLKINSEL = 1,
+            p_DIVCLK_DIVIDE = 1,
+            i_CLKFBIN = fb, o_CLKFBOUT = fb, o_LOCKED = self.lock,
+            p_CLK_FEEDBACK = "CLKFBOUT", p_CLKFBOUT_MULT = m, p_CLKFBOUT_PHASE = 0.,
+            o_CLKOUT0 = self.clk, p_CLKOUT0_DUTY_CYCLE = .5,
+            p_CLKOUT0_PHASE = 0., p_CLKOUT0_DIVIDE = n,
+            # Spares, kept the way the CRG keeps its own.
+            o_CLKOUT1 = spare, p_CLKOUT1_DUTY_CYCLE = .5, p_CLKOUT1_PHASE = 0., p_CLKOUT1_DIVIDE = n,
+        )
+        # A PLL output that drives an IO goes through a global buffer: without it the pad clock takes
+        # ordinary routing, and asking a PHY to accept unknown skew on its reference input is not a
+        # measurement, it is a coin flip.
+        self.specials += Instance("BUFG", i_I = self.clk, o_O = self.cd_refclk.clk)
+
+
 class ULPIProbe(LiteXModule):
     """The instrument half of the ULPI Probe: count clocks over a **gate window**, and prove the meter
     is not lying before anything it says about the PHY is believed.
@@ -88,7 +165,8 @@ class ULPIProbe(LiteXModule):
     conclusions. Deviation from the spec's wording ("a sys-derived *divided* clock") recorded here: a
     multiplied clock we already have is a stronger self-test than a divided one and needs no new clock.
     """
-    def __init__(self, sys_clk_freq, ulpi_pads, refclk_pads = None, hub_rst_pad = None, gate_ms = 1,
+    def __init__(self, sys_clk_freq, ulpi_pads, refclk_pads = None, refclk_clk = None,
+        refclk_lock = None, hub_rst_pad = None, gate_ms = 1,
         clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6, with_analyzer = True):
         gate = int(sys_clk_freq*gate_ms/1e3)
 
@@ -229,12 +307,22 @@ class ULPIProbe(LiteXModule):
         # bitstream**, not fabric signals -- there is no runtime path to them. Asking for one would have
         # produced a register that silently does nothing, which is the worst possible outcome for a safety
         # knob. So the pull-up is a *build* option (`--w12-pullup`, a `NET ... PULLUP = TRUE` constraint)
-        # and the two readings are two spins; `w12_mode` keeps only what the fabric can actually switch:
-        # 0 = input (drive off), 3 = output static 0, 2 = output 24 MHz (added with the refclk PLL).
+        # and the two readings are two spins. Value 1 is then free, and it is used for something better
+        # than the thing it replaced -- see the mode list on `w12_mode`.
         if refclk_pads is not None:
+            # The modes are ordered by how much they can hurt, and the harness walks them in that order:
+            #   0 input            -- cannot hurt, and the only state at power-up
+            #   1 output static 1  -- the *discriminator*: if the net does not read 1 while we hold it at
+            #                         1 with the weakest driver, something is holding it low and driving a
+            #                         clock would be driving into it. Static, so the exposure carries no
+            #                         edges and no state machine depends on it.
+            #   3 output static 0  -- cannot contend with a low holder (both sides drive the same level)
+            #   2 output 24 MHz    -- the actual experiment, and the only mode that also needs the PLL lock
             self.w12_mode = CSRStorage(2, reset=0, description="0=input (drive OFF, the power-up value), "
-                                     "3=output static 0, 2=output 24 MHz. Pull-up is --w12-pullup at build "
-                                     "time: PULLUP is a Spartan-6 IOB attribute, not runtime-selectable.")
+                                     "1=output static 1 (does the net follow our weakest driver?), "
+                                     "3=output static 0, 2=output 24 MHz (needs PLL lock). Pull-up is "
+                                     "--w12-pullup at build time, NOT here: PULLUP is a Spartan-6 IOB "
+                                     "attribute with no fabric path to it.")
             self.w12_keep = CSRStorage(description="Refresh: write 1 to keep the output enable. It drops "
                                      "itself ~50 ms after the last write -- a crashed harness, a closed "
                                      "laptop or an agent that stops mid-experiment must not leave a net "
@@ -244,6 +332,9 @@ class ULPIProbe(LiteXModule):
                                          "sampled in cd_sys, so a 24 MHz net aliases -- 'many' means "
                                          "'something is driving it', which is the actual question.")
             self.w12_drive   = CSRStatus(description="1 = the FPGA is driving W12 right now.")
+            self.w12_pll_lock = CSRStatus(description="1 = the refclk PLL is locked. Mode 2 will not drive "
+                                     "without it: an unlocked PLL can sit at any frequency, and 'the PHY "
+                                     "did not answer' would then be a measurement of nothing.")
             self.w12_keep_ok = CSRStatus(description="1 = the keep bit was refreshed inside its window.")
 
             w12_in   = Signal(name="w12_in")
@@ -254,12 +345,131 @@ class ULPIProbe(LiteXModule):
             # *net*, not our own output register, so "the enable dropped and the net is really not ours"
             # is something the harness can verify instead of assume -- and `w12_level` means something in
             # every mode, including while driving (a drive fight shows up as the level not following us).
-            # A Signal driven to 0, not `Constant(0)`: XST's Verilog reader refuses an assignment into a
-            # constant on the IOBUF's I pin (ERROR:HDLCompiler:1532 "Cannot assign to a constant value").
-            # It also has to be a signal for ticket 06, which puts the 24 MHz clock here.
-            self.w12_out = Signal(name="w12_out")     # 0 in spin 1; the refclk PLL in ticket 06
-            self.comb  += self.w12_out.eq(0)
-            self.specials += Tristate(refclk_pads, i=self.w12_out, o=w12_in, oe=drive_on)
+            # A Signal, not `Constant(0)`: XST's Verilog reader refuses an assignment into a constant on
+            # the IOBUF's I pin (ERROR:HDLCompiler:1532 "Cannot assign to a constant value").
+            # There is no `w12_out` any more. The combinational mux that used to sit here was meant to be
+            # the pad's driven value and *cannot* be one: Spartan-6 refuses a clock into fabric
+            # (Place:1136), so the driven value is an ODDR2 output -- `w12_drv` in the netlist. The modes
+            # are decoded from synchronised bits below, in the pad's own domain.
+            # ⚠ **How we drive this pad, and why it is not a mux into a buffer.**
+            #
+            # First attempt: `Tristate(pad, i=w12_out, o=w12_in)`. Wrong on argument order -- migen is
+            # `Tristate(pad, o, oe, i)`, where `o` is what gets DRIVEN (IOBUF `.I`) and `i` is what gets
+            # READ (`.O`). The result drove the pad from an undriven wire and let the read-back net fight
+            # the mux; it synthesized, placed and timed clean, so nothing said so. Every `w12_level` /
+            # `w12_edges` reading from earlier on 2026-10-30 is therefore not a measurement of the net --
+            # including the "stays low against the internal pull-up" that looked like a holder. Do not
+            # cite those numbers; re-measure.
+            #
+            # Second attempt: a mux on a BUFG'd clock, which Spartan-6 refuses outright
+            # (ERROR:Place:1136, a global buffer driving a non-clock load). So the pad is driven the way
+            # the CRG drives SDRAM CK: **ODDR2**, with the clock on C0 (a legal clock load) and the mode
+            # choosing D0/D1 -- 1/0 gives a copy of the clock, 1/1 a static 1, 0/0 a static 0. One output
+            # stage, no fabric in the clock path, and the same three modes the CSR advertises.
+            #
+            # DDR_ENABLE must be TRUE: with FALSE the primitive ignores D1 and the "clock" mode would
+            # silently output a constant 1.
+            # --- what feeds the pad cells, and from which domain ---------------------------------------
+            #
+            # Both ODDR2s below are clocked by `cd_refclk`, so everything into their D inputs must belong
+            # to `cd_refclk` too. The first version fed them `d0/d1` decoded straight from
+            # `w12_mode.storage`, and `~drive_on` decoded from a 32-bit cd_sys watchdog: two multi-bit
+            # asynchronous cones into the data and tri-state inputs of the cell that decides whether the
+            # PHY sees a clock. trce caught the timing half of that (Score 173, one endpoint:
+            # `keep_timer<6> -> ODDR2_6`). The functional half is silent, and it is precisely the
+            # "we believed we had stopped driving" case the watchdog exists to prevent.
+            #
+            # So: decode in `cd_sys` (where the register lives) into **one-bit predicates**, synchronise
+            # each with its own MultiReg, decode again in `cd_refclk`. One bit per net means a
+            # synchroniser can only emit the old or the new value, never a third -- and the pad's
+            # (D0,D1) pair can then only ever combine into:
+            #
+            #   (1,0) clock   (1,1) static 1   (0,0) static 0
+            #
+            # The clock combination needs `sel_clock`, i.e. `w12_mode.storage == 2`, so **a clock cannot
+            # appear on the pad on the way between two other modes**. That is why this is two predicates
+            # rather than the obvious "ship the 2-bit mode across and decode there", which can land on the
+            # clock code mid-transition (mode 0 -> 3 changes both bits).
+            sel_clock = Signal(name="w12_sel_clock")   # mode 2: put the refclk on the pad
+            sel_one   = Signal(name="w12_sel_one")     # mode 1: hold the pad at 1 (the discriminator)
+            mode      = self.w12_mode.storage
+            self.comb += [
+                sel_clock.eq(mode == 2),
+                sel_one.eq(mode == 1),
+            ]
+
+            # The watchdog, moved above the pad cells so the enable is defined before it is used (it was
+            # below, which is how the async cone got wired in the first place).
+            # reset=0, deliberately: **expired at power-up** -- see the note in the original place below.
+            keep_timer = Signal(32, reset=0)
+            self.sync += If(self.w12_keep.wr_stb, keep_timer.eq(int(sys_clk_freq*50e-3)))
+            self.sync += If(keep_timer != 0, keep_timer.eq(keep_timer - 1))
+
+            # `LOCKED` is an asynchronous level as far as the fabric is concerned, and it gates mode 2.
+            # Synchronised **in cd_sys, not cd_refclk**, on purpose: while the PLL is unlocked its clock
+            # output may not be running, and a synchroniser in the domain that clock would drive can never
+            # release. (Independent bug in the tree before any of this: the raw level went straight into a
+            # CSRStatus and into the enable logic.)
+            pll_lock = Signal(name="w12_pll_lock_sync")
+            if refclk_lock is not None:
+                self.specials += MultiReg(refclk_lock, pll_lock, odomain="sys", n=2)
+            else:
+                self.comb += pll_lock.eq(1)
+
+            self.comb += [
+                keep_ok.eq(keep_timer != 0),
+                # The watchdog gates the *enable*, not the mode register: `w12_mode` may say 2 or 3 and the
+                # pin still is not driven unless the keep bit is live.
+                drive_on.eq((((mode == 3) | (mode == 1)) | ((mode == 2) & pll_lock)) & keep_ok),
+            ]
+
+            # The crossings into the pad's domain. migen's Xilinx builder puts `ASYNC_REG` on a MultiReg's
+            # flops (which is why MultiReg rather than two hand-written flops), so the pair stays in one
+            # slice; the false-path constraint for the crossing itself belongs to the domain, see
+            # RefclkPLL + add_false_path_constraints in BaseSoC.
+            sel_clock_r = Signal(name="w12_sel_clock_r")
+            sel_one_r   = Signal(name="w12_sel_one_r")
+            drive_on_r  = Signal(name="w12_drive_on_r")
+            self.specials += [
+                MultiReg(sel_clock, sel_clock_r, odomain="refclk", n=2),
+                MultiReg(sel_one,   sel_one_r,   odomain="refclk", n=2),
+                MultiReg(drive_on,  drive_on_r,  odomain="refclk", n=2),
+            ]
+            # Decode again, in the pad's own domain: from here to the ODDR2 data pins is a *synchronous*
+            # path with 41.7 ns to spare, so it is not the thing that can fail timing.
+            d0 = Signal()
+            d1 = Signal()
+            self.comb += [
+                d0.eq(sel_clock_r | sel_one_r),
+                d1.eq(sel_one_r),
+            ]
+            w12_drv   = Signal(name="w12_drv")
+            w12_t_r   = Signal(name="w12_t_r")    # ~drive_on through an ODDR2: LIT:675 demands it
+            self.specials += [
+                # Port/parameter names copied from the CRG's own ODDR2 in this file rather than from the
+                # 7-series datasheet: Spartan-6 has no DDR_ENABLE (that is `DDR_MODE`) and no T on ODDR2,
+                # and XST says so with "Module ODDR2 does not have a parameter named DDR_ENABLE" /
+                # "Cannot find port T". C1 = ~C0 is how the CRG gets a full-rate edge pair too.
+                Instance("ODDR2", p_DDR_ALIGNMENT = "NONE", p_INIT = 0, p_SRTYPE = "SYNC",
+                    i_D0 = d0, i_D1 = d1, i_S = 0, i_R = 0, i_CE = 1,
+                    i_C0 = (refclk_clk if refclk_clk is not None else 0),
+                    i_C1 = ~(refclk_clk if refclk_clk is not None else 0),
+                    o_Q = w12_drv),
+                # IOBUF, not OBUF: `w12_in` is the net, so "the enable dropped and the pin is not ours"
+                # and "we drove 1 and the level did not follow" stay things the harness can verify.
+                # ERROR:LIT:675 spells it out: "when the data path on a TBUF is driven by an ODDR2, the
+                # tri-state path of the same TBUF must also be driven by an ODDR2". So the enable goes
+                # through a second ODDR2 with D0=D1 (a level, clocked through) rather than a plain flop --
+                # and it fails safe: INIT=1 means hi-Z until something clocks it, so if the refclk PLL
+                # never locks, the pad is never driven.
+                Instance("ODDR2", p_DDR_ALIGNMENT = "NONE", p_INIT = 1, p_SRTYPE = "SYNC",
+                    i_D0 = ~drive_on_r, i_D1 = ~drive_on_r, i_S = 0, i_R = 0, i_CE = 1,
+                    i_C0 = (refclk_clk if refclk_clk is not None else 0),
+                    i_C1 = ~(refclk_clk if refclk_clk is not None else 0),
+                    o_Q = w12_t_r),
+                Instance("IOBUF",
+                    i_I = w12_drv, i_T = w12_t_r, o_O = w12_in, io_IO = refclk_pads),
+            ]
 
             # Count *transitions of the synchronised copy*: the pad is only ever sampled by the first flop
             # of the 2-FF, so a metastable read cannot itself be counted as an edge.
@@ -279,22 +489,20 @@ class ULPIProbe(LiteXModule):
             ]
             self.comb += [self.w12_level.status.eq(w12_sync), self.w12_edges.status.eq(edges)]
 
-            # The watchdog: reloaded by any write to w12_keep. ~50 ms is far above a CSR round trip and
-            # far below "somebody walked away". Note it gates the *enable*, not the mode register: the
-            # mode can say 2 or 3 and the pin still must not be driven unless the keep is live.
-            # reset=0, deliberately: **expired at power-up**. Giving the timer its full window at boot
-            # would mean "off at power-up" was only true for the first 50 ms, and the whole point of the
-            # watchdog is that a bitstream nobody is talking to cannot drive the net.
-            keep_timer = Signal(32, reset=0)
-            self.sync += If(self.w12_keep.wr_stb, keep_timer.eq(int(sys_clk_freq*50e-3)))
-            self.sync += If(keep_timer != 0, keep_timer.eq(keep_timer - 1))
+            # (The watchdog and the PLL-lock synchroniser moved up next to the pad cells they gate; this is
+            #  now only the read-back.)
+            #
+            # ⚠ Residual exposure, stated rather than fixed, because there is no way to fix it here: the
+            # enable is held in a cell clocked by the refclk, so **if the refclk disappeared while we were
+            # driving, the watchdog could no longer drop the enable** -- the ODDR2 would simply stop
+            # clocking and the pad would freeze at whatever level it held. That residual is a *static
+            # level*, not a clock, and the refclk's only source is this PLL fed from cd_sys: if it stops,
+            # cd_sys stopped too and the board is not being driven by anything any more. Power-cycling
+            # clears it. Worth knowing before the drive step, and worth a meter if the pin is ever reachable.
             self.comb += [
-                keep_ok.eq(keep_timer != 0),
-                # The watchdog gates the *enable*, not the mode register: `w12_mode` may say 2 or 3 and the
-                # pin still is not driven unless the keep bit is live.
-                drive_on.eq(((self.w12_mode.storage == 3) | (self.w12_mode.storage == 2)) & keep_ok),
                 self.w12_drive.status.eq(drive_on),
                 self.w12_keep_ok.status.eq(keep_ok),
+                self.w12_pll_lock.status.eq(pll_lock),
             ]
         else:
             refclk_pads, w12_in = None, Signal()
@@ -321,7 +529,7 @@ class ULPIProbe(LiteXModule):
             # Separate from group 0 because "we enabled the driver and the level did not follow" is a
             # different question from the reset/clock coupling, and merging them costs rate to both.
             2 : [self.w12_mode.storage, self.w12_drive.status, self.w12_keep_ok.status,
-                 self.w12_level.status, w12_in],
+                 self.w12_level.status, w12_in, self.w12_pll_lock.status],
             # group 3: RESERVED for spin 2's ULPI bus capture (see RESERVED_* below); tied to 0 now so the
             # slot exists in the CSV and the client can be pointed at it.
             3 : [self.rsv_spin2],
@@ -551,12 +759,39 @@ class BaseSoC(SoCCore):
         ulpi_pads   = platform.request("ulpi") if with_ulpi_probe else None
         refclk_pads = platform.request("usb_refclk") if with_ulpi_probe else None
 
+        if with_ulpi_probe:
+            # Built before the probe so the probe can be handed the clock and, more importantly, its lock.
+            self.refclk_pll = RefclkPLL(ref_freq = sys_clk_freq)
+            # The weakest driver the part offers, on the one pin where we might be fighting a holder we
+            # cannot see: contention current is set by the output impedance, and this is the only knob for
+            # it. SLOW slew too -- a fast edge into an unknown load is a ringing experiment on top of an
+            # electrical one.
+            # Two statements, not `DRIVE = 4; SLEW = SLOW;` on one netspec: UCF repeats the netspec per
+            # attribute and answers the shorthand with ERROR:ConstraintSystem:300 ("a value was expected
+            # for the SLEW constraint's 'resspec'"), which reads like a typo in a line that looks fine.
+            platform.add_platform_command('NET "{pad}" DRIVE = 4;',  pad=refclk_pads)
+            platform.add_platform_command('NET "{pad}" SLEW = SLOW;', pad=refclk_pads)
+
         self.crg = _CRG(platform, sys_clk_freq,
             sdram_chip       = sdram_chip,
             ulpi_pads        = ulpi_pads,
             sdram_half_phase = sdram_half_phase,
             sdram_clk_phase  = sdram_clk_phase,
             cpu_reset_pin    = cpu_reset_pin)
+
+        if with_ulpi_probe:
+            # The refclk domain's constraints. Both are load-bearing and this is where the Score-173 build
+            # was missing them:
+            #   * the **period**, so the tool treats the pad clock as 24.000 MHz instead of inventing a
+            #     phase relationship with sys_clk (it auto-derived `TSsys_clk / 0.48`, which is the right
+            #     period for the wrong reason: a *derived* timespec tells XST the clocks are related), and
+            #   * the **false paths**, because every cd_sys <-> cd_refclk path in this design is a MultiReg
+            #     (see the pad-cell block in ULPIProbe) and an analysed 2-FF synchroniser is a bug report,
+            #     not a design.
+            # Registered here rather than inside RefclkPLL because cd_sys's clock net is only known once the
+            # CRG exists. Same pair as `cd_usb` in the CRG, same reason.
+            platform.add_period_constraint(self.refclk_pll.cd_refclk.clk, 1e9/self.refclk_pll.out_freq)
+            platform.add_false_path_constraints(self.crg.cd_sys.clk, self.refclk_pll.cd_refclk.clk)
 
         # SoCCore ----------------------------------------------------------------------------------
         # serial_index: the console lives on a DDC pair, 0 = micro-HDMI, 1 = DVI.
@@ -657,6 +892,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
             self.probe = ULPIProbe(sys_clk_freq = sys_clk_freq,
                 ulpi_pads    = ulpi_pads,
                 refclk_pads  = refclk_pads,
+                refclk_clk   = self.refclk_pll.cd_refclk.clk if with_ulpi_probe else None,
+                refclk_lock  = self.refclk_pll.lock  if with_ulpi_probe else None,
                 hub_rst_pad  = platform.request("usb_hub_rst_n"),
                 with_analyzer= with_analyzer)
             if w12_pullup and refclk_pads is not None:
