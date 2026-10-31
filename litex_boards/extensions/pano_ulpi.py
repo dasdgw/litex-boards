@@ -445,6 +445,15 @@ class UlpiMaster(Module):
         read_active = Signal(name = "read_active")
         self.comb += read_active.eq((state == RD_TURN) | (state == RD_WAIT_DIR))
         sync += If(read_active & self.dir_in & ~self.clear, rdata_c.eq(self.tri.i))
+        # ...and it is **emptied whenever the master is idle**, so that an access which never reached its
+        # read cycle -- a `nxt` stall we timed out, a `dir` abort that exhausted the retry budget -- acks with
+        # 00 rather than with the *previous* access's byte. `rdata_c` is a register and `ack_data` carries it
+        # on every access, so without this a failed read reports whatever byte was last read: measured
+        # 2026-10-31, `stall_rd` acked with `rdata=24`, the ID byte of a row three accesses earlier. That is
+        # spec testing decision 8's stale-read failure sitting one layer below the harness rule the
+        # testbench already enforces, and the harness cannot see it because a timed-out access really does
+        # ack.
+        sync += If(state == IDLE, rdata_c.eq(0))
 
         self.comb += [
             self.ack.eq(state == FINISH),
@@ -587,10 +596,6 @@ class UlpiLink(LiteXModule):
         # bit that clears before anybody can read it is a bit that was never there (spec decision 12).
         # Registered, never combinational: spin 1 measured a combinational status read in the glitch.
         a = ack_unpack(self.bridge.ack_data)
-        self.sync += If(self.h_req & ~self.h_busy, [
-            self.done.eq(0), self.err_dir_abort.eq(0), self.err_nxt_timeout.eq(0),
-            self.err_no_clock.eq(0), self.err_reset.eq(0),
-        ])
         self.sync += If(self.bridge.ack, [
             self.done.eq(1),
             self.err_dir_abort.eq(a["dir_abort"]),
@@ -612,6 +617,22 @@ class UlpiLink(LiteXModule):
         # running, stalled, or blocked behind `clear` because the PHY is in reset. The master's
         # `xfer_active` stays what it is for -- the analyzer's gate for "is there a transaction to capture".
         self.sync += If(self.h_busy & ~self.clk_ok, [self.err_no_clock.eq(1), _inc_sat(self.cnt_no_clock)])
+        # The sticky clear, and it is the LAST assignment to these bits on purpose.
+        #
+        # ``err_reset`` is set from ``bridge.err_lost``, which is itself a level held until the next
+        # ``start`` -- so on the very edge that accepts a new ``h_req`` both the clear and the set are
+        # alive, the set reads the old level, and a bit written off a level wins: every access following a
+        # lost one reported ``err_reset`` for one access too many. Found 2026-10-31 by the row *after*
+        # `reset_mid_noclk_rd`, which read a stale `err_reset` as "this access died" and gave up on one that
+        # was running fine. ``err_no_clock`` is the same shape (an access asked for with no clock holds
+        # ``h_busy`` high, so its clear and its set are alive together by construction); re-asserting on the
+        # next cycle is the right answer there, not a bug.
+        #
+        # Order also *is* the contract: "sticky until the next `go`" (spec decision 12) means the `go` wins.
+        self.sync += If(self.h_req & ~self.h_busy, [
+            self.done.eq(0), self.err_dir_abort.eq(0), self.err_nxt_timeout.eq(0),
+            self.err_no_clock.eq(0), self.err_reset.eq(0),
+        ])
         self.specials += [
             MultiReg(self.master.dir_in, self.dir_now, odomain = "sys"),
             MultiReg(self.master.oe_out, self.oe_now,  odomain = "sys"),

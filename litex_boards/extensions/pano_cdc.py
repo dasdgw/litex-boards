@@ -200,6 +200,15 @@ class ReqAckCDC(Module):
         # levels are asynchronous to each other. A destination that really does forget a transaction is
         # caught by `expired` instead, which is slower and always correct.
         self.comb += lost.eq(self.busy & ~ack_edge & (clear_x | (seen_clear & ~clear_x) | expired))
+        # ...and the **withdraw**. The source gives up on a lost access by dropping `req_level`, and a
+        # destination being erased cannot answer at all; either way the far side's `dst_req` has to go with
+        # it. Only `dst_ack` released it, so a master cleared by a PHY reset left `dst_req` stuck high, and
+        # the `~self.dst_req` guard in the edge detect above then swallowed the *next* access: the failure
+        # was one row late and in a different row, which is how the freeze vector (`reset_mid_noclk_rd`)
+        # found it on 2026-10-31 -- that row clears a master whose clock was gone before it could ever ack.
+        # Harmless in the normal flow: `req_level` falls only on `ack_edge` or on `lost`, and by the
+        # `ack_edge` case the destination has long since released `dst_req` itself.
+        dst += If(~req_high | clear_x, self.dst_req.eq(0))
         # The witness is per-access: cleared when one starts and when one is declared lost. Left sticky, it
         # marks every later access lost from the first PHY reset onward (found on the vector right after
         # `reset_mid`, where it looked like a Link that hung).

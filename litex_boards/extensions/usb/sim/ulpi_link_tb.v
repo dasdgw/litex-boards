@@ -14,7 +14,7 @@
 // been built to catch.
 //
 //   iverilog -g2012 -o sim.out ulpi_link_tb.v ulpi_phy_model.v ulpi_link.v
-//   vvp sim.out +hex=vectors.hex +nvec=29
+//   vvp sim.out +hex=vectors.hex +nvec=<count>
 //
 // Three things this file does on purpose:
 //
@@ -82,6 +82,9 @@ module ulpi_link_tb;
         .ulpi_stp(dut_stp), .ulpi_dir(phy_dir), .ulpi_nxt(phy_nxt)
     );
 
+    initial begin watch_oe = 1'b0; drove_after_reset = 1'b0; end
+    always @(posedge sys_clk) if (watch_oe && (|dut_oe)) drove_after_reset = 1'b1;
+
     // ---------------------------------------------------------------------------------------------
     // The model, and the knobs the vector's `fault` column turns.
     // ---------------------------------------------------------------------------------------------
@@ -126,7 +129,13 @@ module ulpi_link_tb;
     // the TSV.
     // ---------------------------------------------------------------------------------------------
     localparam F_NONE = 0, F_ABORT_ONCE = 1, F_ABORT_3 = 2, F_ABORT_FOREVER = 3, F_STALL = 4,
-               F_SILENCE = 5, F_RESET_MID = 6, F_BUS_REV = 7, F_IGNORE_WRITE = 8;
+               F_SILENCE = 5, F_RESET_MID = 6, F_BUS_REV = 7, F_IGNORE_WRITE = 8,
+               F_RESET_MID_NOCLK = 9;
+
+    // The freeze row's witness (see the sequence in the main loop): did the Link put anything on the data
+    // pad *after* the host was told the access was dead? `dut_oe` is the TSTriple's own enable, so this is
+    // the pad, not the FSM's opinion about it.
+    reg watch_oe, drove_after_reset;
     localparam P_READY = 0, P_PHY_RESET = 1, P_HUB_RELEASED = 2, P_HUB_ASSERTED = 3;
     localparam E_NONE = 0, E_TIMEOUT = 1, E_ABORT = 2, E_NO_CLOCK = 3, E_RESET = 4;
 
@@ -263,6 +272,15 @@ module ulpi_link_tb;
             // both wrong, the encoding is the cause, and naming the symptom is what costs the evening. The
             // main loop clears `check_cmd` on the reset rows (a PHY in reset decodes nothing, and the
             // reset-mid row's `seen_cmd` belongs to a transaction that no longer exists).
+            if (ok && (fault == F_RESET_MID_NOCLK) && drove_after_reset) begin
+                // Everything else this row expects -- `err_reset`, `busy` clear -- is the BRIDGE's doing, and
+                // `cd_sys` never stopped clocking, so those hold with or without the relock tail. Without
+                // this check the tail, which is the mechanism decision 6 was written for, was covered by no
+                // vector at all: measured 2026-10-31, deleting it left 28/28 green
+                // (`tools/ulpi_mutate.py no_relock_tail`).
+                ok  = 0;
+                why = "the Link drove the data bus for an access the host had been told was dead";
+            end
             if (check_cmd !== 1'b0) begin
                 if (seen_cmd !== exp_cmd) begin
                     ok  = 0;
@@ -284,10 +302,29 @@ module ulpi_link_tb;
                     E_RESET:    ok = err_reset;
                     default:    ok = 0;
                 endcase
-                if (!ok) why = "the named error never latched";
-                // Half of what these rows test is that the Link comes back: an error bit latched behind a
-                // permanently asserted busy is a hang the host cannot distinguish from a slow access.
-                if (h_busy) why = "error latched but busy never cleared";
+                if (!ok) begin
+                    why = "the named error never latched";
+                end else if (acc_ok && (acc_rdata !== 8'h00)) begin
+                    // A row with no byte expectation is a row whose access was *not* supposed to deliver
+                    // one. If it acked anyway and hands back a byte, that byte is the previous access's:
+                    // `rdata` is a register, and a timed-out or abort-exhausted access reports through the
+                    // same ack. "0x24, and by the way it timed out" is the lie this line refuses -- the
+                    // harness-side half of the same rule is the `if (h_ack)` in `do_access` above, and it
+                    // cannot see this case because a failure that acks is indistinguishable from a success
+                    // by the ack alone. (spec testing decision 8; found 2026-10-31, `stall_rd` read 24.)
+                    ok  = 0;
+                    why = "a failed access returned a byte (stale rdata)";
+                end else if (h_busy) begin
+                    // Half of what these rows test is that the Link comes back: an error bit latched behind
+                    // a permanently asserted busy is a hang the host cannot distinguish from a slow access
+                    // (spec testing decision 5). The `ok = 0` is the whole line and it was missing until
+                    // 2026-10-31: the message existed, `why` was assigned, and the row still printed PASS.
+                    // What reddened the mutation was the *next* vector, blocked behind the stuck busy -- a
+                    // true failure reported in the wrong row, which is how this became a verdict instead of
+                    // a rumour. See `tools/ulpi_mutate.py`'s `lost_keeps_busy`.
+                    ok  = 0;
+                    why = "error latched but busy never cleared";
+                end
             end else if (ok) begin
                 if (!acc_ok) begin
                     ok  = 0;
@@ -304,8 +341,13 @@ module ulpi_link_tb;
             end
             if (ok) begin
                 pass_n = pass_n + 1;
-                $display("RESULT %0d PASS rdata=%h ack=%b abort=%b tmo=%b waited=%0d retry=%0d state=%0d",
-                         n, acc_rdata, acc_ok, acc_abort, acc_timeout, acc_waited, acc_retry, state);
+                // A PASS carries the same evidence as a FAIL. It used to carry less, which meant the four
+                // error bits were only ever visible on a failing row -- and the cross-model diff between
+                // this suite and the python twin (`tools/test_ulpi_phy_model.py`, section 6) compares
+                // readings on rows where both models passed, so it needs them here.
+                $display("RESULT %0d PASS rdata=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d",
+                         n, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy,
+                         acc_waited, acc_retry, state);
             end else begin
                 fail_n = fail_n + 1;
                 // One line, one format string, no concatenation: `check_row` is the only place a verdict is
@@ -371,9 +413,47 @@ module ulpi_link_tb;
             // Two rows have no encoding to check: a PHY held in reset decodes nothing, and the reset-mid row
             // decodes a command whose transaction is then destroyed, so its `seen_cmd` belongs to an access
             // that no longer exists.
-            check_cmd = (pre != P_PHY_RESET) && (fault != F_RESET_MID);
+            check_cmd = (pre != P_PHY_RESET) && (fault != F_RESET_MID) && (fault != F_RESET_MID_NOCLK);
             exp_cmd   = 8'h00;
-            if (fault == F_RESET_MID) begin
+            drove_after_reset = 1'b0;
+            if (fault == F_RESET_MID_NOCLK) begin
+                // Decision 6's *other* half, the one `reset_mid_rd` cannot see. That row resets a domain
+                // that is still being clocked, so the FSM takes the clear itself and the relock tail never
+                // matters. Here the clock goes away first: a PHY reset asserted against a frozen `cd_usb`
+                // is a reset the FSM never observes, and when CLKOUT returns the FSM would simply resume a
+                // transaction whose bridge state no longer exists -- driving a TX CMD into a PHY that has
+                // already forgotten it. `UlpiClear`'s `relock` tail is what makes the first edge back an
+                // edge with `clear` high, and this is the vector that would notice its absence.
+                fork
+                    do_access(1'b1, addr, 8'h00);
+                    begin
+                        // Freeze it *while it is driving*, not N cycles into the access: a register read is
+                        // over in five cd_usb cycles, so a counted delay freezes whatever happens to be
+                        // there -- which is what this row originally did, freezing an idle master and
+                        // passing for the wrong reason. `wait (|dut_oe)` is event-driven: it fires in the
+                        // delta where the pad enable rises, which is by construction the cycle the master
+                        // holds the command byte, and `driving` is therefore 1 when the clock stops.
+                        wait (|dut_oe);
+                        usb_clk_en = 1'b0;                   // C12 dies underneath the transaction
+                        repeat (60) @(posedge sys_clk);      // cd_sys counts; cd_usb is frozen mid-byte
+                        phy_reset = 1'b1;                    // the operator's recovery, per the failure tree
+                        repeat (30) @(posedge sys_clk);
+                        phy_reset = 1'b0;
+                        // From here the pad must be quiet, and the interesting part is that it has to go
+                        // quiet *combinationally*, with no cd_usb edge to do it: `clear` is a cd_sys signal
+                        // and the idle level is a combinational function of it. With the relock tail, `oe`
+                        // drops the cycle `phy_reset` does. Without it, the frozen `driving` keeps the
+                        // command byte on the bus in front of a PHY that has just forgotten the transaction
+                        // that put it there.
+                        watch_oe = 1'b1;
+                        repeat (10) @(posedge sys_clk);
+                        usb_clk_en = 1'b1;                   // the clock returns: the frozen FSM's first edge
+                        repeat (400) @(posedge sys_clk);
+                        watch_oe = 1'b0;
+                    end
+                join
+                repeat (200) @(posedge sys_clk);
+            end else if (fault == F_RESET_MID) begin
                 // The only fault whose content is *when*: the clock is taken away from an access that has
                 // already started. What must come back is `busy`, and what must latch is `err_reset`; the
                 // access itself is expected to die, and a Link that reports success here is the bug.

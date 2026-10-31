@@ -94,10 +94,22 @@ module ulpi_phy_model #(
             regs[2]  = 8'h04;  // ProductID low
             regs[3]  = 8'h00;  // ProductID high  -> 0x0004 = USB3300
             for (i = 4; i < 64; i = i + 1) regs[i] = 8'h00;
-            regs[4]  = 8'h41;  // Function Control POR (datasheet Table 6.3): OTG_EN|INDIRECT_ACCESS|DPDM_DIS
-            regs[6]  = 8'h02;  // Host Configuration: PHY-like, no serial-drv
-            regs[10] = 8'h01;  // OTG: a minimally OTG-compliant PHY
-            regs[16'h15 & 6'h3f] = 8'h00;  // Debug: linestates are overlaid at read time, not stored
+            // Every value below comes from RESEARCH.md §7.2 (USB3300 datasheet Table 6.3), which is this
+            // repo's single home for them, and `tools/test_ulpi_phy_model.py` diffs this list against the
+            // python table in `tools/ulpi_phy_model.py` address by address. That check exists because the
+            // two tables used to disagree here -- `0x06` said 0x02 ("Host Configuration") and `0x0A` said
+            // 0x01 ("minimally OTG-compliant"), both of them remembered rather than cited, both of them
+            // wrong against the doc, and **no vector reads either address**, so no vector could have said
+            // so. A register the vectors do not read is exactly where a model is allowed to lie, which is
+            // why the cross-check compares tables and not just outcomes.
+            regs[6'h04] = 8'h41;   // Function Control POR: OTG_EN|INDIRECT_ACCESS|DPDM_DIS
+            // §6.1.4's set/clear aliases read back the register they alias. They are modelled as separate
+            // storage here (a write to `0x04` does not appear at `0x05`), which is honest because the Link
+            // never uses the aliases (spec decision 2) and no vector reads them.
+            regs[6'h05] = 8'h41;
+            regs[6'h06] = 8'h41;
+            regs[6'h0A] = 8'h06;   // OTG Control POR
+            regs[6'h15] = 8'h00;   // Debug: the linestates are overlaid at read time, not stored
         end
     endtask
 
