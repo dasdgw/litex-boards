@@ -246,13 +246,35 @@ module ulpi_link_tb;
     endtask
 
     task automatic check_row(input integer n, input has_exp, input [7:0] exp, input [2:0] exp_err,
-                             input [3:0] fault);
+                             input [3:0] fault, input [2:0] pre, input op);
         reg ok;
         reg [8*200:1] why;
         begin
             ok  = 1;
             why = "";
-            if (!has_exp) begin
+            // Every row also checks the **encoding the PHY actually decoded** -- `exp_cmd`, set by whoever
+            // ran last: the command of a write access for a write row, and of the read-back for every row
+            // that reads. This is how a wrong TX CMD gets *named* rather than merely failing: a master that
+            // sent 0x40|PID (a packet -- Track A's encoding, never ours), or with a stuck rw bit, or an
+            // address field off by one, would otherwise read as "no ack" and cost a waveform session.
+            // The model decoded it independently from Table 6, so the cross-check is not a tautology.
+            //
+            // First, deliberately, ahead of the byte comparison: when a row's byte *and* its encoding are
+            // both wrong, the encoding is the cause, and naming the symptom is what costs the evening. The
+            // main loop clears `check_cmd` on the reset rows (a PHY in reset decodes nothing, and the
+            // reset-mid row's `seen_cmd` belongs to a transaction that no longer exists).
+            if (check_cmd !== 1'b0) begin
+                if (seen_cmd !== exp_cmd) begin
+                    ok  = 0;
+                    why = "the PHY decoded the wrong TX CMD encoding";
+                end
+            end
+
+
+            // `if (ok)` on both branches, and that is load-bearing rather than tidiness: these compute the
+            // verdict, so assigning to `ok` unconditionally here would erase the encoding verdict above and
+            // put the suite back to "wrong byte" for a wrong-command bug.
+            if (ok && !has_exp) begin
                 // The row is about an error, not a byte. The vector file's rule: it passes only if the
                 // named error is the one that latched.
                 case (exp_err)
@@ -266,7 +288,7 @@ module ulpi_link_tb;
                 // Half of what these rows test is that the Link comes back: an error bit latched behind a
                 // permanently asserted busy is a hang the host cannot distinguish from a slow access.
                 if (h_busy) why = "error latched but busy never cleared";
-            end else begin
+            end else if (ok) begin
                 if (!acc_ok) begin
                     ok  = 0;
                     why = "no ack inside the bound (hung, or died for a reason the row did not name)";
@@ -288,7 +310,10 @@ module ulpi_link_tb;
                 fail_n = fail_n + 1;
                 // One line, one format string, no concatenation: `check_row` is the only place a verdict is
                 // formed, and a verdict that needs a grep across three lines is a verdict nobody reads.
-                $display("RESULT %0d FAIL exp=%h seen=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d why=%0s", n, exp, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy, acc_waited, acc_retry, state, why);
+                // `phycmd` is what the PHY says it decoded and `expcmd` what this row expected it to decode:
+                // the two fields that turn "FAIL" into "the master sent a packet command", which is the
+                // difference between a 2-minute fix and an evening in GTKWave.
+                $display("RESULT %0d FAIL exp=%h seen=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d phycmd=%h expcmd=%h why=%0s", n, exp, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy, acc_waited, acc_retry, state, seen_cmd, exp_cmd, why);
             end
         end
     endtask
@@ -299,6 +324,8 @@ module ulpi_link_tb;
     reg [8*256:1] hex_path;
     reg [8*256:1] vcd_path;
     integer       have_vcd;
+    reg           check_cmd;          // does this row's last access have an expected encoding?
+    reg  [7:0]    exp_cmd;            // the TX CMD byte the PHY must have decoded on that access
     reg           has_exp;
     reg  [7:0]    addr, wdata, exp;
     reg           op;
@@ -341,6 +368,11 @@ module ulpi_link_tb;
             apply_pre(pre);
             apply_fault(fault);
 
+            // Two rows have no encoding to check: a PHY held in reset decodes nothing, and the reset-mid row
+            // decodes a command whose transaction is then destroyed, so its `seen_cmd` belongs to an access
+            // that no longer exists.
+            check_cmd = (pre != P_PHY_RESET) && (fault != F_RESET_MID);
+            exp_cmd   = 8'h00;
             if (fault == F_RESET_MID) begin
                 // The only fault whose content is *when*: the clock is taken away from an access that has
                 // already started. What must come back is `busy`, and what must latch is `err_reset`; the
@@ -357,15 +389,18 @@ module ulpi_link_tb;
                 repeat (200) @(posedge sys_clk);     // let relock expire so the next row starts clean
             end else begin
                 do_access(op, addr, wdata);
+                // Remember what the PHY decoded for *this* access: the read-back below overwrites `seen_cmd`.
+                check_cmd = 1'b1; exp_cmd = op ? (`ULPI_BYTE_RD | addr) : (`ULPI_BYTE_WR | addr);
                 if (!op) begin
                     // A write vector's `exp` is the read-back, per the TSV's column definition: a write that
                     // "succeeded" without changing the register is the failure the row exists for, and only
                     // a read can tell.
                     do_access(1'b1, addr, 8'h00);
+                    check_cmd = 1'b1; exp_cmd = `ULPI_BYTE_RD | addr;
                 end
             end
 
-            check_row(i, has_exp, exp, exp_err, fault);
+            check_row(i, has_exp, exp, exp_err, fault, pre, op);
         end
 
         $display("ulpi_link_tb: %0d vectors, %0d passed, %0d failed", nvec, pass_n, fail_n);

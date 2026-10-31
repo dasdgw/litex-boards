@@ -14,6 +14,13 @@
 `define ULPI_CMD_WR     2'b10   // RegWrite:  10b | 6-bit address
 `define ULPI_CMD_RD     2'b11   // RegRead:   11b | 6-bit address
 
+// The same two commands as a whole byte, for code that must name the byte rather than the field.
+// `ULPI_CMD_WR` is 2 bits *by design* -- that is the width Table 6 defines -- and the temptation to write
+// `ULPI_CMD_WR | addr` is a real trap: `2'b10 | 8'h00` is `8'h02`, not `8'h80`. The first version of the
+// testbench's encoding cross-check did exactly that and failed every row in the file.
+`define ULPI_BYTE_WR  8'h80   // RegWrite: 10b in 7:6, immediate address in 5:0
+`define ULPI_BYTE_RD  8'hC0   // RegRead:  11b in 7:6, immediate address in 5:0
+
 // The USB3300's own ID registers (datasheet Table 6.3 / §6.1.4), low byte first.
 `define ULPI_REG_VID_LO 6'h00
 `define ULPI_REG_VID_HI 6'h01
