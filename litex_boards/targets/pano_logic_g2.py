@@ -69,6 +69,8 @@ from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 from migen.genlib.cdc import MultiReg
 from migen.fhdl.specials import Tristate
 
+from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
+
 # ULPI Probe ---------------------------------------------------------------------------------------
 
 class RefclkPLL(LiteXModule):
@@ -167,8 +169,21 @@ class ULPIProbe(LiteXModule):
     """
     def __init__(self, sys_clk_freq, ulpi_pads, refclk_pads = None, refclk_clk = None,
         refclk_lock = None, hub_rst_pad = None, gate_ms = 1,
-        clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6, with_analyzer = True):
+        clk_ok_min_hz = 45e6, clk_ok_max_hz = 75e6, with_analyzer = True, bus_owner = None):
         gate = int(sys_clk_freq*gate_ms/1e3)
+        # **Who drives the ULPI pads, and why that is a constructor argument.**
+        #
+        # Spin 1 of the probe only *listened*: it drove `data` at the ULPI idle level while the PHY was in
+        # reset and released the bus otherwise, and held `stp` low because it transmitted nothing. The Link
+        # (spec decision 8) takes the pads now, and its idle state *is* that rule -- `oe = phy_reset |
+        # master_driving`, `data` 00h when not driving -- so handing them over loses nothing. What must not
+        # happen is two blocks attaching a tristate to the same pads: that is not a warning, it is either a
+        # build error or a bus fight, and the second kind is invisible from a register read. Hence one flag
+        # that moves the driver, the `probe_oe` CSR's source, and the analyzer's `data` tap together --
+        # they are three views of one fact and cannot be allowed to disagree.
+        #
+        # `bus_owner=None` is spin 1 exactly as measured. `--with-ulpi-master` passes the Link.
+        drives_pads = bus_owner is None
 
         # --- measurement: the ULPI clock (C12 via cd_usb; may be absent) -----------------------------
         # width=8: the gray counter wraps every 256 edges and the sampler accumulates the differences, so
@@ -227,6 +242,12 @@ class ULPIProbe(LiteXModule):
         timer    = Signal(32)
         target   = Signal(32)
         asserted = Signal(reset=1)                              # logical, before polarity
+        # Exposed for the Link (`--with-ulpi-master`), and deliberately the **logical** level rather than
+        # `rst_phy_net`: the master must gate its `oe` on "the PHY is in reset" in the sense ULPI means, and
+        # that is decided here, once, in software. Handing it the pad net would re-apply the polarity hint a
+        # second time in a different place, and the whole point of the hint being a CSR is that the bench can
+        # still be wrong about it -- two places to correct is two places to disagree.
+        self.rst_level_logical = asserted
         self.sync += [
             target.eq(self.seq_wait_ms.storage*int(sys_clk_freq/1e3)),
             timer.eq(timer + 1),
@@ -268,15 +289,35 @@ class ULPIProbe(LiteXModule):
         # with no `cd_usb` logic sampling `dir` synchronously, that expression would make an output
         # enable depend on an asynchronous pad input on a bus we transmit nothing on. The standards line
         # was amended in the same change (CODING_STANDARDS.md) so reviewer and code agree.
-        self.tri = TSTriple(8)
-        self.specials += self.tri.get_tristate(ulpi_pads.data)
-        self.comb += [
-            self.tri.oe.eq(asserted),        # drive the bus idle while the PHY is in reset (ULPI asks
-            self.tri.o.eq(0),                #   for exactly this), release it the moment it is not
-            ulpi_pads.stp.eq(0),             # never a strobe here: spin 1 transmits nothing
-        ]
-        self.oe = CSRStatus(description="Current output-enable level (the above, observed).")
-        self.comb += self.oe.status.eq(asserted)
+        # The two bus taps, so the pad driver, `probe_oe` and analyzer group 1 all read the same net. A
+        # named Signal and not `self.tri.o`: LiteScope de-duplicates its groups through a dict, so an
+        # expression is unhashable and refuses to be tapped (spin 1 measured that), and it is also what
+        # you want in a VCD -- one name, one net, one meaning.
+        self.bus_oe = Signal(name = "ulpi_bus_oe")
+        self.bus_o  = Signal(8, name = "ulpi_bus_o")
+        if drives_pads:
+            self.tri = TSTriple(8)
+            self.specials += self.tri.get_tristate(ulpi_pads.data)
+            self.comb += [
+                self.tri.oe.eq(asserted),    # drive the bus idle while the PHY is in reset (ULPI asks
+                self.tri.o.eq(0),            #   for exactly this), release it the moment it is not
+                ulpi_pads.stp.eq(0),         # never a strobe here: spin 1 transmits nothing
+            ]
+            self.comb += [self.bus_oe.eq(asserted), self.bus_o.eq(self.tri.o)]
+        else:
+            # The Link owns `data`, `oe` and `stp`. This block keeps every one of its registers and every
+            # one of its analyzer slots -- but they now observe the master rather than a driver that is no
+            # longer there. `bus_oe`/`bus_o` are assigned by the target from the master's **registered**
+            # views (`oe_out`, `tx_byte`), which is the same information the pad cell sees, one clock
+            # earlier in cd_usb: the same substitution the W12 group already makes for the ODDR2's D inputs
+            # and for the same reason (ERROR:Pack:2531 -- pulling an output cell's Q side into fabric makes
+            # the packer refuse the design).
+            self.tri = None
+        self.oe = CSRStatus(description="Current output-enable level on the ULPI data pads. With "
+                             "--with-ulpi-probe alone this is the probe's own idle rule; with "
+                             "--with-ulpi-master it is the Link's, which is the same fact about the same "
+                             "pad and the only one still worth reporting under this name.")
+        self.comb += self.oe.status.eq(self.bus_oe)
 
         # dir/nxt are the PHY's; a 2-FF copy *and* the raw wire are both tapped so a metastable sample
         # in the capture is distinguishable from a real transition (they differ for one sample only).
@@ -459,6 +500,28 @@ class ULPIProbe(LiteXModule):
             # the argument: it is the countdown, not an inference from a status bit.
             self.w12_keep_left = CSRStatus(16, description="keep_timer >> 10, i.e. ~ms of window left "
                                      "(1024 sys cycles per count). 0 = expired.")
+            # **A second way to hold the pin driven, and deliberately not another value of the first one.**
+            #
+            # A keep-bit watchdog is the right instrument for a probe: it fails safe, and a spin that stops
+            # refreshing it stops driving. It is the wrong instrument for the Link, which is not probing any
+            # more -- it needs a refclock for as long as it owns the PHY, and a 20 ms window whose refresh
+            # rides on a link where one CSR round-trip costs ~20 ms is a design that drops the clock whenever
+            # the host blinks. (Measured: the PHY emits exactly 60.000 MHz on C12 **only** while we drive,
+            # and free-runs at ~29.45 MHz otherwise -- TODO (a) closed, RESEARCH.md.)
+            #
+            # So `arm` is a second input to the enable alongside `keep_ok`, not a third mode value. A mode
+            # number would have cost `w12_mode` its meaning ("how is the oscillator routed"), and the two
+            # questions are independent: a long-lived Link driving mode 1's direct copy is a different fact
+            # from "the host refreshed the window 4 ms ago". Both old modes behave exactly as before; the
+            # power-up value is 0 so a spin that never writes it is bit-for-bit spin 1; and the watchdog
+            # still runs, still expires and still reports, because `w12_keep_left`/`w12_keep_ok` must mean
+            # the same thing in an armed build as in an un-armed one.
+            self.w12_arm = CSRStorage(description="Hold the W12 output enable up independently of the keep "
+                                 "window: write 1 once at boot and the pad stays driven for the life of this "
+                                 "bitstream. The Link's refclock cannot ride a 20 ms watchdog when one CSR "
+                                 "round-trip costs ~20 ms. Independent of w12_mode (oscillator routing) and "
+                                 "of w12_keep_ms (window length); 0 at power up, so an unwritten arm never "
+                                 "silently drives a pin, and the watchdog alone decides as before.")
             self.sync += If(self.w12_keep.wr_stb,
                             keep_timer.eq(self.w12_keep_ms.storage*int(sys_clk_freq/1e3)))
             self.sync += If(keep_timer != 0, keep_timer.eq(keep_timer - 1))
@@ -485,8 +548,11 @@ class ULPIProbe(LiteXModule):
             self.sync += [
                 keep_ok.eq(keep_timer != 0),
                 # The watchdog gates the *enable*, not the mode register: `w12_mode` may say 2 or 3 and the
-                # pin still is not driven unless the keep bit is live.
-                drive_on.eq((((mode == 3) | (mode == 1)) | ((mode == 2) & pll_lock)) & keep_ok),
+                # pin still is not driven unless the keep bit is live -- or unless `w12_arm` holds it up.
+                # `keep_ok` deliberately reports the watchdog and nothing else, so this bit is the only
+                # place the two sources of permission meet, and `w12_keep_left` stays honest about expiry.
+                drive_on.eq((((mode == 3) | (mode == 1)) | ((mode == 2) & pll_lock))
+                            & (keep_ok | self.w12_arm.storage)),
             ]
 
             # The crossings into the pad's domain. migen's Xilinx builder puts `ASYNC_REG` on a MultiReg's
@@ -591,6 +657,9 @@ class ULPIProbe(LiteXModule):
             self.w12_edges  = CSRStatus(16)
             self.w12_drive  = CSRStatus()
             self.w12_keep_ok = CSRStatus()
+            # Present so a build without the refclock pads still has the name spin 2 writes, and fails as
+            # "this revision has no W12 to arm" rather than as a missing CSR in the middle of a bench run.
+            self.w12_arm = CSRStorage(description="No refclock pads on this revision: nothing to arm.")
 
         # The groups, built last (they reference everything above) and instantiated by the SoC.
         #
@@ -603,7 +672,7 @@ class ULPIProbe(LiteXModule):
                  ulpi_pads.dir, self.dir_sync, self.ctr_hi],
             # group 1: slow/secondary, deliberately not time-critical.
             1 : [self.nxt_sync, ulpi_pads.nxt, self.hub_rst_inv.storage, self.phy_rst_inv.storage,
-                 self.seq_auto.storage, self.tri.o],
+                 self.seq_auto.storage, self.bus_o],
             # group 2: W12 -- what we asked for, whether we are actually driving, and what the net says.
             # Separate from group 0 because "we enabled the driver and the level did not follow" is a
             # different question from the reset/clock coupling, and merging them costs rate to both.
@@ -836,6 +905,10 @@ class BaseSoC(SoCCore):
         with_ulpi_probe    = False,
         with_analyzer      = True,
         w12_pullup         = False,
+        with_ulpi_master   = False,
+        ulpi_stall_timeout = 1 << 16,
+        ulpi_retry_limit   = 3,
+        ulpi_io_offsets    = True,
         **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         assert sdram_chip in ["a", "b"]
@@ -843,8 +916,8 @@ class BaseSoC(SoCCore):
         # CRG --------------------------------------------------------------------------------------
         # Requested once here and handed down: `platform.request()` consumes the resource, so a second
         # request for the same group anywhere else fails with "Resource not found".
-        ulpi_pads   = platform.request("ulpi") if with_ulpi_probe else None
-        refclk_pads = platform.request("usb_refclk") if with_ulpi_probe else None
+        ulpi_pads   = platform.request("ulpi") if (with_ulpi_probe or with_ulpi_master) else None
+        refclk_pads = platform.request("usb_refclk") if (with_ulpi_probe or with_ulpi_master) else None
 
         if with_ulpi_probe:
             # Built before the probe so the probe can be handed the clock and, more importantly, its lock.
@@ -982,7 +1055,9 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 refclk_clk   = self.refclk_pll.cd_refclk.clk if with_ulpi_probe else None,
                 refclk_lock  = self.refclk_pll.lock  if with_ulpi_probe else None,
                 hub_rst_pad  = platform.request("usb_hub_rst_n"),
-                with_analyzer= with_analyzer)
+                with_analyzer= with_analyzer,
+                # With the Link present it owns the pads; see the flag's comment in ULPIProbe.
+                bus_owner    = with_ulpi_master)
             if w12_pullup and refclk_pads is not None:
                 # The pull-up half of "floating or actively held". An attribute on the NET, because that
                 # is all PULLUP is on this FPGA -- see the W12 block in ULPIProbe.
@@ -1000,11 +1075,107 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                     csr_csv      = "analyzer.csv",
                 )
 
+        # The ULPI Link (ticket 02): the `ulpi_*` CSR door, behind it a bridge into the PHY's clock domain,
+        # and behind that the master that puts one RegRead/RegWrite on the bus.
+        #
+        # Built AFTER the probe and its analyzer on purpose: it takes the pads the probe used to hold
+        # (decision 8), and its analyzer taps are the probe's registered views of those pads rather than
+        # `TSTriple` internals -- pulling an output cell's Q side back into fabric is ERROR:Pack:2531, which
+        # is the same lesson the W12 group already learned the hard way.
+        if with_ulpi_master:
+            assert with_ulpi_probe, "--with-ulpi-master needs --with-ulpi-probe: the probe owns phy_reset, " \
+                                    "clk_ok and the W12 refclock, and the Link has no business re-deriving " \
+                                    "any of them (spec decision 8, decision 14)."
+            self.ulpi = UlpiCsr(ulpi_pads,
+                sys_clk_freq   = sys_clk_freq,
+                stall_timeout  = ulpi_stall_timeout,
+                retry_limit    = ulpi_retry_limit,
+            )
+            self.comb += [
+                # The probe's *logical* reset levels, already polarity-corrected in software -- which is why
+                # this is safe to hand to combinational logic in cd_sys. Feeding it the raw pad would be the
+                # async-reset mistake decision 6 refuses, and feeding it the master's own guess would be a
+                # second opinion where we want one.
+                self.ulpi.phy_reset.eq(self.probe.rst_level_logical),
+                # Spin 1's clock meter, registered in cd_sys, is the only thing that can tell us the PHY
+                # stopped clocking us: cd_usb cannot observe the absence of its own clock (decision 14).
+                self.ulpi.clk_ok.eq(self.probe.clk_ok.status),
+                # `bus_grant` is a real interlock with one degenerate input. It is *not* dead code: when the
+                # 2023 `usb_host` core joins, or a second spin wants `stp`, the arbitration lands here, and
+                # `UlpiMaster` keeps `oe` low on a denied request (ULPI 1.1 §3.8.4.2). Tying it to 1 states
+                # the one fact that makes that legal today: this SoC has exactly one ULPI bus master, and it
+                # is us. A future second owner must fail here rather than share the pads silently.
+                self.ulpi.bus_grant.eq(1),
+                # What the probe reports as `probe_oe` / analyzer group 1's `data`, now driven by the Link.
+                # Registered views (`oe_out`, `tx_byte`), not the pad cell's Q: same information, and the
+                # packer stays happy.
+                self.probe.bus_oe.eq(self.ulpi.link.master.oe_out),
+                self.probe.bus_o.eq(self.ulpi.link.master.tx_byte),
+            ]
+            if ulpi_io_offsets:
+                # Relative to the PHY's clock, exactly as the spec's decision 9 requires -- and note the
+                # measured consequence documented in the method: on this part the pads must be IO-registered
+                # for these to close. `--no-ulpi-io-offsets` exists to isolate that question on a bench, not
+                # to make the report prettier.
+                self._add_ulpi_io_offsets(platform)
+
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
             self.leds = LedChaser(
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
+
+    def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = 0.0):
+        """The ULPI pad input/output timing, as raw UCF.
+
+        **Why raw.** LiteX in this tree has no `add_input_delay_constraint`/`add_output_delay_constraint`
+        (checked: no such name exists anywhere in `litex/`, and there is no SDC backend for ISE), so the
+        documented helper cannot be used and `add_platform_command` is the only door. Net names are taken
+        from the requested pads rather than hardcoded, because they are LiteX's naming, not ours.
+
+        **The numbers, and what they are made of** (`RESEARCH.md` §7.3, USB 2.0 ULPI 1.1 Table 5, the
+        192.6..255 MHz column that `C12` = 60 MHz selects):
+
+        * ``OFFSET IN  = TDD_max + skew = 9.0 ns`` -- the PHY's worst clock-to-output on `data`/`dir`/`nxt`.
+        * ``OFFSET OUT = period - TSD_min - skew = 10.667 ns`` -- the complement of the 6 ns the PHY must
+          hold before the next edge. It is the *wire* budget (a `trce` MAXDELAY from the clock pin), which
+          is why it is 10.667 and not the 7.667 the internal setup budget works out to: our clock network's
+          insertion delay is spent *inside* that 10.667, not added to it.
+        * ``VALID = period - TDD_max = 7.667 ns`` -- the honest window: the PHY's byte is valid at the pin
+          from TDD_max after its own edge until the next byte replaces it one period later. (The §7.4
+          "capture at 7.7 ns" figure is the *internal* setup budget; it happens to be the same number here
+          because the budget is the complement of the same TDD_max, but it is not what a VALID window means,
+          and an earlier draft of this method computed ``period - 2*TDD_max`` and emitted a **negative**
+          window -- which Xilinx accepts without complaint. A constraint the tool will take silently is a
+          constraint that needs a test, so see `tools/test_ulpi_ucf.py`.)
+
+        **And the measured fact about this file, which is why it is not silently turned off.** Measured on
+        this part (xc6slx100fgg484-**2**, the fastest grade it ships in) with a throwaway that copies this
+        constraint block exactly, and reported rather than tuned away:
+
+        | constraints                       | trce result                                  |
+        |-----------------------------------|----------------------------------------------|
+        | ``VALID 7.667`` (the honest one)  | **HOLD** fails, ~4.8 ns, on `dir`/`nxt`      |
+        | ``VALID 16.667`` (widened)        | **SETUP** fails instead                      |
+
+        That is not the constraint being wrong; it is the constraint *working*. With the pads registered in
+        fabric, the clock reaches the flop ~3.5-4.8 ns after it reaches the pin while the data path from the
+        same pin is ~1.5 ns, so the *next* byte (launched 0-9 ns after the edge) reaches the D pin before the
+        capturing edge does. Widening `VALID` does not remove the race, it moves it onto the setup axis. The
+        fix order is therefore fixed, in this order:
+
+        1. **IO-register the pads** (ILOGIC/OLOGIC, where clock and data arrive together). This is the only
+           fix that keeps the spec's numbers, and it is a gateware change in `pano_ulpi.py`.
+        2. Never "fix" it by relaxing `OFFSET`, `VALID` or the clock: a relaxed OFFSET is how a Link that
+           corrupts one byte in 10^9 ships as green.
+        """
+        # The arithmetic and the text live in pano_ulpi.py as pure functions, so they can be asserted
+        # without running ISE -- see `ulpi_io_windows` for why that mattered within the hour of writing it.
+        # It raises if the window cannot close at this clock, which is a build error and not a UCF line.
+        from litex_boards.extensions.pano_ulpi import ulpi_ucf_lines
+        for line in ulpi_ucf_lines(clk_net = clk_net, clk_hz = 60e6, skew_ns = skew_ns):
+            platform.add_platform_command(line)
+
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -1034,6 +1205,23 @@ def main():
         help="Constrain usb_refclk (W12) with PULLUP for the 'does the level follow our pull' half of "
              "TODO (a). On Spartan-6 PULLUP is an IOB attribute, so floating and pulled are TWO builds; "
              "it cannot be a CSR bit.")
+    parser.add_target_argument("--with-ulpi-master", action="store_true",
+        help="Add the ULPI Link and its `ulpi_*` CSRs (RegRead/RegWrite only, spec decision 4). Needs "
+             "--with-ulpi-probe, which keeps owning phy_reset, clk_ok and the W12 refclock; the Link takes "
+             "the data/stp pads from the probe (decision 8) and needs `probe_w12_arm=1` to keep that clock "
+             "alive without a host-side watchdog.")
+    parser.add_target_argument("--no-ulpi-io-offsets", action="store_true",
+        help="Do not emit the raw-UCF OFFSET constraints on the ULPI pads. A bench diagnostic for which "
+             "constraint a timing failure belongs to -- NOT a way to get a green report: the budget is on "
+             "the wire and the only real fix is IO-registering the pads (see _add_ulpi_io_offsets).")
+    parser.add_target_argument("--ulpi-stall-timeout", default=1 << 16, type=int,
+        help="cd_usb cycles a ULPI access waits before it declares itself stuck (2^16 = ~1.1 ms). The PHY "
+             "may hold nxt indefinitely per ULPI 1.1, so this bound is ours and is never evidence of a PHY "
+             "spec violation.")
+    parser.add_target_argument("--ulpi-retry-limit", default=3, type=int,
+        help="How many times an access retries a dir-aborted transfer before err_dir_abort (ULPI 1.1 "
+             "Table 10 mandates at least one). Always read ulpi_cnt_dir_abort as well: a pass after three "
+             "aborts is a different fact from a clean pass.")
     parser.add_target_argument("--no-analyzer", action="store_true",
         help="Drop the LiteScope analyzer from the probe (faster rebuild; the CSR matrix still works).")
     parser.add_target_argument("--cpu-reset-pin", default=None,
@@ -1065,6 +1253,10 @@ def main():
         with_ulpi_probe     = args.with_ulpi_probe,
         with_analyzer       = not args.no_analyzer,
         w12_pullup          = args.w12_pullup,
+        with_ulpi_master    = args.with_ulpi_master,
+        ulpi_stall_timeout  = args.ulpi_stall_timeout,
+        ulpi_retry_limit    = args.ulpi_retry_limit,
+        ulpi_io_offsets     = not args.no_ulpi_io_offsets,
         **parser.soc_argdict
     )
     builder = Builder(soc, **parser.builder_argdict)

@@ -109,6 +109,16 @@ rebuilt from two expressible things, both load-bearing:
 That is the recovery property decision 6 asked for, and ``reset_mid`` in ``tools/ulpi_vectors.tsv`` proves
 it offline. The literal async-clear flip-flop is what ``ulpi_wrapper.v`` does; if a spin ever needs it,
 this file is the place to change and the testbench is already here.
+
+``ulpi_status``, and why its layout is a table and not a sentence
+----------------------------------------------------------------
+
+Ticket 02 builds the CSRs and ticket 04 builds the harness that reads them, so a layout written only in
+prose is a layout that can silently disagree with itself. ``STATUS_FIELDS`` is the list of
+``(name, width)`` pairs ``UlpiLink.status()`` cats together, LSB first, and :func:`status_decode` is its
+inverse; the CSR block, the offline python twin and the bench harness all read that one table. A status
+word whose bits were documented rather than *derived* is how a bench note and a bitstream end up disagreeing
+about which bit is ``busy`` -- and only one of them is wrong, at the bench, at 1 am.
 """
 
 from migen import *
@@ -119,7 +129,7 @@ from litex.gen import LiteXModule
 from litex_boards.extensions.pano_cdc import CdcLevel, ReqAckCDC
 
 __all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
-           "UlpiMaster", "UlpiLink", "UlpiClear"]
+           "STATUS_FIELDS", "status_decode", "UlpiMaster", "UlpiLink", "UlpiClear"]
 
 # The analyzer taps `state`, so these numbers are part of what a capture *means*: renumbering one
 # invalidates every saved .gtkwave layout and every bench note that quotes a state.
@@ -128,6 +138,86 @@ __all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
 STATE = dict(IDLE=IDLE, BUSY_WAIT=BUSY_WAIT, WR_CMD=WR_CMD, WR_DATA=WR_DATA, WR_STP=WR_STP,
              RD_CMD=RD_CMD, RD_TURN=RD_TURN, RD_WAIT_DIR=RD_WAIT_DIR, RD_DATA=RD_DATA, ABORT=ABORT,
              FINISH=FINISH)
+
+# The `ulpi_status` word: (name, width), LSB first, and the *only* place its layout is written down.
+# `UlpiLink.status_signals()` returns the signals in exactly this order; `status_decode` is the inverse,
+# shared by the python twin and the bench harness so that neither re-derives an offset by hand.
+STATUS_FIELDS = [("busy", 1), ("done", 1), ("err_dir_abort", 1), ("err_nxt_timeout", 1),
+                 ("err_no_clock", 1), ("err_reset", 1), ("dir", 1), ("oe", 1), ("state", 4)]
+STATUS_WIDTH  = sum(w for _, w in STATUS_FIELDS)          # 12
+
+
+def status_decode(word):
+    """``ulpi_status`` as read -> {name: value}. Pure, and shared by every reader of the word."""
+    out, off = {}, 0
+    for name, width in STATUS_FIELDS:
+        out[name] = (word >> off) & ((1 << width) - 1)
+        off += width
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# The pad timing, as arithmetic -- because a constraint the tool accepts silently is a constraint
+# that needs a test. `tools/test_ulpi_ucf.py` in ~/llm/tests/panologic_g2 asserts these numbers.
+# ---------------------------------------------------------------------------------------------
+
+# USB 2.0 ULPI 1.1 Table 5, the 192.6..255 MHz column that a 60 MHz `C12` selects. Sourced once, in
+# RESEARCH.md §7.3; the numbers are the *wire* budget, not an internal setup budget.
+ULPI_TDD_MAX_NS = 9.0    # CLKOUT rising -> PHY drives data/stp (max)
+ULPI_TSD_MIN_NS = 6.0    # the PHY must see our data this far before the next CLKOUT rising edge
+
+
+def ulpi_io_windows(clk_hz = 60e6, skew_ns = 0.0, tdd_ns = ULPI_TDD_MAX_NS, tsd_ns = ULPI_TSD_MIN_NS):
+    """``(offset_in, valid_in, offset_out)`` in ns for the ULPI pads, relative to the PHY's clock.
+
+    * ``offset_in``  = TDD_max + skew -- our worst-case arrival, so the internal setup budget is the rest
+      of the period.
+    * ``valid_in``   = period - offset_in -- the byte is valid at the pin from TDD_max after the PHY's edge
+      until the next byte replaces it one period later. **Not** ``period - 2*TDD_max``, which is what an
+      earlier draft of this file said and what it then *emitted*: at 60 MHz that is -1.333 ns, a window
+      smaller than nothing, and Xilinx wrote it into the UCF without a word of complaint. That is the whole
+      reason this function exists separately from the code that formats it.
+    * ``offset_out`` = period - TSD_min - skew -- the wire budget on our clock-to-pad. Note it is 10.667 ns
+      and not the 7.667 ns the §7.4 table calls "capture": the internal budget and the wire budget differ by
+      the clock network's insertion delay, and asking for the wrong one is how a Link that violates TSD by
+      3 ns gets a clean timing report.
+
+    Raises rather than emitting a window that cannot exist: at a clock where the PHY's own TDD exceeds the
+    period there is no constraint to write, and the build must say so instead of synthesising a race.
+    """
+    period = 1e9/clk_hz
+    offset_in  = tdd_ns + skew_ns
+    valid_in   = period - offset_in
+    offset_out = period - tsd_ns - skew_ns
+    if valid_in <= 0:
+        raise ValueError(f"ULPI input window cannot close at {clk_hz/1e6:.1f} MHz: TDD_max "
+                         f"{offset_in:.2f} ns leaves {valid_in:.2f} ns of valid window. A 60 MHz C12 is "
+                         f"the fastest this budget supports; check --sys-clk-freq and the PHY's CLKOUT mode.")
+    if offset_out <= 0:
+        raise ValueError(f"ULPI output budget cannot close at {clk_hz/1e6:.1f} MHz: TSD_min {tsd_ns} ns "
+                         f"exceeds the {period:.2f} ns period.")
+    return offset_in, valid_in, offset_out
+
+
+def ulpi_ucf_lines(clk_net = "usb_clk", clk_hz = 60e6, skew_ns = 0.0, data_net = "ulpi_data",
+                    in_nets = ("ulpi_dir", "ulpi_nxt"), out_nets = ("ulpi_stp",), bits = 8):
+    """The UCF text for the ULPI pads, as data.
+
+    A function rather than f-strings inside the target, so the emitted text is assertable without running
+    ISE (which is the only way this block gets checked on every commit). One line per net and per bit, no
+    wildcards: `trce` reports failures per bit, and `NET "ulpi_data[*]"` would hide *which* bit failed --
+    the difference between "a byte lane is bad" and "the whole bus is bad".
+    """
+    offset_in, valid_in, offset_out = ulpi_io_windows(clk_hz = clk_hz, skew_ns = skew_ns)
+    lines = []
+    # `data` is bidirectional and ULPI puts a budget on each half, so it appears in both lists.
+    for net in list(in_nets) + [f"{data_net}[{i}]" for i in range(bits)]:
+        lines.append(f'NET "{net}" OFFSET = IN {offset_in:.3f} ns VALID {valid_in:.3f} ns '
+                     f'BEFORE "{clk_net}";')
+    for net in list(out_nets) + [f"{data_net}[{i}]" for i in range(bits)]:
+        lines.append(f'NET "{net}" OFFSET = OUT {offset_out:.3f} ns BEFORE "{clk_net}";')
+    return lines
+
 
 CMD_REG_WRITE = 0x80      # TX CMD bits 7:6 = 10b, immediate 6-bit address in 5:0
 CMD_REG_READ  = 0xC0      # TX CMD bits 7:6 = 11b
@@ -639,7 +729,17 @@ class UlpiLink(LiteXModule):
             MultiReg(self.master.state,  self.state,   odomain = "sys"),
         ]
 
+    def status_signals(self):
+        """The ``ulpi_status`` word, LSB first -- **the** definition of the layout.
+
+        ``STATUS_FIELDS`` is this list's names and widths, in this order, and ``status_decode`` is its
+        inverse. Change one without the other and the gateware and every reader of a captured word
+        disagree about which bit is ``busy`` -- silently, at the bench, which is the one place a
+        bit-field disagreement is expensive instead of merely wrong.
+        """
+        return [self.h_busy, self.done, self.err_dir_abort, self.err_nxt_timeout,
+                self.err_no_clock, self.err_reset, self.dir_now, self.oe_now, self.state]
+
     def status(self):
         """The ``ulpi_status`` word, in the bit order documented on the class."""
-        return Cat(self.h_busy, self.done, self.err_dir_abort, self.err_nxt_timeout,
-                   self.err_no_clock, self.err_reset, self.dir_now, self.oe_now, self.state)
+        return Cat(*self.status_signals())
