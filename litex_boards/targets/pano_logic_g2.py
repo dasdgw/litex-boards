@@ -73,6 +73,20 @@ from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
 
 # ULPI Probe ---------------------------------------------------------------------------------------
 
+
+# Board skew, in ns, added to BOTH directions of the ULPI constraint. Sourced, not invented: Microchip
+# AN19.17 (ULPI Design Guide) §3 asks for 50-60 ohm controlled-impedance traces, each under 3 inches, "routed
+# to within 0.5 inches of CLKOUT", which at ~150-180 ps/in on FR-4 is ~0.1 ns between CLKOUT and a data line.
+# We do NOT know that the Pano's layout meets that -- there are no layout files and it is a 2009 thin client,
+# not a reference design -- so this allowance is the reference rule plus a factor rather than the rule itself.
+# The honest correction is to measure it: drive a square wave on one data line, probe CLKOUT and that line,
+# pass the number to --ulpi-skew-ns. 0.0 would claim matched traces; 0.3 claims nothing we have not seen.
+#
+# It lives at module scope, not as a class attribute, because `get_argparser()` runs before the SoC class is
+# defined at import time -- a `SocPanoLogicG2.ULPI_SKEW_NS_DEFAULT` default is a NameError at --help.
+ULPI_SKEW_NS_DEFAULT = 0.3
+
+
 class RefclkPLL(LiteXModule):
     """24.000 MHz for the USB PHY's reference clock, derived from `cd_sys` in a PLL of its own.
 
@@ -661,6 +675,41 @@ class ULPIProbe(LiteXModule):
             # "this revision has no W12 to arm" rather than as a missing CSR in the middle of a bench run.
             self.w12_arm = CSRStorage(description="No refclock pads on this revision: nothing to arm.")
 
+        # ---- USB3300 §6.1.11: releasing reset is a conditional act, and we detect rather than gate -------
+        # The datasheet (DS00001783 §6.1.11): "reset must only be de-asserted when the USB3300 clkout signal is
+        # active", and "no other PHY digital input signals may change state for two clkout clock cycles after the
+        # de-assertion of the reset signal".
+        #
+        # The second half we satisfy by scale, not by construction: `UlpiClear`'s relock tail holds the master
+        # cleared for `relock_ms` (10 ms ≈ 600 000 cd_usb cycles) after the clock returns, so the Link cannot
+        # touch STP or DATA inside two cycles of a release. Worth naming, because it turns a guessed constant
+        # into one with a citation.
+        #
+        # The first half is NOT enforced here, deliberately. AN19.17 §4.2 says asserting RESETB *stops* the
+        # 60 MHz output clock, so "hold reset until clk_ok" is a deadlock the moment it is written literally:
+        # CLKOUT only comes back after the release. §6.1.11 meanwhile requires CLKOUT active *at* the release.
+        # The two documents disagree on whether the PLL or only the pad buffer stops during hardware reset --
+        # that is a bench question (row D14 of ticket 05), and the wrong HDL choice here would brick the very
+        # session that answers it. So: count it, report it, gate nothing.
+        #
+        # A counter rather than a sticky bit: `phy_rst` comes out of configuration asserted (`reset=1`), so a
+        # sticky bit would be set by the first boot sequence and then report nothing forever. Read it, release,
+        # read it again -- an increment means YOUR release happened blind.
+        prev_asserted = Signal(reset = 1, name = "prev_phy_rst")
+        self.rst_blind = CSRStatus(8, description="PHY-reset RELEASES that happened while `clk_ok` was 0 "
+                             "(USB3300 DS 6.1.11 wants CLKOUT active at release). Saturating, never cleared, and "
+                             "NOTHING is gated on it -- see the deadlock note above. Read before and after a "
+                             "release: an increment means that release was blind.")
+        self.sync += prev_asserted.eq(asserted)
+        self.sync += If(prev_asserted & ~asserted & ~self.clk_ok.status, [
+            If(self.rst_blind.status != 0xFF, self.rst_blind.status.eq(self.rst_blind.status + 1)),
+        ])
+        # Created HERE on purpose: LiteX assigns CSR addresses in creation order, and this counter is new
+        # since the spin-1 map was frozen, so anywhere else shifts every later `probe_*` address and
+        # `tools/test_ulpi_csr_map.py`'s golden file (rightly) refuses the build. Same reason
+        # `probe_w12_arm` sits last. Appending costs nothing except that the name is not adjacent to the
+        # reset CSRs it belongs to -- which is what the comment is for.
+
         # The groups, built last (they reference everything above) and instantiated by the SoC.
         #
         # ONE analyzer because groups are **multiplexed**: a second instance would halve the sampling rate
@@ -906,6 +955,7 @@ class BaseSoC(SoCCore):
         with_analyzer      = True,
         w12_pullup         = False,
         with_ulpi_master   = False,
+        ulpi_skew_ns       = ULPI_SKEW_NS_DEFAULT,
         ulpi_stall_timeout = 1 << 16,
         ulpi_retry_limit   = 3,
         ulpi_io_offsets    = True,
@@ -1113,11 +1163,11 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 self.probe.bus_o.eq(self.ulpi.link.master.tx_byte),
             ]
             if ulpi_io_offsets:
-                # Relative to the PHY's clock, exactly as the spec's decision 9 requires -- and note the
-                # measured consequence documented in the method: on this part the pads must be IO-registered
-                # for these to close. `--no-ulpi-io-offsets` exists to isolate that question on a bench, not
-                # to make the report prettier.
-                self._add_ulpi_io_offsets(platform)
+                # Relative to the PHY's clock, exactly as the spec's decision 9 requires. They do not all close
+                # at the slow corner (~1 ns on `data`, ~3.3 ns on `stp`, spin `ulpi_t16`), and that deficit is an
+                # accepted deviation with a trigger attached: ADR-0005 + ticket 06. `--no-ulpi-io-offsets` exists
+                # to isolate which constraint a failure belongs to on a bench, never to make a report prettier.
+                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -1125,7 +1175,7 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
-    def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = 0.0):
+    def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = ULPI_SKEW_NS_DEFAULT):
         """The ULPI pad input/output timing, as raw UCF.
 
         **Why raw.** LiteX in this tree has no `add_input_delay_constraint`/`add_output_delay_constraint`
@@ -1133,14 +1183,24 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
         documented helper cannot be used and `add_platform_command` is the only door. Net names are taken
         from the requested pads rather than hardcoded, because they are LiteX's naming, not ours.
 
-        **The numbers, and what they are made of** (`RESEARCH.md` §7.3, USB 2.0 ULPI 1.1 Table 5, the
-        192.6..255 MHz column that `C12` = 60 MHz selects):
+        **The numbers, and what they are made of.** Read off **ULPI v1.1 §3.7.2 Table 5, the "Output clock"
+        group** (`datasheets/ULPI_v1_1.pdf`, verified 2026-10-31; Microchip AN19.17 §5.1 restates the same
+        table and adds "it is expected that any SoC that integrates a link meets the setup and hold times
+        defined here"). Two things that citation settles, and that an earlier version of this docstring got
+        wrong: the *other* group in that table, "Input clock (optional)", is where the Link supplies the clock
+        and `TSD` is only 3.0 ns -- not this board, where the PHY outputs CLKOUT; and every parameter is
+        measured "with respect to the clock as seen at the PHY clock pin", which is exactly why skew is a term
+        of the constraint and not a rounding error.
 
-        * ``OFFSET IN  = TDD_max + skew = 9.0 ns`` -- the PHY's worst clock-to-output on `data`/`dir`/`nxt`.
-        * ``OFFSET OUT = period - TSD_min - skew = 10.667 ns`` -- the complement of the 6 ns the PHY must
-          hold before the next edge. It is the *wire* budget (a `trce` MAXDELAY from the clock pin), which
-          is why it is 10.667 and not the 7.667 the internal setup budget works out to: our clock network's
-          insertion delay is spent *inside* that 10.667, not added to it.
+        * ``OFFSET IN  = TDD_max + skew`` -- `TDC/TDD` is the PHY's worst clock-to-output on `data`/`dir`/`nxt`
+          (9.0 ns max), plus the board skew above.
+        * ``OFFSET OUT = TSD_min + skew`` -- **a margin, not a budget.** Xilinx checks an output offset as "the
+          pad must stay quiet for d before the NEXT clock edge", so the budget it enforces is `period - d`
+          (= 10.667 ns at 60 MHz) and `d` is ULPI's `TSD_min` (6.0 ns). Writing `period - TSD` into this field
+          is the bug this file had, and `trce`'s own `Requirement:` line is what caught it: it asked for
+          clock-to-pad <= 6 ns and invented 4.67 ns of violation on every output. See `ulpi_io_windows` and
+          `docs/NOTES.md`; `tools/test_ulpi_ucf.py` now refuses the complement on the ground that *a margin
+          cannot depend on the clock while a budget must*.
         * ``VALID = period - TDD_max = 7.667 ns`` -- the honest window: the PHY's byte is valid at the pin
           from TDD_max after its own edge until the next byte replaces it one period later. (The §7.4
           "capture at 7.7 ns" figure is the *internal* setup budget; it happens to be the same number here
@@ -1212,8 +1272,14 @@ def main():
              "alive without a host-side watchdog.")
     parser.add_target_argument("--no-ulpi-io-offsets", action="store_true",
         help="Do not emit the raw-UCF OFFSET constraints on the ULPI pads. A bench diagnostic for which "
-             "constraint a timing failure belongs to -- NOT a way to get a green report: the budget is on "
-             "the wire and the only real fix is IO-registering the pads (see _add_ulpi_io_offsets).")
+             "constraint a timing failure belongs to -- NOT a way to get a green report. (This help used to "
+             "say the failure's \"only real fix is IO-registering the pads\"; measured 2026-10-31 that is "
+             "worth ~0.3 ns, see bench/2026-10-31_ulpi_iob/ and ADR-0005.)")
+    parser.add_target_argument("--ulpi-skew-ns", default=ULPI_SKEW_NS_DEFAULT, type=float,
+        help="Board skew allowance, ns, added to OFFSET IN and to the OFFSET OUT margin. Default 0.3 comes "
+             "from Microchip AN19.17 s3 (50-60 ohm, <3 in, within 0.5 in of CLKOUT => ~0.1 ns) plus a factor, "
+             "because the Pano's layout is unknown to us; 0.0 would claim matched traces. Measure it with a "
+             "scope on CLKOUT and one data line, then pass the number.")
     parser.add_target_argument("--ulpi-stall-timeout", default=1 << 16, type=int,
         help="cd_usb cycles a ULPI access waits before it declares itself stuck (2^16 = ~1.1 ms). The PHY "
              "may hold nxt indefinitely per ULPI 1.1, so this bound is ours and is never evidence of a PHY "
@@ -1254,6 +1320,7 @@ def main():
         with_analyzer       = not args.no_analyzer,
         w12_pullup          = args.w12_pullup,
         with_ulpi_master    = args.with_ulpi_master,
+        ulpi_skew_ns        = args.ulpi_skew_ns,
         ulpi_stall_timeout  = args.ulpi_stall_timeout,
         ulpi_retry_limit    = args.ulpi_retry_limit,
         ulpi_io_offsets     = not args.no_ulpi_io_offsets,
