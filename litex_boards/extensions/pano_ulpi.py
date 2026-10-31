@@ -306,12 +306,28 @@ class UlpiMaster(Module):
     :class:`~litex_boards.extensions.pano_cdc.ReqAckCDC` presents on its far side; ``req_taken`` makes sure
     a request still held high after its own ack cannot start a second transaction.
 
-    Cycle convention, stated once because every state depends on it: ``dir_in``/``nxt_in`` are registered,
-    so in any cycle the FSM sees what the PHY drove in the **previous** cycle. That is the same pipeline
-    both prior references have (``UlpiCtrl.scala`` samples ``io.ulpi.nxt`` inside a clocked block) and it is
-    legal because ULPI's ``nxt`` is a throttle the PHY holds until the Link's next byte appears. The one
-    place the *raw* pad is used is the ``oe`` turnaround term, which has to win immediately no matter where
-    the FSM's own pipeline has got to.
+    Cycle convention, stated once because every state depends on it -- and **split in two, because the
+    bench proved one half of it false.** ``dir_in``/``nxt_in`` are registered, so in any cycle the FSM sees
+    what the PHY drove in the **previous** cycle. For the **read** that registration is not a convenience,
+    it is the alignment: §3.8.3.1 has the PHY assert ``dir`` and return the byte in the cycle after, so a
+    one-cycle-late ``dir`` is exactly the cycle the byte is valid (measured that way on ``ulpi_t17``:
+    ``dir`` 8333 ns, byte 8349 ns, ``bench/2026-10-31_capture_fresh_00.vcd``).
+
+    For the **write** the same registration was a bug. §3.8.3.1: "the Link sends a register write command
+    and waits for nxt to assert. **In the cycle after nxt asserts, the Link sends the register write
+    data**". Reacting to a *registered* ``nxt`` puts the byte two cycles after the assertion, and the
+    USB3300 does not wait: it samples the bus in the cycle after its own ``nxt`` and takes whatever is
+    there. Measured on this board -- a write of ``0x3c`` to Scratch stored ``0x96``, which is the TX CMD
+    ``0x80|0x16`` still on the bus when it sampled, and the access reported **no error**
+    (``bench/2026-10-31_capture_write16_0x3C.vcd``, and the byte read back for twelve different written
+    values in ``bench/2026-10-31_ulpi_scratch_walk.tsv``). The claim that justified the old wiring -- "the
+    PHY holds ``nxt`` until the Link's next byte appears" -- is what the capture falsifies: on a write
+    ``nxt`` is high for two consecutive cycles and then it samples.
+
+    So the write states read ``pads.nxt`` **raw**, and they are the only states that do. That is the same
+    pad-to-flop class the ``oe`` turnaround term already lives in, so ``OFFSET = IN`` covers it (slice 02's
+    constraint row, worst input slack +3.380 ns on ``ulpi_t17``). ``nxt_in`` stays registered and stays the
+    analyzer's tap: the capture must show what the PHY drove, not what our pipeline made of it.
     """
 
     def __init__(self, pads, stall_timeout = 1 << 16, retry_limit = 3, domain = "usb",
@@ -482,13 +498,19 @@ class UlpiMaster(Module):
                             state.eq(Mux(rw_r, RD_CMD, WR_CMD)),
                         ]),
                     ],
+                    # RAW `pads.nxt`, deliberately, and one cycle earlier than the registered copy would
+                    # allow: §3.8.3.1 puts the data byte "in the cycle after nxt asserts", and a Link that
+                    # reacts to `nxt_in` puts it in the cycle after that -- which is how `0x80|addr` got
+                    # stored in place of the payload on silicon. The `dir` abort check stays on the
+                    # registered copy: an abort is retried, so its exact cycle is not load-bearing, and
+                    # routing it raw would put a second combinational load on the same pad for no gain.
                     WR_CMD: [                                  # TX CMD 0x80|addr, `stp` low
-                        If(self.dir_in, on_dir_abort()).Elif(self.nxt_in, [
+                        If(self.dir_in, on_dir_abort()).Elif(pads.nxt, [
                             state.eq(WR_DATA), tx_byte.eq(wdata_r),
                         ]),
                     ],
                     WR_DATA: [                                 # the byte, then `stp` next cycle
-                        If(self.dir_in, on_dir_abort()).Elif(self.nxt_in, [
+                        If(self.dir_in, on_dir_abort()).Elif(pads.nxt, [
                             state.eq(WR_STP), stp_drive.eq(1), tx_byte.eq(0),
                         ]),
                     ],
@@ -535,7 +557,18 @@ class UlpiMaster(Module):
         sync += If((state != IDLE) & ~self.clear, [
             If(tmo < stall_timeout, tmo.eq(tmo + 1)).Else(tmo_hit.eq(1)),
         ]).Else(tmo.eq(0), tmo_hit.eq(0))
-        sync += If(tmo_hit & (state != IDLE) & ~self.clear, [
+        # `state != FINISH` is the fix, and it is load-bearing: without it this **later** `sync +=` outranks
+        # the `Case` above it, whose only exit from FINISH is `state.eq(IDLE)`. A timed-out access set
+        # `tmo_hit`, `tmo_hit` is cleared only in the `.Else` branch above (i.e. only once `state == IDLE`),
+        # and so the timeout re-forced FINISH every cycle and the master could never leave it. `ack` is
+        # combinational on FINISH, so the bridge acked every subsequent request with the frozen result
+        # bundle and no pad activity at all: one bad access cost the link until a PHY reset. Found on
+        # silicon, not in the suite -- `apply_pre()` writes `phy_reset` before *every* vector, so no vector
+        # ever followed a timeout without the very thing that clears it (`phy_reset`) in between. Rows
+        # `alive_after_stall` / `alive_after_silence` in `tools/ulpi_vectors.tsv` are that boundary; the
+        # bench evidence is `bench/2026-10-31_ulpi_wedge_probe.tsv` (state stuck at 10 across 200 ms and
+        # across `ulpi_abort`, 2/2, and a PHY reset the only thing that returned `0x24`).
+        sync += If(tmo_hit & (state != IDLE) & (state != FINISH) & ~self.clear, [
             timed_out.eq(1), state.eq(FINISH), driving.eq(0), stp_drive.eq(0), tx_byte.eq(0),
         ])
 

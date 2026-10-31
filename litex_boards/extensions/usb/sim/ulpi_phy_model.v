@@ -67,23 +67,27 @@ module ulpi_phy_model #(
     reg [7:0] regs [0:63];
     integer i;
 
-    localparam S_IDLE    = 3'd0,
-               S_NXT     = 3'd1,   // holding nxt up for the command
-               S_WDATA   = 3'd2,   // waiting for the write data byte
-               S_WSTP    = 3'd3,   // waiting for the END marker
-               S_RD_DIR  = 3'd4,   // announcing: dir up this cycle
-               S_RD_DATA = 3'd5,   // driving the byte, one cycle
-               S_RD_END  = 3'd6,   // releasing it: the cycle that bites a Link with a registered `dir`
-               S_ABORT   = 3'd7;   // dir held; released on stp, or on the model's own bound
+    // One more state than spin 1 had, and the extra 4th bit with it: §3.8.3.1's write is a THREE-cycle
+    // story (nxt for the command, the byte in the cycle after it, then the END marker), and the three-state
+    // version could only express "hold nxt" and "wait for stp" -- which is how this model ended up holding
+    // nxt until a late byte arrived instead of sampling the cycle the spec owns to the byte.
+    localparam S_IDLE    = 4'd0,
+               S_NXT     = 4'd1,   // the cycle before `nxt` rises (this model is registered: the assertion
+                                    // cycle is the one AFTER the state that assigns phy_nxt)
+               S_WDATA   = 4'd2,   // C1: `nxt` asserted for the command
+               S_WACK    = 4'd3,   // C2: the data byte is due; sample the bus, drop `nxt`
+               S_WSTP    = 4'd4,   // waiting for the END marker
+               S_RD_DIR  = 4'd5,   // announcing: dir up this cycle
+               S_RD_DATA = 4'd6,   // driving the byte, one cycle
+               S_RD_END  = 4'd7,   // releasing it: the cycle that bites a Link with a registered `dir`
+               S_ABORT   = 4'd8;   // dir held; released on stp, or on the model's own bound
 
-    reg [2:0]  state;
+    reg [3:0]  state;
     reg [7:0]  byte_r;
     reg [5:0]  addr;
     reg        is_write;
     reg [7:0]  nxt_hold;      // cycles nxt has been up: the throttle bookkeeping
     reg [7:0]  abort_hold;
-    reg        prev_link_oe;
-    reg [7:0]  prev_link_data;
 
     task automatic set_id_regs;
         begin
@@ -122,7 +126,7 @@ module ulpi_phy_model #(
         state = S_IDLE; addr = 6'h00; is_write = 1'b0;
         seen_cmd = 8'h00; seen_wdata = 8'h00; saw_stp = 1'b0; abort_count = 4'd0;
         cmd_is_write = 1'b0; nxt_cycles_too_long = 1'b0;
-        nxt_hold = 0; abort_hold = 0; prev_link_oe = 0; prev_link_data = 8'h00;
+        nxt_hold = 0; abort_hold = 0;
         set_id_regs;
     end
 
@@ -135,8 +139,6 @@ module ulpi_phy_model #(
             nxt_hold <= 0; abort_hold <= 0;
             set_id_regs;
         end else begin
-            prev_link_oe   <= link_oe;
-            prev_link_data <= link_data;
 
             case (state)
                 S_IDLE: begin
@@ -178,27 +180,30 @@ module ulpi_phy_model #(
                     end
                 end
 
-                // ---- the throttle, and why the model holds nxt -------------------------------------
-                // §3.8.2.2: "The PHY throttles the data using nxt such that the Link provides the next byte
-                // in the cycle after nxt is detected as high." Detected. A Link that registers nxt before
-                // acting -- which is what our master does, and what UlpiCtrl.scala does -- presents that
-                // byte one cycle after the cycle in which nxt was high, and the PHY must still be holding
-                // nxt when it arrives. Dropping nxt after one cycle would model a PHY that only works with
-                // a combinational Link, and would fail a correct master.
+                // ---- the write byte is SAMPLED, not waited for ----------------------------------------
+                // This is the state that was wrong, and the bench is what proved it. The previous version
+                // held `nxt` up until the Link's byte *appeared*, quoting §3.8.2.2's "the cycle after nxt is
+                // **detected** as high" to bless a master that registers `nxt` before acting. §3.8.3.1 is a
+                // waveform, not a detection: "the Link sends a register write command and waits for nxt to
+                // assert. **In the cycle after nxt asserts, the Link sends the register write data**" -- so
+                // the PHY takes the bus value one cycle after the assertion cycle, whatever happens to be on
+                // it. "Detected" describes the Link's view; it does not entitle the Link to be late.
+                //
+                // Measured against that on 2026-10-31 with `ulpi_t17`: `nxt` high for two consecutive
+                // cycles, the byte the PHY took = the **command** byte of a Link that answers a cycle late,
+                // and Scratch read back `0x96` = `0x80|0x16` for a write of `0x3c`
+                // (`bench/2026-10-31_capture_write16_0x3C.vcd`). A model that waits cannot see that, and
+                // 31/31 vectors passed a Link that has never once written a PHY.
+                //
+                // So: hold `nxt` for the command's assertion cycle (C1), keep it up for C2 -- the second
+                // assertion, which is what the USB3300's two consecutive high cycles are -- and latch the
+                // bus at the end of C2. No waiting for the byte, no permissive tail.
                 S_NXT: begin
                     phy_nxt    <= 1'b1;
                     nxt_hold   <= nxt_hold + 8'd1;
                     if (nxt_hold > 8'd100) nxt_cycles_too_long <= 1'b1;   // model bug detector
                     if (is_write) begin
-                        // A write: nxt is the throttle, and it stays up until the Link's data byte appears.
-                        // One cycle would only be enough for a Link that reacts to nxt combinationally; ours
-                        // registers it, like `UlpiCtrl.scala` does, and the spec's word is "detected".
-                        if (link_oe && (link_data != prev_link_data)) begin
-                            phy_nxt    <= 1'b0;
-                            seen_wdata <= link_data;
-                            nxt_hold   <= 0;
-                            state      <= S_WSTP;
-                        end
+                        state <= S_WDATA;             // C2: nxt stays up, the byte is due on the bus
                     end else if (nxt_hold >= 8'd1) begin
                         // A read: there is no second byte from the Link to wait for -- it releases the bus.
                         // §3.8.3.1 then has the PHY assert dir in the cycle after nxt and drive the byte in
@@ -209,6 +214,25 @@ module ulpi_phy_model #(
                         nxt_hold <= 0;
                         state    <= S_RD_DIR;
                     end
+                end
+
+                S_WDATA: begin
+                    // C1, the command's `nxt` cycle. Keep nxt up for C2: the USB3300's two consecutive high
+                    // cycles on a write are this assertion plus the second one §3.8.3.1 asks for
+                    // ("waits for nxt to assert again"), not a throttle held open for a late Link.
+                    phy_nxt <= 1'b1;
+                    state   <= S_WACK;
+                end
+
+                S_WACK: begin
+                    // C2, the cycle §3.8.3.1 owns to the data byte: latch **whatever is on the bus** and
+                    // drop nxt for C3. A Link that answers a cycle late latches its own TX CMD here, which
+                    // is precisely what the silicon did (`0x96` stored for a write of `0x3c`); a model that
+                    // stores the intended value instead is a model that hides the bug.
+                    seen_wdata <= link_data;
+                    phy_nxt    <= 1'b0;
+                    nxt_hold   <= 8'd0;
+                    state      <= S_WSTP;
                 end
 
                 S_WSTP: begin
