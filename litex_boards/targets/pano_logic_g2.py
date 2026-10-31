@@ -70,6 +70,7 @@ from migen.genlib.cdc import MultiReg
 from migen.fhdl.specials import Tristate
 
 from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
+from litex_boards.extensions.pano_ulpi_scope import UlpiUsbScope
 
 # ULPI Probe ---------------------------------------------------------------------------------------
 
@@ -704,16 +705,27 @@ class ULPIProbe(LiteXModule):
         self.sync += If(prev_asserted & ~asserted & ~self.clk_ok.status, [
             If(self.rst_blind.status != 0xFF, self.rst_blind.status.eq(self.rst_blind.status + 1)),
         ])
-        # Created HERE on purpose: LiteX assigns CSR addresses in creation order, and this counter is new
-        # since the spin-1 map was frozen, so anywhere else shifts every later `probe_*` address and
-        # `tools/test_ulpi_csr_map.py`'s golden file (rightly) refuses the build. Same reason
-        # `probe_w12_arm` sits last. Appending costs nothing except that the name is not adjacent to the
-        # reset CSRs it belongs to -- which is what the comment is for.
+        # Created HERE on purpose: inside one CSR region LiteX assigns addresses in *creation* order, so a
+        # register inserted where it "logically belongs" shifts every later one -- and this counter is new
+        # since the spin-1 map was frozen, so `tools/test_ulpi_csr_map.py`'s golden file (rightly) refuses the
+        # build. Same reason `probe_w12_arm` sits last. (The other level, measured later the same day: the
+        # regions themselves are laid out alphabetically, which is why the 60 MHz capture's module is named
+        # `usb_scope` and not `analyzer_usb` -- see ADR-0007 and extensions/pano_ulpi_scope.py.) Appending
+        # costs nothing except that a name is not adjacent to the signals it belongs to -- which is what the
+        # comment is for.
 
         # The groups, built last (they reference everything above) and instantiated by the SoC.
         #
-        # ONE analyzer because groups are **multiplexed**: a second instance would halve the sampling rate
-        # of both, and group 0 is the one that has to hold the whole cause-and-effect story.
+        # ONE instance here because its groups are **multiplexed**: only one group is captured at a time, so
+        # group 0 is where cause and effect have to live together on a single time axis.
+        #
+        # ⚠ This comment used to give the reason as "a second instance would halve the sampling rate of both",
+        # and that is not what a second instance does: measured 2026-10-31 with `usb_scope` built alongside it
+        # (bench/2026-10-31_ulpi_t17), `analyzer.csv` still reports samplerate 50e6 / RLE on / 25 bits, and the
+        # `TIMESPEC`s are unchanged. An extra analyzer costs BRAM (360 Kb -> RAMB16 31 -> 53 of 268) and, if it
+        # taps pads, input *hold* margin (ULPI `dir` +0.706 -> +0.146 ns) -- not rate. Rate is what a second
+        # *group* would not cost either; what a second group costs is the one-pipeline sharing that this line
+        # is actually about.
         self.analyzer_groups = {
             # group 0: sequence state, both resets, oe, clk_ok, raw + synchronised `dir`, and the high bits
             # of the clock counter -- cause and effect on a single time axis.
@@ -741,8 +753,15 @@ class ULPIProbe(LiteXModule):
         }
 
     # Spin 2 (the ULPI ID read) must land without renaming anything measured here or moving a group.
-    # It needs: ulpi_cmd/ulpi_addr/ulpi_wdata/ulpi_rdata + ulpi_go, a CDC bridge into cd_usb, and the
-    # 60 MHz bus capture. Those slots are group 2 and the names below; they are documented, not built.
+    # It needed: ulpi_cmd/ulpi_addr/ulpi_wdata/ulpi_rdata + ulpi_go, a CDC bridge into cd_usb, and the
+    # 60 MHz bus capture. The CSRs were built under these names; the 60 MHz capture is a SEPARATE analyzer
+    # (`usb_scope`, extensions/pano_ulpi_scope.py), not group 3 of this one -- group 3 stays tied to 0 here
+    # precisely so this analyzer's groups 0/1/2 keep the positions every spin-1 capture was read at. Of the
+    # names below, three are exact in `usb_scope.csv`; `ulpi_clk_ok` carries its module's prefix because
+    # litex.gen prefixes module-owned signals, and `ulpi_data` becomes `ulpi_scope_data` because a
+    # bidirect pad net may not drive fabric at all (ERROR:NgdBuild:924) so the tap is the Link's IOBUF
+    # output. Both reasons are in extensions/pano_ulpi_scope.py; pinned row-by-row by
+    # tools/test_ulpi_csr_map.py.
     RESERVED_CSR_NAMES  = ["ulpi_cmd", "ulpi_addr", "ulpi_wdata", "ulpi_rdata", "ulpi_go"]
     RESERVED_GRP_NAMES  = ["ulpi_data", "ulpi_dir", "ulpi_nxt", "ulpi_stp", "ulpi_clk_ok"]
 
@@ -955,6 +974,7 @@ class BaseSoC(SoCCore):
         with_analyzer      = True,
         w12_pullup         = False,
         with_ulpi_master   = False,
+        with_ulpi_scope    = True,
         ulpi_skew_ns       = ULPI_SKEW_NS_DEFAULT,
         ulpi_stall_timeout = 1 << 16,
         ulpi_retry_limit   = 3,
@@ -1162,6 +1182,39 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 self.probe.bus_oe.eq(self.ulpi.link.master.oe_out),
                 self.probe.bus_o.eq(self.ulpi.link.master.tx_byte),
             ]
+            # The 60 MHz capture of the bus (ticket 03) ----------------------------------------------
+            # A 50 MHz sample of a 60 MHz bus answers state questions and not byte questions: a ULPI byte is
+            # ONE CLKOUT cycle, so `analyzer` can show that a transaction happened and cannot show which bit
+            # of which byte is wrong. This is the instrument for that, in `cd_usb_scope` -- the PHY's clock
+            # with a boot-counter reset, because LiteScope's storage/RLE FSMs need a reset and `cd_usb` is
+            # reset-less by necessity. All of the reasoning, including the `reg scope_rst = 1'd0;` with no
+            # driver that this replaces, is in extensions/pano_ulpi_scope.py.
+            if with_analyzer and with_ulpi_scope:
+                from litescope import LiteScopeAnalyzer
+                self.ulpi_scope = UlpiUsbScope(ulpi_pads, link = self.ulpi.link)
+                # Top-level, and `csr_csv` matching the instance name: `litescope_cli` derives the analyzer's
+                # CSR prefix from the BASENAME OF --csv (`litescope_cli.py`, and `driver/analyzer.py` matches
+                # `name + "_"` against the remote's register names), so prefix and CSV name are ONE decision.
+                # The name is `usb_scope` and not the spec's `analyzer_usb`: LiteX lays CSR regions out
+                # alphabetically, so `analyzer_usb` sorted in between `analyzer` and `ctrl` and moved all 71
+                # addresses the golden map pins -- the guard refused the build, and this name appends. See
+                # the last section of extensions/pano_ulpi_scope.py.
+                self.usb_scope = LiteScopeAnalyzer(self.ulpi_scope.groups,
+                    depth        = 2**14,          # 273 us at 60 MHz: longer than any ULPI access, shorter
+                                                   #   than the ~20 ms it takes the host to notice anything.
+                    samplerate   = 60e6,           # sets the VCD time base; wrong here = a lying axis later
+                    clock_domain = "usb_scope",
+                    register     = True,           # one register stage on the taps, in cd_usb_scope: the
+                                                   #   pad->flop cone is then all the OFFSET = IN budget has
+                                                   #   to cover, instead of mux + trigger + FIFO-write.
+                    with_rle     = False,          # decision 22: one new suspect per spin.
+                    csr_csv      = "usb_scope.csv",
+                )
+                # The line the whole domain exists for: LiteScope drives `cd_scope.clk` from our domain but
+                # NEVER drives `cd_scope.rst`, so without this the storage FSM's reset mux reads an undriven
+                # net (`ulpi_t16`'s netlist has exactly that: declared, read once, zero drivers).
+                self.comb += self.usb_scope.cd_scope.rst.eq(self.ulpi_scope.scope_rst)
+
             if ulpi_io_offsets:
                 # Relative to the PHY's clock, exactly as the spec's decision 9 requires. They do not all close
                 # at the slow corner (~1 ns on `data`, ~3.3 ns on `stp`, spin `ulpi_t16`), and that deficit is an
@@ -1290,6 +1343,13 @@ def main():
              "aborts is a different fact from a clean pass.")
     parser.add_target_argument("--no-analyzer", action="store_true",
         help="Drop the LiteScope analyzer from the probe (faster rebuild; the CSR matrix still works).")
+    parser.add_target_argument("--no-ulpi-scope", action="store_true",
+        help="Drop `usb_scope` (the second LiteScope instance, `--csv usb_scope.csv`), which samples the ULPI "
+             "bus at the PHY's own 60 MHz (needs --with-ulpi-master). It costs BRAM-heavy FSMs and puts the "
+             "first fabric loads "
+             "on the ULPI input pads in the PHY's clock domain, so it is the thing to remove when a timing "
+             "failure on those pads needs an owner. Not a way to get a greener report: without it a wrong "
+             "byte costs another spin instead of another capture.")
     parser.add_target_argument("--cpu-reset-pin", default=None,
         help="Also reset from this platform resource (active low, e.g. user_btn_n). Default: boot counter only.")
     ethopts = parser.target_group.add_mutually_exclusive_group()
@@ -1320,6 +1380,7 @@ def main():
         with_analyzer       = not args.no_analyzer,
         w12_pullup          = args.w12_pullup,
         with_ulpi_master    = args.with_ulpi_master,
+        with_ulpi_scope     = not args.no_ulpi_scope,
         ulpi_skew_ns        = args.ulpi_skew_ns,
         ulpi_stall_timeout  = args.ulpi_stall_timeout,
         ulpi_retry_limit    = args.ulpi_retry_limit,
