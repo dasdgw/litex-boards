@@ -129,7 +129,8 @@ from litex.gen import LiteXModule
 from litex_boards.extensions.pano_cdc import CdcLevel, ReqAckCDC
 
 __all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
-           "STATUS_FIELDS", "status_decode", "UlpiMaster", "UlpiLink", "UlpiClear"]
+           "STATUS_FIELDS", "status_decode", "ulpi_io_windows", "ulpi_output_budget", "ulpi_ucf_lines",
+           "UlpiMaster", "UlpiLink", "UlpiClear"]
 
 # The analyzer taps `state`, so these numbers are part of what a capture *means*: renumbering one
 # invalidates every saved .gtkwave layout and every bench note that quotes a state.
@@ -177,10 +178,18 @@ def ulpi_io_windows(clk_hz = 60e6, skew_ns = 0.0, tdd_ns = ULPI_TDD_MAX_NS, tsd_
       earlier draft of this file said and what it then *emitted*: at 60 MHz that is -1.333 ns, a window
       smaller than nothing, and Xilinx wrote it into the UCF without a word of complaint. That is the whole
       reason this function exists separately from the code that formats it.
-    * ``offset_out`` = period - TSD_min - skew -- the wire budget on our clock-to-pad. Note it is 10.667 ns
-      and not the 7.667 ns the §7.4 table calls "capture": the internal budget and the wire budget differ by
-      the clock network's insertion delay, and asking for the wrong one is how a Link that violates TSD by
-      3 ns gets a clean timing report.
+    * ``offset_out``  = **TSD_min + skew = 6.0 ns, and it does not depend on the clock.** This is the line
+      that was wrong before, and wrong in the way that looks like a hardware problem: `OFFSET = OUT d` in
+      Xilinx's model is the **quiet margin the data must hold before the NEXT clock edge**, so the tool's own
+      requirement is ``period - d`` (measured: `trce` printed ``Requirement: 5.999ns`` for
+      ``OFFSET = OUT 10.667`` at a 16.667 ns period). Emitting the *budget* (10.667) instead of the *margin*
+      (6.0) therefore demanded clock-to-pad <= 6.0 ns when ULPI only asks for <= 10.667 ns -- a phantom
+      4.67 ns violation on every output, on top of the real one. The complement was inherited from the
+      ticket's wording ("OFFSET_OUT ~ 10.5 ns = period - TSD - margin") and nobody checked it against the
+      tool's arithmetic; the fact that both numbers are complements of the same two quantities at this one
+      clock is what made it survivable in prose. A margin is a margin at any clock: that invariance is now
+      asserted in `tools/test_ulpi_ucf.py`, because it is the only cheap thing that distinguishes the two
+      readings.
 
     Raises rather than emitting a window that cannot exist: at a clock where the PHY's own TDD exceeds the
     period there is no constraint to write, and the build must say so instead of synthesising a race.
@@ -188,15 +197,26 @@ def ulpi_io_windows(clk_hz = 60e6, skew_ns = 0.0, tdd_ns = ULPI_TDD_MAX_NS, tsd_
     period = 1e9/clk_hz
     offset_in  = tdd_ns + skew_ns
     valid_in   = period - offset_in
-    offset_out = period - tsd_ns - skew_ns
+    offset_out = tsd_ns + skew_ns        # a MARGIN, not a budget -- see the docstring
     if valid_in <= 0:
         raise ValueError(f"ULPI input window cannot close at {clk_hz/1e6:.1f} MHz: TDD_max "
                          f"{offset_in:.2f} ns leaves {valid_in:.2f} ns of valid window. A 60 MHz C12 is "
                          f"the fastest this budget supports; check --sys-clk-freq and the PHY's CLKOUT mode.")
-    if offset_out <= 0:
-        raise ValueError(f"ULPI output budget cannot close at {clk_hz/1e6:.1f} MHz: TSD_min {tsd_ns} ns "
-                         f"exceeds the {period:.2f} ns period.")
+    if period - offset_out <= 0:
+        raise ValueError(f"ULPI output budget cannot close at {clk_hz/1e6:.1f} MHz: the PHY needs TSD_min "
+                         f"{tsd_ns:.2f} ns of the {period:.2f} ns period, leaving nothing for our clock "
+                         f"path. This PHY cannot run this fast relative to CLKOUT.")
     return offset_in, valid_in, offset_out
+
+
+def ulpi_output_budget(clk_hz = 60e6, skew_ns = 0.0, tsd_ns = ULPI_TSD_MIN_NS):
+    """The clock-to-pad budget the tool will actually check, in ns: ``period - (TSD_min + skew)``.
+
+    Separate function on purpose. It is the number people want when they ask "how much room do we have",
+    and it is NOT the number that goes in the UCF -- confusing them is the 4.67 ns mistake described in
+    :func:`ulpi_io_windows`. `trce`'s ``Requirement:`` line for an ``OFFSET = OUT`` is this value.
+    """
+    return 1e9/clk_hz - tsd_ns - skew_ns
 
 
 def ulpi_ucf_lines(clk_net = "usb_clk", clk_hz = 60e6, skew_ns = 0.0, data_net = "ulpi_data",
