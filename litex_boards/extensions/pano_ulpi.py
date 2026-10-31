@@ -1,0 +1,624 @@
+#
+# This file is part of LiteX-Boards.
+#
+# Copyright (c) 2026 Pano Logic G2 reverse-engineering community
+# SPDX-License-Identifier: BSD-2-Clause
+
+"""The ULPI **Link** for the Pano Logic G2: ``RegRead`` + ``RegWrite``, nothing else.
+
+Why this block exists and stays (it is not a bring-up throwaway): Track A's PHY path
+(``ultraembedded/core_ulpi_wrapper`` -> ``ulpi_wrapper.v``) writes Function Control (``0x04``) and OTG
+Control (``0x0A``) only, so Interface Control, the Debug register (the only pre-enumeration witness of the
+USB ``link state``) and a soft PHY reset have no door. Every later PHY question needs this door.
+
+Every encoding, address and timing figure is owned by ``RESEARCH.md`` §7 in the project docs and cited
+there rather than restated. The two that appear below because they *are* the state machine:
+``TX CMD = 0x80|addr`` (RegWrite) and ``0xC0|addr`` (RegRead) — ULPI 1.1 Table 6, bits 7:6 = ``10b``/``11b``.
+
+Choreography, quoted rather than remembered (ULPI 1.1 §3.8.3.1, §3.8.4)
+----------------------------------------------------------------------
+
+*RegWrite* — "the Link sends a register write command and waits for nxt to assert. In the cycle after nxt
+asserts, the Link sends the register write data and waits for nxt to assert again. When nxt asserts the
+second time, the Link asserts stp in the following cycle to complete the operation." **Two bytes on the
+wire plus a one-cycle ``stp``.** A "3-byte write" is wrong, and this project's own milestone doc used to
+say one.
+
+*``stp`` is an END marker, not a start marker* — "stp … If the Link is sending data to the PHY, stp
+indicates the last byte of data was on the bus in the previous cycle"; "the Link must assert stp to signal
+the end of a USB transmit packet or a register write operation". The TX CMD cycle is therefore driven with
+``stp`` **low**; asserting it early tells the PHY the transfer ended before it began.
+
+*RegRead* — "the Link sends a register read command and waits for nxt to assert. In the cycle after nxt
+asserts, the PHY asserts dir to gain control of the data bus. In the cycle after dir asserts, the PHY must
+return the register read data. The PHY does not assert nxt when dir is asserted during the register read
+operation." So: **no ``nxt`` on a read, no ``stp`` on a read, and the byte arrives one cycle after
+``dir``** — which is why the states are named ``RD_TURN``/``RD_WAIT_DIR``/``RD_DATA`` and why the
+testbench asserts the arrival cycle instead of just the happy value. Reading that gap as a stall is the
+likeliest way to make a healthy PHY look broken.
+
+*Bus idle first* — "Anytime the Link wants to write or read a ULPI register, the Link will need to wait
+until DIR is low" (USB3300), so ``go`` while ``dir`` is high **waits and counts** (``BUSY_WAIT``,
+``result_bus_waited``) rather than erroring: the PHY legitimately holds ``dir`` after reset until its PLL
+settles, and an immediate error would cost a 60 ms round trip per retry.
+
+*Abort* — "the PHY can abort the Link by asserting dir" (§3.8.4.1) and "the Link must retry the RegWrite
+when the bus is idle" (§3.8.3.1): a ``dir`` abort is retried up to ``retry_limit`` **and still reported**,
+because "passed after three aborts" and "passed cleanly" are different facts. The Link aborts a PHY holding
+``dir`` by pulsing ``stp`` (§3.8.4.2) — that is ``abort``; §3.8.4.2's own caveat ("If the Link does not
+immediately drive a TX CMD, the PHY is allowed to re-assert dir") is why it releases the bus and promises
+nothing more.
+
+Interface (tickets 02 and 04 code against this — keep it in sync)
+----------------------------------------------------------------
+
+``UlpiMaster``, in the PHY's clock domain. The request is a **level** and the completion a **one-cycle**
+``ack``, because that is the shape ``ReqAckCDC`` presents on its far side; ``UlpiLink`` is the ``cd_sys``
+side and is what a CSR front-end or a testbench drives.
+
+::
+
+    req             i 1  level: a request is offered (rw/addr/wdata valid with it)
+    rw              i 1  0 = RegWrite, 1 = RegRead
+    addr            i 6  immediate register address (ULPI's 6-bit space; RESEARCH.md §7.2)
+    wdata           i 8  byte to write
+    ack             o 1  one cycle at the end of the access; ack_data valid with it
+    ack_data        o 30 packed result, see ACK_FIELDS / ack_unpack — never read a piece of it alone
+    xfer_active     o 1  level: high for the whole span, INCLUDING an access that never ends
+    state           o 4  the FSM, for the analyzer (STATE below)
+    phy_reset       i 1  level: PHY reset asserted now — drives the bus-idle level
+    clear           i 1  level: hold this master off the bus and clear its FSM (see "The clear")
+    abort_req       i 1  pulse: release a PHY that is holding `dir` (the CSR behind it is
+                     `ulpi_abort`; the `_req` suffix is because a Verilated C++ model cannot have a
+                     port named `abort` -- it collides with libc's abort())
+    bus_grant       i 1  permission to drive data — tied to 1 in spin 2, see the comment at `bus_grant`
+    dir_in, nxt_in  o 1  registered view of the pads, for the analyzer
+    oe_out, stp_out o 1  registered view of what *we* drive, for the analyzer
+    tx_byte         o 8  the byte we are driving, whether or not `oe` says so
+
+``UlpiLink`` adds the ``cd_sys`` side (``h_req``/``h_ack``/``h_busy``, one cycle each, ``h_ack_data`` the same
+30-bit bundle) and the latched status described on that class.
+
+``STATE`` (4 bits, 11 states): ``0 IDLE · 1 BUSY_WAIT · 2 WR_CMD · 3 WR_DATA · 4 WR_STP · 5 RD_CMD ·
+6 RD_TURN · 7 RD_WAIT_DIR · 8 RD_DATA · 9 ABORT · 10 FINISH``. The analyzer taps ``state``, so these numbers
+are what a saved VCD and every bench note that quotes a state means: renumbering one invalidates them all.
+
+``stall_timeout`` (default ``2**16`` ≈ 1.1 ms at 60 MHz) is **ours, not the spec's**: "A register read is
+the only instance where ULPI does not use nxt to throttle data", and ULPI 1.1 bounds ``nxt`` throttling not
+at all (searched: there is no "three-strike rule" in it). A timeout here must sit far above any legal
+throttle, must be counted, and must never be reported as a PHY spec violation. ``retry_limit`` default
+**3**: §3.8.3.1 says *must retry*, and a forever-retry is a hang with a nicer name.
+
+The clear, and why it is a level rather than ``always @(posedge clk or posedge rst)``
+------------------------------------------------------------------------------------
+
+Spec decision 6 asked for an async clear from the PHY-reset net OR'd with a boot counter, because that is
+the only reset that works with the clock **stopped** — and this domain's clock *is* the PHY's, which stops
+whenever the PHY is in reset. migen's generator emits synchronous resets only, so the *guarantee* is
+rebuilt from two expressible things, both load-bearing:
+
+1. ``driving`` is qualified with ``~clear`` **combinationally**, so while ``clear`` is high the pads sit at
+   the ULPI idle level (``data = 00h``, ``stp`` low) whatever the frozen FSM was doing. A PHY reset can
+   never leave us mid-byte on a bus we are no longer clocked to see.
+2. :func:`UlpiClear` — in ``cd_sys``, which always has a clock — holds ``clear`` asserted for
+   ``relock_ms`` **after** PHY reset releases, long after the PHY's clock can return. So the first edge a
+   frozen FSM ever takes is an edge with ``clear`` high: an access stuck in ``RD_TURN`` cannot resume a
+   transaction that no longer exists. The host learns of it from the *bridge* (``err_lost``), the side that
+   still has a clock to report with.
+
+That is the recovery property decision 6 asked for, and ``reset_mid`` in ``tools/ulpi_vectors.tsv`` proves
+it offline. The literal async-clear flip-flop is what ``ulpi_wrapper.v`` does; if a spin ever needs it,
+this file is the place to change and the testbench is already here.
+"""
+
+from migen import *
+from migen.genlib.cdc import MultiReg
+
+from litex.gen import LiteXModule
+
+from litex_boards.extensions.pano_cdc import CdcLevel, ReqAckCDC
+
+__all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
+           "UlpiMaster", "UlpiLink", "UlpiClear"]
+
+# The analyzer taps `state`, so these numbers are part of what a capture *means*: renumbering one
+# invalidates every saved .gtkwave layout and every bench note that quotes a state.
+(IDLE, BUSY_WAIT, WR_CMD, WR_DATA, WR_STP, RD_CMD, RD_TURN, RD_WAIT_DIR, RD_DATA, ABORT,
+ FINISH) = range(11)
+STATE = dict(IDLE=IDLE, BUSY_WAIT=BUSY_WAIT, WR_CMD=WR_CMD, WR_DATA=WR_DATA, WR_STP=WR_STP,
+             RD_CMD=RD_CMD, RD_TURN=RD_TURN, RD_WAIT_DIR=RD_WAIT_DIR, RD_DATA=RD_DATA, ABORT=ABORT,
+             FINISH=FINISH)
+
+CMD_REG_WRITE = 0x80      # TX CMD bits 7:6 = 10b, immediate 6-bit address in 5:0
+CMD_REG_READ  = 0xC0      # TX CMD bits 7:6 = 11b
+# Deliberately absent: 0x00 NOOP (that is the idle *level*, not something to send), 0x40|PID packet
+# transmit (Track A's job; doing it here would mean a second, worse ulpi_wrapper), and the 0x2F extended
+# forms (the USB3300 tells the Link not to read or write anything outside its register table).
+
+# The ack carries the whole result bundle rather than one byte, because the result is not interpretable in
+# pieces: `rdata` without its `bus_waited` is a number you cannot judge — "passed after waiting 3 cycles"
+# and "passed after waiting 40 000" are the same verdict today and a different diagnosis next month.
+REQ_FIELDS = ["rw", "addr", "wdata"]                                        # 1 + 6 + 8       = 15
+ACK_FIELDS = ["dir_abort", "nxt_timeout", "rdata", "bus_waited", "retry"]   # 1 + 1 + 8 + 16 + 4 = 30
+
+
+def req_pack(rw, addr, wdata):
+    return Cat(rw, addr, wdata)
+
+
+def ack_unpack(sig):
+    """Field views of an ack payload, in the order named by ``ACK_FIELDS``."""
+    return dict(dir_abort=sig[0], nxt_timeout=sig[1], rdata=sig[2:10],
+                bus_waited=sig[10:26], retry=sig[26:30])
+
+
+def _inc_sat(sig):
+    return sig.eq(Mux(sig != (2**len(sig) - 1), sig + 1, sig))
+
+
+
+
+class UlpiClear(Module):
+    """``cd_sys``: the level that holds the Link off the bus and clears its FSM.
+
+    ``clear = ~boot_done | phy_reset | relock``, and ``relock`` keeps it asserted for ``relock_ms``
+    **after** PHY reset releases. That tail is not caution, it is the mechanism -- see "The clear" in this
+    file's docstring: without it a PHY reset asserted while ``C12`` was already stopped is a reset the FSM
+    never observes, and an access frozen in ``RD_WAIT_DIR`` simply resumes when the clock comes back. With
+    it, the first edge a frozen FSM ever takes is an edge with ``clear`` high.
+
+    A boot counter rather than a config pin: ``cd_sys`` itself only starts clocking when the Ethernet PHY's
+    125 MHz appears (``RESEARCH.md``), so "counted N cycles of the sys clock" is the only definition of
+    *booted* that means anything on this board.
+    """
+    def __init__(self, sys_clk_freq, phy_reset, boot_ms = 1, relock_ms = 10):
+        self.clear     = Signal()
+        self.boot_done = Signal()
+        boot_cycles    = int(sys_clk_freq*boot_ms/1e3)
+        relock_cycles  = int(sys_clk_freq*relock_ms/1e3)
+        boot, hold, rst_d = Signal(32), Signal(32), Signal()
+        self.sync += [
+            rst_d.eq(phy_reset),
+            If(boot < boot_cycles, boot.eq(boot + 1)),
+            If(phy_reset, hold.eq(relock_cycles))      # asserted, and every cycle since it was
+             .Elif(hold != 0, hold.eq(hold - 1)),
+        ]
+        self.comb += [
+            self.boot_done.eq(boot >= boot_cycles),
+            self.clear.eq((boot < boot_cycles) | phy_reset | (hold != 0)),
+        ]
+
+
+class UlpiMaster(Module):
+    """One register path into a ULPI PHY. Lives in the PHY's clock domain (``domain``, default ``usb``).
+
+    The request is a **level** (``req``) and the completion a **one-cycle** ``ack``, which is the shape
+    :class:`~litex_boards.extensions.pano_cdc.ReqAckCDC` presents on its far side; ``req_taken`` makes sure
+    a request still held high after its own ack cannot start a second transaction.
+
+    Cycle convention, stated once because every state depends on it: ``dir_in``/``nxt_in`` are registered,
+    so in any cycle the FSM sees what the PHY drove in the **previous** cycle. That is the same pipeline
+    both prior references have (``UlpiCtrl.scala`` samples ``io.ulpi.nxt`` inside a clocked block) and it is
+    legal because ULPI's ``nxt`` is a throttle the PHY holds until the Link's next byte appears. The one
+    place the *raw* pad is used is the ``oe`` turnaround term, which has to win immediately no matter where
+    the FSM's own pipeline has got to.
+    """
+
+    def __init__(self, pads, stall_timeout = 1 << 16, retry_limit = 3, domain = "usb",
+                 bus_waited_width = 16, name = "ulpi"):
+        assert 1 <= retry_limit <= 15, "retry_limit has to fit the 4-bit retry counter"
+        assert stall_timeout >= 1024, "a shorter timeout can fire during a legal nxt throttle (§3.8.3: unbounded)"
+
+        # --- host-facing (the bridge's far side) --------------------------------------------------------
+        self.req         = Signal()
+        self.rw          = Signal()
+        self.addr        = Signal(6)
+        self.wdata       = Signal(8)
+        self.ack         = Signal()
+        self.ack_data    = Signal(30)
+        self.xfer_active = Signal()
+        self.state       = Signal(4)
+        self.phy_reset   = Signal()
+        self.clear       = Signal()
+        self.abort_req   = Signal()
+        # DO NOT fold this into `req`, and do not delete it because spin 2 ties it to 1. The next owner of
+        # these pads is Track A's `ulpi_wrapper.v`, which raises `stp` on its own the moment the HCD
+        # transmits: two engines on one bus cannot be separated by a *convention*, so the arbitration
+        # promise has to live in the interface. One input now, versus a bus fight nobody would see from the
+        # host side. (Spec decision 9.)
+        self.bus_grant   = Signal()
+
+        # --- analyzer taps, all registered --------------------------------------------------------------
+        # LiteScope's format_groups() de-duplicates through a dict and a migen operator is unhashable, so
+        # anything worth capturing needs a name of its own (spin 1 measured: the analyzer refuses to tap
+        # `~dir`). It is also what you want in the VCD: one name, one net, one meaning.
+        self.dir_in  = Signal()
+        self.nxt_in  = Signal()
+        self.oe_out  = Signal()
+        self.stp_out = Signal()
+        self.tx_byte = Signal(8)
+
+        sync = self.sync if domain == "sync" else getattr(self.sync, domain)
+
+        # --- pads -----------------------------------------------------------------------------------------
+        self.tri = TSTriple(8, name = name + "_tri")
+        self.specials += self.tri.get_tristate(pads.data)
+
+        # dir/nxt are registered **one stage, on purpose, and this must not become a MultiReg.** They are
+        # synchronous here -- the PHY drives them from the same CLKOUT that clocks this domain, inside the
+        # 9 ns TDC/TDD budget of `RESEARCH.md` §7.4, which slice 02 closes with OFFSET_IN -- so the problem
+        # is propagation and not metastability, and a 2-FF synchroniser would push the read-byte sample one
+        # cycle past the only cycle in which the PHY drives it. The alignment is worth seeing: the PHY
+        # asserts `dir` in cycle D and returns the byte in D+1 (§3.8.3.1), so our registered copy is high
+        # *during* D+1, which is exactly when RD_WAIT_DIR samples the pad. One stage is what makes that line
+        # correct rather than a cycle late.
+        sync += [self.dir_in.eq(pads.dir), self.nxt_in.eq(pads.nxt)]
+
+        # Every one of these is named on purpose: the synth report, the LiteScope VCD and the iverilog
+        # dump are the only debug interface this block has, and an unnamed Signal elaborates as
+        # `ulpimaster7` -- which is what you then have to translate by hand at 1 am from a .gtkwave file.
+        state     = Signal(4, reset = IDLE, name = "state")
+        driving   = Signal(name = "driving")
+        stp_drive = Signal(name = "stp_drive")
+        tx_byte   = Signal(8,   name = "tx_byte")
+        rw_r      = Signal(name = "rw_r")
+        addr_r    = Signal(6,   name = "addr_r")
+        wdata_r   = Signal(8,   name = "wdata_r")
+        waited    = Signal(bus_waited_width, name = "waited")
+        retries   = Signal(4,   name = "retries")
+        aborted   = Signal(name = "aborted")
+        timed_out = Signal(name = "timed_out")
+        req_taken = Signal(name = "req_taken")
+        tmo       = Signal(32,  name = "tmo")
+        tmo_hit   = Signal(name = "tmo_hit")
+
+        self.comb += [
+            self.state.eq(state), self.tx_byte.eq(tx_byte), self.stp_out.eq(stp_drive),
+            self.oe_out.eq(self.tri.oe),
+            self.xfer_active.eq(state != IDLE),
+        ]
+
+        # DO NOT register the `dir` term below, and DO NOT delete it either.
+        #   * Delete it and two drivers can own the data bus at once: the result is a byte that is neither
+        #     ours nor the PHY's and nothing on the host side says so. §3.8.4.2: "In the next cycle, the
+        #     PHY must de-assert dir", so a registered `dir` keeps us driving exactly one cycle into the
+        #     PHY's ownership of the bus. Both prior references for this exact board do it combinationally
+        #     and both flag the path: `ulpi_wrapper.v` `pads_data.oe.eq(~pads.dir)`, `UlpiCtrl.scala`
+        #     `data.writeEnable := !direction`.
+        #   * Register it and it stops doing its job: the PHY takes the bus in a cycle our own pipeline has
+        #     not reached yet.
+        # `~clear` is the other half of "The clear" in this file's docstring -- combinational *because* the
+        # clock may already have stopped, leaving this the only logic able to return the bus to the ULPI
+        # idle level (data 00h, stp low). `phy_reset` in the same term is ULPI's own requirement that the
+        # Link drive the idle value while the PHY is in reset.
+        # `stp` is a dedicated output and is deliberately NOT qualified by `dir`: §3.8.4.2 asks for it
+        # precisely while the PHY is holding `dir`.
+        drive_now = driving & ~self.clear & self.bus_grant
+        # TWO command bytes, because there are two moments a command is issued and they do not have the same
+        # information available:
+        #   `cmd_new` at accept, from the request itself -- `rw_r`/`addr_r` are assigned on that very edge,
+        #     so building the byte from them there yields the *previous* access's rw. That is not a
+        #     hypothetical: it was this module's first bug, it sent every RegRead out as a RegWrite, and the
+        #     simulation caught it in one vector (`tx=0x80` while `rw_r=1`).
+        #   `cmd_r` on a retry out of BUSY_WAIT, where the request pins have long since moved on and only
+        #     the latched copy is the right answer.
+        cmd_new, cmd_r = Signal(8, name = "cmd_new"), Signal(8, name = "cmd_r")
+        self.comb += [
+            cmd_new.eq(Mux(self.rw, CMD_REG_READ | self.addr, CMD_REG_WRITE | self.addr)),
+            cmd_r.eq(Mux(rw_r, CMD_REG_READ | addr_r, CMD_REG_WRITE | addr_r)),
+            self.tri.oe.eq(self.phy_reset | (drive_now & ~pads.dir)),
+            self.tri.o.eq(Mux(drive_now & ~self.phy_reset, tx_byte, 0)),
+            # `stp` is a separate pad, not part of the tri-state, and it is qualified by `~clear` for the
+            # same reason the data pad is: the ULPI idle level is `stp` low with `data` at 00h, and that is
+            # what must be on the pins whenever the PHY is in reset or the Link has been cleared. It is NOT
+            # qualified by `bus_grant`: §3.8.4.2 asks the Link to raise `stp` while the PHY holds `dir`, so
+            # the release path must work in exactly the moment the arbitration is telling us not to talk.
+            pads.stp.eq(stp_drive & ~self.clear),
+        ]
+
+        # A `dir` abort (§3.8.4.1) is not a failure the first `retry_limit` times: "the Link must retry the
+        # RegWrite when the bus is idle" (§3.8.3.1). Retry through BUSY_WAIT, because by definition the bus
+        # is *not* idle while `dir` is high -- and keep `aborted` set, so a successful retry reports "passed
+        # with a note" rather than a clean pass. Exhausting the budget ends the access with the bit set too.
+        def on_dir_abort():
+            return [
+                aborted.eq(1), driving.eq(0), tx_byte.eq(0),
+                If(retries < retry_limit, [_inc_sat(retries), state.eq(BUSY_WAIT)]).Else(
+                    state.eq(FINISH)),
+            ]
+
+        issue = Signal(name = "issue")
+        self.comb += issue.eq(self.bus_grant & ~self.dir_in)
+
+        # The request is a LEVEL from the bridge and stays high for a few cycles after its own ack (the
+        # 2-phase loop has to carry the ack home). `req_taken` is what stops a request servicing itself
+        # twice; it is released when the level drops, never at accept time -- clearing it at accept is the
+        # bug where the *next* access is swallowed, because the level has not dropped yet then.
+        sync += If(~self.req | self.clear, req_taken.eq(0))
+
+        sync += If(self.clear, [
+            # Everything except the result bundle: `clear` is also how a PHY reset mid-transaction gets
+            # reported, and the host must still be able to read *which* access died when it comes back.
+            state.eq(IDLE), driving.eq(0), stp_drive.eq(0), tx_byte.eq(0),
+            waited.eq(0), retries.eq(0), aborted.eq(0), timed_out.eq(0), req_taken.eq(0), tmo.eq(0),
+        ]).Elif(1, [
+            stp_drive.eq(0),
+            If(self.abort_req & (state != IDLE), [                 # §3.8.4.2: release a PHY holding `dir`
+                state.eq(ABORT), driving.eq(0), tx_byte.eq(0), aborted.eq(1),
+            ]).Else(
+                Case(state, {
+                    IDLE: [
+                        driving.eq(0),
+                        If(self.req & ~req_taken, [
+                            rw_r.eq(self.rw), addr_r.eq(self.addr), wdata_r.eq(self.wdata),
+                            req_taken.eq(1), waited.eq(0), retries.eq(0), aborted.eq(0),
+                            timed_out.eq(0), tmo.eq(0),
+                            If(issue, [
+                                driving.eq(1), tx_byte.eq(cmd_new),
+                                state.eq(Mux(self.rw, RD_CMD, WR_CMD)),
+                            ]).Else(
+                                # "Anytime the Link wants to write or read a ULPI register, the Link will
+                                # need to wait until DIR is low" (USB3300 §6.1). Count the wait, never
+                                # error on it: the PHY legitimately holds `dir` after reset until its PLL
+                                # settles, and an error here would cost a 60 ms round trip per retry.
+                                state.eq(BUSY_WAIT),
+                            ),
+                        ]),
+                    ],
+                    BUSY_WAIT: [
+                        driving.eq(0), _inc_sat(waited),
+                        If(issue, [
+                            driving.eq(1), tx_byte.eq(cmd_r),
+                            state.eq(Mux(rw_r, RD_CMD, WR_CMD)),
+                        ]),
+                    ],
+                    WR_CMD: [                                  # TX CMD 0x80|addr, `stp` low
+                        If(self.dir_in, on_dir_abort()).Elif(self.nxt_in, [
+                            state.eq(WR_DATA), tx_byte.eq(wdata_r),
+                        ]),
+                    ],
+                    WR_DATA: [                                 # the byte, then `stp` next cycle
+                        If(self.dir_in, on_dir_abort()).Elif(self.nxt_in, [
+                            state.eq(WR_STP), stp_drive.eq(1), tx_byte.eq(0),
+                        ]),
+                    ],
+                    WR_STP: [                                  # exactly one cycle: 1-cycle END marker
+                        driving.eq(0), stp_drive.eq(0), tx_byte.eq(0), state.eq(FINISH),
+                    ],
+                    RD_CMD: [                                  # TX CMD 0xC0|addr, `stp` low
+                        If(self.dir_in, on_dir_abort()).Elif(self.nxt_in, [
+                            state.eq(RD_TURN), driving.eq(0), tx_byte.eq(0),
+                        ]),
+                    ],
+                    RD_TURN: [
+                        driving.eq(0), tx_byte.eq(0),
+                        If(self.dir_in, state.eq(RD_DATA)).Else(state.eq(RD_WAIT_DIR)),
+                    ],
+                    RD_WAIT_DIR: [
+                        driving.eq(0),
+                        If(self.dir_in, state.eq(RD_DATA)),
+                    ],
+                    RD_DATA: [
+                        driving.eq(0), tx_byte.eq(0), state.eq(FINISH),
+                    ],
+                    ABORT: [
+                        stp_drive.eq(1), driving.eq(0), tx_byte.eq(0), state.eq(FINISH),
+                    ],
+                    FINISH: [
+                        state.eq(IDLE), driving.eq(0), stp_drive.eq(0), tx_byte.eq(0),
+                    ],
+                }),
+            ),
+        ])
+
+        # Only 11 of the 16 encodings of `state` exist. Anything else comes home: the alternative is an
+        # unrouted encoding that leaves the master holding the data bus forever, and `verilator -Wall` says
+        # the same thing (CASEINCOMPLETE). It is checked ahead of the case, not as a case default, because
+        # every waiting state relies on `state` *holding* and a default assignment in the block would clear
+        # that.
+        sync += If(state > FINISH, state.eq(IDLE), driving.eq(0), stp_drive.eq(0), tx_byte.eq(0))
+
+        # The stall timeout: **ours**, not the spec's (see this file's docstring). It bounds the whole
+        # access rather than one wait, which is what makes "waited for bus idle", "waited for nxt" and
+        # "waited for dir" all fail the same way instead of hanging -- and it is armed only while an access
+        # is live, so an idle master can never time out.
+        sync += If((state != IDLE) & ~self.clear, [
+            If(tmo < stall_timeout, tmo.eq(tmo + 1)).Else(tmo_hit.eq(1)),
+        ]).Else(tmo.eq(0), tmo_hit.eq(0))
+        sync += If(tmo_hit & (state != IDLE) & ~self.clear, [
+            timed_out.eq(1), state.eq(FINISH), driving.eq(0), stp_drive.eq(0), tx_byte.eq(0),
+        ])
+
+        # The read byte, and the one cycle it can be taken in.
+        #
+        # The PHY announces with `dir` in cycle D and drives the byte in D+1 (§3.8.3.1). Our `dir_in` is
+        # registered, so it is high *during* D+1 -- which is therefore the cycle whose pad value is the
+        # answer, and `RD_TURN` is entered in that same cycle (it is one cycle after we see `nxt`). Waiting
+        # for `RD_WAIT_DIR` before sampling would read the cycle *after* the PHY let go: an all-zero byte,
+        # or worse the byte of the previous access. Hence `read_active` spans both states, and the capture
+        # is on the *first* cycle `dir_in` is high.
+        #
+        # It is latched here rather than sampled at `ack` because "whatever is on the bus when `done` is
+        # read" is the stale-read failure this whole spin is built to avoid reporting as a pass (spec
+        # testing decision 8).
+        rdata_c     = Signal(8, name = "rdata_c")
+        read_active = Signal(name = "read_active")
+        self.comb += read_active.eq((state == RD_TURN) | (state == RD_WAIT_DIR))
+        sync += If(read_active & self.dir_in & ~self.clear, rdata_c.eq(self.tri.i))
+
+        self.comb += [
+            self.ack.eq(state == FINISH),
+            self.ack_data.eq(Cat(aborted, timed_out, rdata_c, waited, retries)),
+        ]
+
+
+
+
+class UlpiLink(LiteXModule):
+    """The register path as one block: :class:`ReqAckCDC` (``cd_sys`` -> ``cd_usb``) + :class:`UlpiMaster`.
+
+    This is what the SoC instantiates and what the simulator runs. No CSRs in here, deliberately: the CSR
+    front-end is the integration layer's (ticket 02), and keeping it out means the simulation exercises *the
+    logic* rather than a LiteX CSR model.
+
+    Host side (``cd_sys``)
+    ----------------------
+    ``h_req`` for one cycle with ``h_rw``/``h_addr``/``h_wdata``; ``h_ack`` for one cycle when it finishes;
+    ``h_ack_data`` is the master's result bundle (``ack_unpack``). ``h_busy`` is the bridge's and is the only
+    ``busy`` the host should ever read: it clears on the ack **or** on ``lost``, so a PHY reset cannot strand
+    it (spec testing decision 5).
+
+    What lives on which side, and why
+    ---------------------------------
+    ``err_no_clock`` is derived **here**, in ``cd_sys``, from the master's ``xfer_active`` level while
+    ``clk_ok`` is low. The master cannot derive it: a domain cannot observe the absence of its own clock,
+    which is the same reason spin 1's clock meter sits in ``cd_sys`` (spec decision 14). Sampled across the
+    *span* of the access, not at the instant of ``go``, because "the clock died during the transaction" is
+    the failure that actually happens on this board.
+
+    ``err_reset`` is the bridge's ``err_lost`` under the name the acceptance matrix uses. Both halves of the
+    argument matter: ``clear`` cannot cross from ``cd_usb`` to ``cd_sys`` as a pulse (there may be no
+    ``cd_usb`` cycles left in which to generate one), but it crosses fine as a level -- which is what
+    ``ReqAckCDC.dst_clear`` is.
+
+    The ``ulpi_status`` bit layout is the contract tickets 02 and 04 code against, so it is stated once,
+    here, and repeated by the :meth:`status` helper rather than re-derived at each use:
+
+    ::
+
+        bit 0  busy             (cd_sys bridge)
+        bit 1  done             (last access completed; sticky until the next h_req)
+        bit 2  err_dir_abort    (this access was aborted -- it may still have succeeded)
+        bit 3  err_nxt_timeout  (our stall bound expired: ours, never a PHY spec violation)
+        bit 4  err_no_clock     (xfer_active while clk_ok=0; derived here, in cd_sys)
+        bit 5  err_reset        (far side cleared mid-access; from the bridge)
+        bit 6  dir              (live, as the master sees it -- "is the PHY holding the bus?")
+        bit 7  oe               (live output enable)
+        bits 11:8  state        (the master's FSM; see STATE)
+
+    The counters are separate and saturating, and are *not* in the status word, because a counter's whole
+    purpose is to survive being read: ``cnt_access``, ``cnt_dir_abort``, ``cnt_timeout``, ``cnt_reset``,
+    ``cnt_no_clock``, plus the last access's ``last_bus_waited``/``last_retry``.
+    """
+    def __init__(self, pads, sys_clk_freq, stall_timeout = 1 << 16, retry_limit = 3,
+                 boot_ms = 1, relock_ms = 10, watchdog_ms = 20):
+        # --- host side, cd_sys --------------------------------------------------------------------------
+        self.h_req      = Signal()
+        self.h_rw       = Signal()
+        self.h_addr     = Signal(6)
+        self.h_wdata    = Signal(8)
+        self.h_ack      = Signal()
+        self.h_ack_data = Signal(30)
+        self.h_busy     = Signal()
+        self.abort_req  = Signal()          # one-cycle, cd_sys
+        self.bus_grant  = Signal()
+        self.phy_reset  = Signal()          # logical level, 1 = PHY reset asserted (already cd_sys-clean)
+        self.clk_ok     = Signal()          # spin 1's clock meter, already in cd_sys
+
+        # --- latched status and counters, cd_sys --------------------------------------------------------
+        self.done            = Signal()
+        self.err_dir_abort   = Signal()
+        self.err_nxt_timeout = Signal()
+        self.err_no_clock    = Signal()
+        self.err_reset       = Signal()
+        self.dir_now         = Signal()
+        self.oe_now          = Signal()
+        self.state           = Signal(4)
+        self.last_bus_waited = Signal(16)
+        self.last_retry      = Signal(4)
+        self.cnt_access      = Signal(16)
+        self.cnt_dir_abort   = Signal(8)
+        self.cnt_timeout     = Signal(8)
+        self.cnt_reset       = Signal(8)
+        self.cnt_no_clock    = Signal(8)
+
+        # --- the clear ----------------------------------------------------------------------------------
+        self.ulpi_clear = UlpiClear(sys_clk_freq = sys_clk_freq, phy_reset = self.phy_reset,
+                                    boot_ms = boot_ms, relock_ms = relock_ms)
+
+        # --- the crossing -------------------------------------------------------------------------------
+        # watchdog_ms = 20, not 10: `docs/NOTES.md` measured one CSR transaction on this serial link at
+        # 12-20 ms, so a bridge that has been busy for less than that is not yet news, and a watchdog that
+        # fires inside the noise of normal traffic is worse than no watchdog.
+        self.bridge = ReqAckCDC(req_width = 15, ack_width = 30,
+                                src_domain = "sys", dst_domain = "usb")
+        self.bridge.watchdog.reset = int(sys_clk_freq*watchdog_ms/1e3)
+
+        # --- the master ---------------------------------------------------------------------------------
+        self.master = UlpiMaster(pads, stall_timeout = stall_timeout, retry_limit = retry_limit,
+                                 domain = "usb")
+
+        # --- wiring -------------------------------------------------------------------------------------
+        m = ack_unpack(self.bridge.dst_ack_data)
+        self.comb += [
+            self.bridge.req.eq(self.h_req & ~self.h_busy),
+            self.bridge.req_data.eq(req_pack(self.h_rw, self.h_addr, self.h_wdata)),
+            self.bridge.dst_clear.eq(self.ulpi_clear.clear),
+            self.h_ack.eq(self.bridge.ack),
+            self.h_ack_data.eq(self.bridge.ack_data),
+            self.h_busy.eq(self.bridge.busy),
+
+            self.master.req.eq(self.bridge.dst_req),
+            self.master.rw.eq(self.bridge.dst_data[0]),
+            self.master.addr.eq(self.bridge.dst_data[1:7]),
+            self.master.wdata.eq(self.bridge.dst_data[7:15]),
+            self.bridge.dst_ack.eq(self.master.ack),
+            self.bridge.dst_ack_data.eq(self.master.ack_data),
+
+            self.master.phy_reset.eq(self.phy_reset),
+            self.master.clear.eq(self.ulpi_clear.clear),
+            self.master.bus_grant.eq(self.bus_grant),
+        ]
+
+        # `abort` is a cd_sys pulse and the master consumes a cd_usb level. A *pulse* cannot cross into a
+        # domain that may have stopped, so what crosses is a level the link holds until the access that saw
+        # it ends (ack) or is declared dead (lost). The master acts on it once per access for the same
+        # reason: a held level must not abort the access after the one the host meant.
+        abort_level = Signal()
+        self.sync  += If(self.abort_req, abort_level.eq(1))
+        self.sync  += If(self.bridge.ack | self.bridge.err_lost | self.ulpi_clear.clear,
+                         abort_level.eq(0))
+        abort_usb = Signal()
+        self.specials += MultiReg(abort_level, abort_usb, odomain = "usb")
+        self.comb  += self.master.abort_req.eq(abort_usb)
+
+        # --- latched status, cd_sys ---------------------------------------------------------------------
+        # Sticky **until the next `h_req`**, never self-clearing: the host is ~20 ms away on this link and a
+        # bit that clears before anybody can read it is a bit that was never there (spec decision 12).
+        # Registered, never combinational: spin 1 measured a combinational status read in the glitch.
+        a = ack_unpack(self.bridge.ack_data)
+        self.sync += If(self.h_req & ~self.h_busy, [
+            self.done.eq(0), self.err_dir_abort.eq(0), self.err_nxt_timeout.eq(0),
+            self.err_no_clock.eq(0), self.err_reset.eq(0),
+        ])
+        self.sync += If(self.bridge.ack, [
+            self.done.eq(1),
+            self.err_dir_abort.eq(a["dir_abort"]),
+            self.err_nxt_timeout.eq(a["nxt_timeout"]),
+            self.last_bus_waited.eq(a["bus_waited"]),
+            self.last_retry.eq(a["retry"][:4]),
+            _inc_sat(self.cnt_access),
+        ])
+        self.sync += If(self.bridge.ack & a["dir_abort"], _inc_sat(self.cnt_dir_abort))
+        self.sync += If(self.bridge.ack & a["nxt_timeout"], _inc_sat(self.cnt_timeout))
+        # `err_reset` and `err_no_clock` are set on the *events*, not on the ack: the access that lost the
+        # clock or the far side never produces an ack at all, and that is precisely the failure being
+        # guarded. Latching them off the ack is how a dead link reports success.
+        self.sync += If(self.bridge.err_lost, [self.err_reset.eq(1), _inc_sat(self.cnt_reset)])
+        # Derived from the BRIDGE's `busy`, not from the master's `xfer_active`, and that is not an
+        # oversight: a master with no clock never leaves IDLE, so `xfer_active` stays low in exactly the
+        # case this bit exists to report (spec decision 14, "an access was asked for and the PHY clock is not
+        # there"). `h_busy` is already in cd_sys, needs no synchroniser, and is true whether the access is
+        # running, stalled, or blocked behind `clear` because the PHY is in reset. The master's
+        # `xfer_active` stays what it is for -- the analyzer's gate for "is there a transaction to capture".
+        self.sync += If(self.h_busy & ~self.clk_ok, [self.err_no_clock.eq(1), _inc_sat(self.cnt_no_clock)])
+        self.specials += [
+            MultiReg(self.master.dir_in, self.dir_now, odomain = "sys"),
+            MultiReg(self.master.oe_out, self.oe_now,  odomain = "sys"),
+            MultiReg(self.master.state,  self.state,   odomain = "sys"),
+        ]
+
+    def status(self):
+        """The ``ulpi_status`` word, in the bit order documented on the class."""
+        return Cat(self.h_busy, self.done, self.err_dir_abort, self.err_nxt_timeout,
+                   self.err_no_clock, self.err_reset, self.dir_now, self.oe_now, self.state)
