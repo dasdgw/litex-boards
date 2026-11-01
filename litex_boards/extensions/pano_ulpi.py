@@ -68,9 +68,14 @@ side and is what a CSR front-end or a testbench drives.
     state           o 4  the FSM, for the analyzer (STATE below)
     phy_reset       i 1  level: PHY reset asserted now — drives the bus-idle level
     clear           i 1  level: hold this master off the bus and clear its FSM (see "The clear")
-    abort_req       i 1  pulse: release a PHY that is holding `dir` (the CSR behind it is
+    abort_req       i 1  LEVEL whose RISING EDGE this master takes locally (bug 5, and `pano_cdc.py`'s
+                     rule): pulse `stp` once to release a PHY that is holding `dir` (the CSR behind it is
                      `ulpi_abort`; the `_req` suffix is because a Verilated C++ model cannot have a
-                     port named `abort` -- it collides with libc's abort())
+                     port named `abort` -- it collides with libc's abort()). A level and not a pulse
+                     because the domain it crosses into may have stopped; edge-detected because a held
+                     level that outranks the FSM's own `ABORT` state is a master that never drives `stp`.
+                     Ignored if this master is already IDLE, and see `UlpiLink.abort_level` for the same
+                     rule one domain earlier.
     bus_grant       i 1  permission to drive data — tied to 1 in spin 2, see the comment at `bus_grant`
     dir_in, nxt_in  o 1  registered view of the pads, for the analyzer
     oe_out, stp_out o 1  registered view of what *we* drive, for the analyzer
@@ -507,6 +512,29 @@ class UlpiMaster(Module):
         # bug where the *next* access is swallowed, because the level has not dropped yet then.
         sync += If(~self.req | self.clear, req_taken.eq(0))
 
+        # **Take the abort as a local edge, not as the level that crossed.** bug 5, found 2026-11-01 by row 3
+        # of `usb/sim/ulpi_abort_idle_tb.v` while ticket 08 was being written, and confirmed on the waveform
+        # of the generated netlist (`bench/2026-11-02_ulpi_abort_idle_tb/`): with `If(self.abort_req, …)` here
+        # the pad **never pulsed**.
+        #
+        # Why: `abort_req` is a LEVEL held until the cd_sys side sees the ack (see `UlpiLink`'s `abort_level`
+        # -- a pulse cannot cross into a domain that may have stopped). This `If` outranks the `Case` below
+        # it, so for every cycle the level stayed high the master re-entered `ABORT` through *this* branch and
+        # the `Case`'s `ABORT` entry -- the only writer of `stp_drive` -- never ran. The master parked in
+        # ABORT for the whole 33 µs of the stall bound, ended the access with *our* timeout, and its ack was
+        # then the thing that cleared the level. `ulpi_abort` was therefore not "release the PHY" but "force a
+        # nxt_timeout", and `err_dir_abort` was set by a branch that had not touched the bus.
+        #
+        # This is the repo's own CDC rule broken in its own file: **levels cross, edges are made locally**
+        # (`pano_cdc.py` docstring). One registered copy in `cd_usb` and the abort is what §3.8.4.2 asks for:
+        # one `stp` cycle, then FINISH, then the ack that releases the level upstream. It also keeps the
+        # `state != IDLE` test honest -- a late abort with the access already home is dropped rather than
+        # queued, which is the same answer ticket 08 gives on the `cd_sys` side.
+        abort_r    = Signal(name = "abort_r")
+        abort_fire = Signal(name = "abort_fire")
+        sync += abort_r.eq(self.abort_req)
+        self.comb += abort_fire.eq(self.abort_req & ~abort_r)
+
         sync += If(self.clear, [
             # Everything except the result bundle: `clear` is also how a PHY reset mid-transaction gets
             # reported, and the host must still be able to read *which* access died when it comes back.
@@ -514,7 +542,7 @@ class UlpiMaster(Module):
             waited.eq(0), retries.eq(0), aborted.eq(0), timed_out.eq(0), req_taken.eq(0), tmo.eq(0),
         ]).Elif(1, [
             stp_drive.eq(0),
-            If(self.abort_req & (state != IDLE), [                 # §3.8.4.2: release a PHY holding `dir`
+            If(abort_fire & (state != IDLE), [                   # §3.8.4.2: release a PHY holding `dir`
                 state.eq(ABORT), driving.eq(0), tx_byte.eq(0), aborted.eq(1),
             ]).Else(
                 Case(state, {
@@ -771,8 +799,26 @@ class UlpiLink(LiteXModule):
         # domain that may have stopped, so what crosses is a level the link holds until the access that saw
         # it ends (ack) or is declared dead (lost). The master acts on it once per access for the same
         # reason: a held level must not abort the access after the one the host meant.
+        #
+        # `& self.bridge.busy` is bug 4, found on silicon 2026-11-01 and reproduced with no board in
+        # `extensions/usb/sim/ulpi_abort_idle_tb.v` (`bench/2026-11-01_ulpi_abort_idle/`). Every clear below
+        # means *"an access ended"*, so a request written when **no access was running** had nothing to end:
+        # the level latched forever, crossed into `cd_usb`, and fired on the NEXT command. The board said it
+        # as `id_vid_low_after_abort: expected 24, got 00`, `errors=dir_abort+nxt_timeout`, one row after a
+        # row that reported the link idle with `busy`=0 -- and every neighbouring step's PHY reset cured it,
+        # which is the same cure-and-hide shape as bug 3.
+        #
+        # The honest ULPI reading of a dropped request: a Link abort is §3.8.4.2's release of a PHY that
+        # holds `dir`, so with no transaction in flight there is nothing to release. "Ignored" is therefore
+        # the semantics, stated in the `ulpi_abort` register description too. Both terms are `cd_sys`, so
+        # this adds no crossing and no CDC risk.
+        #
+        # What it costs: `abort` written in the *same* cd_sys cycle as `go` is dropped, because `busy` is set
+        # on that edge and so still reads 0. Through the CSR that means writing `ulpi_go` and `ulpi_abort`
+        # in one transaction, which this map cannot do -- they are separate registers ~20 ms apart -- and the
+        # alternative is the bug. An `abort` that arrives one cycle after `go` is kept: `busy` is already 1.
         abort_level = Signal()
-        self.sync  += If(self.abort_req, abort_level.eq(1))
+        self.sync  += If(self.abort_req & self.bridge.busy, abort_level.eq(1))
         self.sync  += If(self.bridge.ack | self.bridge.err_lost | self.ulpi_clear.clear,
                          abort_level.eq(0))
         abort_usb = Signal()

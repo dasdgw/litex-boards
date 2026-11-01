@@ -242,7 +242,16 @@ class UlpiCsr(LiteXModule):
                              "stuck' does not need a power cycle. Caveat from the same clause: unless the "
                              "Link drives a TX CMD immediately after the turnaround the PHY may simply "
                              "re-assert dir -- this releases the bus and promises nothing more, which is "
-                             "why go waits for idle and counts the wait instead of erroring.")
+                             "why go waits for idle and counts the wait instead of erroring. "
+                             "IGNORED unless an access is in flight (ulpi_status.busy = 1), and silently: a "
+                             "Link abort ends a transaction and with none running there is nothing to "
+                             "release. That is a measured choice, not an oversight -- before it, an abort "
+                             "written on an idle link latched and aborted the NEXT access, so the innocent "
+                             "read after a stray ulpi_abort came back 00h with dir_abort+nxt_timeout "
+                             "(bug 4, bench/2026-11-01_ulpi_abort_idle/, proven red-before-green by "
+                             "extensions/usb/sim/ulpi_abort_idle_tb.v and kept red-able by tools/ulpi_mutate.py "
+                             "'s abort_idle mutation.")
+
         self.refused = CSRStatus(description="STICKY BIT, not a counter: once one ulpi_go has arrived "
                              "while an access was running this reads 1 and stays 1 until the bitstream "
                              "reloads. The bridge is single-outstanding on purpose, so a go cannot be "
