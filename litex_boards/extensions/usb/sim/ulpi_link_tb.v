@@ -153,7 +153,14 @@ module ulpi_link_tb;
     // pad *after* the host was told the access was dead? `dut_oe` is the TSTriple's own enable, so this is
     // the pad, not the FSM's opinion about it.
     reg watch_oe, drove_after_reset;
-    localparam P_READY = 0, P_PHY_RESET = 1, P_HUB_RELEASED = 2, P_HUB_ASSERTED = 3;
+    localparam P_READY = 0, P_PHY_RESET = 1, P_HUB_RELEASED = 2, P_HUB_ASSERTED = 3, P_CLK_OOB = 4;
+
+    // `P_CLK_OOB` = the meter says the clock is out of band while the domain is still being clocked. That is
+    // NOT a fiction invented to give `err_no_clock` a row: it is the one way this board loses its clock, and
+    // it was measured doing it (`bench/2026-11-01_access_without_clock/`: our 24 MHz off -> the PHY free-runs
+    // at ~29.45 MHz -> `probe_clk_ok`=0, `probe_fm_ulpi_value`=29413, and a RegRead still returns 0x24 with
+    // `err_no_clock` latched). 3 bits of `pre`, 5 used: a 6th still fits.
+
     localparam E_NONE = 0, E_TIMEOUT = 1, E_ABORT = 2, E_NO_CLOCK = 3, E_RESET = 4;
 
     reg [39:0] vecs [0:63];
@@ -198,7 +205,15 @@ module ulpi_link_tb;
                 // An access killed by a PHY reset never acks -- that is the design (the bridge reports it
                 // and drops busy). Sitting here for an ack that cannot come would report every reset vector
                 // as a hang and hide the one bug this row is looking for.
-                if (err_reset || err_no_clock) guard = ACCESS_BOUND;
+                //
+                // `err_no_clock` is NOT in this condition, and it used to be. That was the same fiction as
+                // `apply_pre`'s `clk_ok = 0`: it assumed a low clock meter means the far side never starts,
+                // so no ack can come. The board says an ack DOES come -- with the PHY free-running at
+                // ~29.45 MHz and `probe_clk_ok`=0, a RegRead returned `0x24` with `done`=1 and `busy`=0
+                // (`bench/2026-11-01_access_without_clock/`). Bailing here would have made `freerun_rd`
+                // report a hang on a link that answered, which is a false red of exactly the kind this suite
+                // is built to refuse; the row's own `exp_err` is what proves the meter was reported.
+                if (err_reset) guard = ACCESS_BOUND;
             end
             // Copy the result bundle **only when there is one**. `h_ack_data` is a wire that keeps the last
             // completed access's payload, so sampling it unconditionally makes an access that never finished
@@ -227,8 +242,20 @@ module ulpi_link_tb;
         begin
             phy_reset = 0; usb_clk_en = 1; clk_ok = 1; linestate = 2'b01;
             if (pre == P_PHY_RESET) begin
-                phy_reset = 1;  clk_ok = 0;      // no CLKOUT while the PHY is in reset -- see the vector
+                // **`clk_ok` stays 1 here, and that is a measurement, not an oversight.** Until ticket 09 this
+                // line read `phy_reset = 1; clk_ok = 0;` because AN19.17 §4.2 says asserting reset stops
+                // CLKOUT. It does not stop it on this part: with the pad at the level that makes the PHY
+                // ignore every command, `probe_fm_ulpi_value` reads 60000 exactly and `probe_clk_ok` reads 1,
+                // in every reading and in both polarity settings (`bench/2026-11-01_ulpi_rst_polarity/`), and
+                // `ulpi_cnt_no_clock` has read 0 on four spins. Driving it low here made `phyreset_rd` pass
+                // by *constructing* the failure it claimed to observe -- the model agreed with a board that
+                // was never asked. What really ends that access is our own `UlpiClear` + `bridge.err_lost`.
+                phy_reset = 1;  clk_ok = 1;
             end
+            // The clock-absent case, now on the side of the interface that can actually see it: `cd_usb`
+            // keeps running (a free-running PHY still clocks it) and only the METER says no. `usb_clk_en`
+            // deliberately stays 1 -- stopping it would test `reset_mid_noclk_rd`'s domain, not this one.
+            if (pre == P_CLK_OOB)   clk_ok = 0;
             // The two hub rows are the W11 pin, not a PHY register: what the Debug register reports is the
             // line state, which is the only way to see a hub reset work before enumeration.
             if (pre == P_HUB_RELEASED) linestate = 2'b01;
@@ -364,11 +391,19 @@ module ulpi_link_tb;
                 end else if (acc_rdata !== exp) begin
                     ok  = 0;
                     why = "byte mismatch";
-                end else if ((exp_err == E_ABORT) && !err_dir_abort) begin
+                end else if ((exp_err != E_NONE) && !(
+                        (exp_err == E_ABORT    && err_dir_abort)    ||
+                        (exp_err == E_TIMEOUT  && err_nxt_timeout)  ||
+                        (exp_err == E_NO_CLOCK && err_no_clock)     ||
+                        (exp_err == E_RESET    && err_reset))) begin
                     // A retry that worked still has to report the aborts: "passed after 3 aborts" and
-                    // "passed cleanly" are different facts (spec decision 12).
+                    // "passed cleanly" are different facts (spec decision 12). It was written for the abort
+                    // rows only (`exp_err == E_ABORT`) and is now any named error, because `freerun_rd` is a
+                    // row whose byte is RIGHT and whose whole content is the bit that must ride with it; a
+                    // check that only enforced the bit on rows with no byte would let that row pass on the
+                    // byte alone, which is the difference between "reported the clock" and "got an answer".
                     ok  = 0;
-                    why = "byte correct, abort not reported";
+                    why = "byte correct, the named error not reported";
                 end
             end
             if (ok) begin

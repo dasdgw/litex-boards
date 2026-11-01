@@ -208,8 +208,15 @@ module ulpi_phy_model #(
         set_id_regs;
     end
 
-    // A PHY reset is not our `clear`: it wipes the register table back to defaults, which is precisely why
-    // the reset-mid-transaction vector has to be followed by a fresh read to see anything at all.
+    // A PHY reset is NOT our `clear`. What it does here is drop the FSM and the bug-3 state; what it does
+    // NOT do any more is wipe the register table, because the board says the table survives the pad
+    // (`bench/2026-11-01_reset_array/`: `Scratch`=0xA5 written, pad driven high with the LOGICAL level held
+    // released so the death is the PHY's and not our `UlpiClear`'s, then 0xA5 read back with a clean `done`;
+    // reproduced with 0x5A). The python twin's `assert_reset` dropped the same line for the same reason --
+    // the two models have to be wrong or right together, and being wrong in the same direction as the board
+    // is the failure this pair exists to catch. POR values are still what a fresh model starts with, which is
+    // what the `fc_por`/`ic_por` rows are about. UNWITNESSED by any vector row: none writes, crosses a reset,
+    // and reads back. Ticket 10.
     always @(posedge clk or posedge phy_reset) begin
         if (phy_reset) begin
             phy_data <= 8'h00; phy_dir <= 1'b0; phy_nxt <= 1'b0;
@@ -219,7 +226,8 @@ module ulpi_phy_model #(
             // "wait 100 ms" does not cure it and row "PHY reset" does. Everything else in this list is a
             // register; this one is the reason the cure row reads the way it reads.
             unsolicited_tx <= 1'b0; unsolicited_byte <= 8'h00; nxt_window <= 1'b0; turn <= 1'b0;
-            set_id_regs;
+            // `set_id_regs` removed -- see the block comment. `regs` is written only by POR init and by an
+            // answered RegWrite, so the array now survives a pad pulse exactly as the silicon's does.
         end else begin
             // BEFORE the case, so a decode in the same cycle wins: `clr_seen` is asserted while the bus is
             // idle, and a row that then decodes a command must still be able to report it.
