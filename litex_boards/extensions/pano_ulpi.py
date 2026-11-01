@@ -420,6 +420,51 @@ class UlpiMaster(Module):
         # `stp` is a dedicated output and is deliberately NOT qualified by `dir`: §3.8.4.2 asks for it
         # precisely while the PHY is holding `dir`.
         drive_now = driving & ~self.clear & self.bus_grant
+
+        # ---- the idle level: bug 3, and the Link was the one holding it wrong -------------------------
+        # Everything above this line drives the data pad when it has a byte to say and TRI-STATES it when it
+        # has not. ULPI does not allow that. Table 1, on `data`: "Bi-directional data bus, **driven low by
+        # the Link during idle** ... The Link and PHY initiate data transfers by driving a non-zero pattern
+        # onto the data bus." §2.3.2 is stronger still: "the Link **continuously** drives the data bus to 00h
+        # during idle". And the PHY does that because a PHY has no view of the Link's output enable: it
+        # samples a level every cycle and decodes bits 7:6 as a command (USB3300 Table 6-4). USB3300 §6.1.5.1
+        # states the consequence of a floating bus in so many words -- "the Link must drive a ULPI Idle (00h)
+        # on the data bus **or the USB3300 may decode the bus value as a ULPI command**" -- and §6.1.5.2 names
+        # the exact cycle this block was missing: after a register read's turnaround, "the Link must drive a
+        # ULPI Idle command at T6".
+        #
+        # What that cost, measured: after a RegRead the pads kept the PHY's own answer and decayed through it
+        # for ~1 us = 60 interface cycles (`bench/2026-11-01_ulpi_t18_poison/`: `5a`, `52`, `50`,
+        # `40`, and every one of them is bits 7:6 = 01b = a USB Transmit). The PHY starts a transmit nobody
+        # asked for and thereafter treats a TXD CMD as payload, so the *next* access dies -- which is why
+        # `bench/2026-10-31_ulpi_t18_poison_sweep.tsv` is poisoned for exactly the 6 reads whose **byte** was
+        # a non-Idle TXD type and clean for exactly the 42 whose byte was `00b`. Not the address, the type:
+        # `0x04`/`0x05`/`0x06` all return `41`, and `0x16`..`0x18` all return the `5a` written earlier. A read
+        # is therefore only as safe as the byte it returns, and `idle_now` is what makes it safe at any byte.
+        #
+        # `~pads.dir` is §2.3.1's own suggestion ("the dir signal can be used to directly control the data
+        # output buffers of both PHY and Link"), and it is also what both prior references do: `ulpi_wrapper.v`
+        # `pads_data.oe.eq(~pads.dir)`, `UlpiCtrl.scala` `data.writeEnable := !direction`.
+        #
+        # The extra `~self.dir_in` buys back the ONE turnaround cycle. §2.3.1: "A change in dir causes a
+        # turnaround cycle on the bus during which, neither Link nor PHY can drive the bus. Data during the
+        # turnaround cycle is undefined and must be ignored by both Link and PHY", and our registered
+        # `dir_in` is exactly one interface cycle behind the pad, so this holds the idle drive off the pads
+        # for that cycle and returns it on the next -- which is USB3300 §6.1.5.2's T6, one cycle after the
+        # PHY drops `dir` at T5. Driving straight through the handover would not corrupt a byte (the level is
+        # 00h and the turnaround value is defined to be ignored), so this term is not a correctness
+        # requirement; it is what makes the pads match the sentence in the spec, and what keeps the
+        # one-cycle float that `ulpi_phy_model.v`'s `turn` and selfcheck SC3 model honest to the shape they
+        # were written from. Both prior references omit it, incidentally: they drive on `~dir` alone.
+        #
+        # CONSEQUENCE AT THE BENCH, to be read before anyone is surprised by it: `probe_oe` and
+        # `ulpi_scope_oe` now read **1 while the link is idle**, because holding the idle level *is* driving.
+        # Spin 1's notes describe `oe`=0 as "our host is silent", and that sentence is now false in a way no
+        # one asked for: silence means "driving 00h", and the only way to see a Link that is not driving at
+        # all is the level itself (`data` floating to 0xFF/whatever the pull does), not the enable. The
+        # `bus-fight` judgement in `tools/ulpi_probe.py::judge_framing` is unaffected -- it looks for `oe` and
+        # `dir` high *together*, which `~pads.dir` still makes impossible by construction.
+        idle_now = self.bus_grant & ~pads.dir & ~self.dir_in
         # TWO command bytes, because there are two moments a command is issued and they do not have the same
         # information available:
         #   `cmd_new` at accept, from the request itself -- `rw_r`/`addr_r` are assigned on that very edge,
@@ -432,7 +477,7 @@ class UlpiMaster(Module):
         self.comb += [
             cmd_new.eq(Mux(self.rw, CMD_REG_READ | self.addr, CMD_REG_WRITE | self.addr)),
             cmd_r.eq(Mux(rw_r, CMD_REG_READ | addr_r, CMD_REG_WRITE | addr_r)),
-            self.tri.oe.eq(self.phy_reset | (drive_now & ~pads.dir)),
+            self.tri.oe.eq(self.phy_reset | (drive_now & ~pads.dir) | idle_now),
             self.tri.o.eq(Mux(drive_now & ~self.phy_reset, tx_byte, 0)),
             # `stp` is a separate pad, not part of the tri-state, and it is qualified by `~clear` for the
             # same reason the data pad is: the ULPI idle level is `stp` low with `data` at 00h, and that is

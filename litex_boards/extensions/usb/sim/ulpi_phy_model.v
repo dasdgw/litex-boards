@@ -17,7 +17,13 @@
 module ulpi_phy_model #(
     // Set to 1 to have the model print what it decodes. Off by default: the TB diffs outcomes, and a
     // chatty model turns a 200-line failure into a 4 000-line one.
-    parameter DEBUG = 0
+    parameter DEBUG = 0,
+    // The `nxt` offer period of a USB3300 sitting in a USB Transmit it was never asked for: one cycle high
+    // every **40** cycles of the 60 MHz interface, measured as 666.6 ns on this board and this PHY
+    // (`bench/2026-10-31_t18_after_scratchread_00.vcd`, and the same cadence in
+    // `bench/2026-10-31_t18_fresh_16.vcd`). A named parameter because a magic 40 in a comparison is the kind
+    // of number a later reader assumes was invented, and it was not.
+    parameter integer TX_NXT_PERIOD = 40
 ) (
     input  wire       clk,          // 60 MHz, the same clock the Link is running on
     input  wire       phy_reset,    // the reset pin, active high (our `phy_reset` CSR level)
@@ -27,6 +33,10 @@ module ulpi_phy_model #(
     // quietly win the bus, it fails the byte check.
     input  wire [7:0] link_data,
     input  wire       link_oe,
+    // The resolved data NET, as the PHY's input receiver actually sees it (the TB's wired tri-state). It is
+    // a separate port from `link_data`/`link_oe` for one reason: **a PHY has no view of the Link's output
+    // enable.** It samples a level every cycle, whatever produced it. See `rx_r` below.
+    input  wire [7:0] bus,
     output reg  [7:0] phy_data,
     output reg        phy_dir,
     output reg        phy_nxt,
@@ -45,6 +55,15 @@ module ulpi_phy_model #(
     input wire       knop_wrong_cmd,     // only respond to the wrong TX CMD encoding (0xE3)
     input wire       knop_rev_bus,       // drive read data bit-reversed: the wiring-swap fingerprint
     input wire       knop_ignore_write,  // answer reads, swallow writes (a stuck write path)
+    // One-cycle "forget what the last row made me see". The TB used to compare `seen_cmd` across a whole
+    // file without clearing it, so **a row whose PHY decoded nothing at all passed on the previous row's
+    // command** -- and a wrong-command bug on a reset row could, and would, pass. Recorded in this repo as
+    // `TB_HOLE` (handoff 2026-10-31, unfixed there); cleared per row here.
+    input wire       clr_seen,
+    // 1 = this PHY ignores a level left on the bus with nobody driving it, i.e. it is the permissive model
+    // this file was before bug 3. 0 (the default, wired so by the TB) = it decodes what it samples.
+    // The whole of bug 3 is the difference between those two sentences.
+    input wire       knop_ignore_float,
 
     // The two line-state receivers, so the Link can read them back out of the Debug register the way the
     // bench does with a hub reset on the other pin. `01` = SE0/DP-low, which is what "nothing plugged in"
@@ -58,7 +77,14 @@ module ulpi_phy_model #(
     output reg        saw_stp,           // a 1-cycle stp was observed after the data byte
     output reg  [3:0] abort_count,       // dir aborts this model has issued
     output reg        cmd_is_write,      // decoding of seen_cmd
-    output reg        nxt_cycles_too_long// model's own violation detector, see the nxt throttle note
+    output reg        nxt_cycles_too_long,// model's own violation detector, see the nxt throttle note
+    // Bug 3's witness: the PHY entered a USB Transmit it was never asked for, because of the LEVEL the Link
+    // left on the data bus, and `how` says which level. Named rather than folded into `state` because a
+    // vector that only says "the next access died" sends the engineer to the choreography, and the fault is
+    // on the pads.
+    output reg        unsolicited_tx,
+    output reg        unsolicited_cmd,   // a RegRead/RegWrite decoded while `link_oe` was low
+    output reg [7:0]  unsolicited_byte
 );
 
     // The register table. Only the four ID registers and the handful the vectors write are meaningful;
@@ -80,10 +106,37 @@ module ulpi_phy_model #(
                S_RD_DIR  = 4'd5,   // announcing: dir up this cycle
                S_RD_DATA = 4'd6,   // driving the byte, one cycle
                S_RD_END  = 4'd7,   // releasing it: the cycle that bites a Link with a registered `dir`
-               S_ABORT   = 4'd8;   // dir held; released on stp, or on the model's own bound
+               S_ABORT   = 4'd8,   // dir held; released on stp, or on the model's own bound
+               // ---- bug 3: the state a floating data bus puts a real PHY into -------------------------
+               // ULPI 1.1 Table 1: the data bus is "driven low by the Link during idle", and "the Link and
+               // PHY initiate data transfers by driving a non-zero pattern onto the data bus". §2.3.2 is
+               // stronger: "the Link CONTINUOUSLY drives the data bus to 00h during idle". USB3300 §6.1.5.1
+               // spells out the consequence of not doing it -- "the Link must drive a ULPI Idle (00h) on the
+               // data bus **or the USB3300 may decode the bus value as a ULPI command**" -- and §6.1.5.2
+               // names the exact cycle our Link was missing: after a register READ's turnaround, "the Link
+               // must drive a ULPI Idle command at T6". Our Link tri-states the pads instead, so after a
+               // read the PHY's OWN answer stays on the pads and is decoded as if the Link had driven it.
+               // Measured on this board: `bench/2026-10-31_t18_fresh_16.transitions.csv` holds `5a` there and
+               // lets it decay `52 -> 50 -> 40 -> 0` over ~1.17 us = **60-70 interface cycles**, and every
+               // one of those values has bits 7:6 = 01b, a **USB Transmit** (USB3300 Table 6-4). From then on
+               // the PHY is fetching packet bytes and ignores every TXD CMD, which is
+               // `bench/2026-10-31_ulpi_t18_poison_sweep.tsv` read properly: poisoned for exactly the 6 rows
+               // whose BYTE was a non-Idle TXD type, clean for exactly the 42 whose byte was the Idle
+               // command. A byte's address explains nothing; a byte's TYPE explains all 48 rows.
+               S_TX      = 4'd9;   // unsolicited USB Transmit; see the state body
 
     reg [3:0]  state;
     reg [7:0]  byte_r;
+    reg [7:0]  rx_r;        // the PHY's receiver: the last level actually driven onto the net
+    reg [7:0]  tx_tick;     // Tx-mode throttle bookkeeping, see S_TX
+    reg        nxt_window;  // §6.1.7's END window: the cycle after a Tx-mode `nxt` offer
+    // ULPI 1.1 §2.3.1: "A change in dir causes a turnaround cycle on the bus during which, neither Link nor
+    // PHY can drive the bus. Data during the turnaround cycle is undefined and must be ignored by both Link
+    // and PHY." One cycle, armed whenever this model lets go of the bus. WITHOUT it the model would decode
+    // the PHY's own byte during the very cycle it is handing the bus back, and would then poison a Link that
+    // has already started driving 00h -- a model bug that looks exactly like the board's bug 3 and would
+    // have made the fix look wrong. The bug is the LONG float afterwards (measured 60 cycles), not this one.
+    reg        turn;
     reg [5:0]  addr;
     reg        is_write;
     reg [7:0]  nxt_hold;      // cycles nxt has been up: the throttle bookkeeping
@@ -120,13 +173,38 @@ module ulpi_phy_model #(
     reg phy_oe_r;   // registered beside phy_data, never decoded from `state`
     assign phy_oe = phy_oe_r;
 
+    // The receiver, and the retention. When neither side drives, a real CMOS net KEEPS its last level for a
+    // long time (measured: 70 interface cycles above), so `rx_r` holds. Holding it FOREVER is the harsher
+    // bound than the measured decay, and the harsher bound is the one that cannot flatter a bad Link: a
+    // Link that drives 00h makes `rx_r` 00h one cycle after it takes the bus, whatever the board's
+    // capacitance does afterwards.
+    always @(posedge clk or posedge phy_reset) begin
+        if (phy_reset)          rx_r <= 8'h00;
+        else if (!$isunknown(bus)) rx_r <= bus;
+    end
+
+    // **Combinational**, with the retention behind it, and the reason is an off-by-one that would otherwise
+    // hide the entire bug: the PHY samples its receiver at the rising edge, so what it decides in cycle C is
+    // the level that was on the pads *during* C. Reading the registered `rx_r` inside the clocked block
+    // reads the level of cycle C-1, which is the cycle the PHY was still driving itself -- so a Link that
+    // takes the bus and drives 00h one cycle after `dir` falls (exactly what USB3300 §6.1.5.2's T6 asks
+    // for) would still be decoded as the PHY's own previous byte. `rx_now` is what the pad presents.
+    wire [7:0] rx_now = $isunknown(bus) ? rx_r : bus;
+
     initial begin
-        byte_r = 8'h00; phy_oe_r = 1'b0;
+        byte_r = 8'h00; phy_oe_r = 1'b0; rx_r = 8'h00; tx_tick = 8'h00;
         phy_data = 8'h00; phy_dir = 1'b0; phy_nxt = 1'b0;
         state = S_IDLE; addr = 6'h00; is_write = 1'b0;
         seen_cmd = 8'h00; seen_wdata = 8'h00; saw_stp = 1'b0; abort_count = 4'd0;
         cmd_is_write = 1'b0; nxt_cycles_too_long = 1'b0;
         nxt_hold = 0; abort_hold = 0;
+        // Every new receiver state, initialised, because `!turn` with `turn` unknown is unknown and an
+        // unknown in the decode condition is not "false": iverilog takes neither branch, and the observable
+        // symptom was this model refusing to decode ANY command (33/33 rows failing with `phycmd=00`, while
+        // the same file passed a minute earlier). A state register added to a model without an initial value
+        // does not fail loudly; it silently deletes the model's behaviour.
+        unsolicited_tx = 1'b0; unsolicited_cmd = 1'b0; unsolicited_byte = 8'h00;
+        nxt_window = 1'b0; turn = 1'b0;
         set_id_regs;
     end
 
@@ -137,29 +215,63 @@ module ulpi_phy_model #(
             phy_data <= 8'h00; phy_dir <= 1'b0; phy_nxt <= 1'b0;
             state    <= S_IDLE;
             nxt_hold <= 0; abort_hold <= 0;
+            // Bug 3's state dies here and nowhere else, and that IS the bench result: `diag_cure.py` row
+            // "wait 100 ms" does not cure it and row "PHY reset" does. Everything else in this list is a
+            // register; this one is the reason the cure row reads the way it reads.
+            unsolicited_tx <= 1'b0; unsolicited_byte <= 8'h00; nxt_window <= 1'b0; turn <= 1'b0;
             set_id_regs;
         end else begin
+            // BEFORE the case, so a decode in the same cycle wins: `clr_seen` is asserted while the bus is
+            // idle, and a row that then decodes a command must still be able to report it.
+            if (clr_seen) begin
+                seen_cmd <= 8'h00; seen_wdata <= 8'h00; saw_stp <= 1'b0;
+                unsolicited_cmd <= 1'b0;
+            end
 
             case (state)
                 S_IDLE: begin
                     phy_nxt  <= 1'b0;
                     phy_dir  <= 1'b0;
                     phy_data <= 8'h00;
-                    // A command is a byte the Link newly drives whose 7:6 is a TX CMD. Sampling the bus
-                    // rather than trusting an "is this a command" hint is the PHY's job, and it is why the
-                    // model can catch a master that sends a *packet* command by mistake: 0x40|PID decodes
-                    // here as a packet, which this model ignores, and the vector fails.
-                    if (link_oe && ((link_data[7:6] == 2'b10) || (link_data[7:6] == 2'b11))) begin
-                        seen_cmd     <= link_data;
-                        cmd_is_write <= (link_data[7:6] == 2'b10);
-                        addr         <= link_data[5:0];
-                        is_write     <= (link_data[7:6] == 2'b10);
+                    if (turn) turn <= 1'b0;          // §2.3.1: the hand-back cycle is not a command
+                    // ---- bug 3, the entry, and the reason this model used to be blind ---------------------
+                    // A real PHY has no view of the Link's output enable; it samples a LEVEL and decodes
+                    // bits 7:6 (USB3300 Table 6-4). So a Link that tri-states the pads after driving them does
+                    // not present "nothing" -- it presents the last byte, held. ULPI 1.1 §2.3.2: "the Link
+                    // continuously drives the data bus to 00h during idle". USB3300 §6.1.5.1: "the Link must
+                    // drive a ULPI Idle (00h) on the data bus OR THE USB3300 MAY DECODE THE BUS VALUE AS A
+                    // ULPI COMMAND". Decoding `link_oe && link_data` instead -- which is what this model did,
+                    // and what every offline check in this repo was built on -- builds a PHY that is
+                    // physically incapable of the failure the board shows: 33/33 passed a Link that had never
+                    // driven an idle level in its life.
+                    //
+                    // `unsolicited_tx` is deliberately NOT cleared by `clr_seen`: it is the state the next row
+                    // inherits, and a per-row clear would erase the only witness of a fault whose entire
+                    // symptom is that it appears one access later.
+                    if (!knop_ignore_float && !turn && (rx_now[7:6] == 2'b01)) begin
+                        state                <= S_TX;
+                        tx_tick              <= 8'd0;
+                        nxt_window           <= 1'b0;
+                        if (!unsolicited_tx) unsolicited_byte <= rx_now;
+                        unsolicited_tx       <= 1'b1;
+                    // A command is a byte whose 7:6 is a TX CMD, taken off the pads. Sampling the bus rather
+                    // than trusting an "is this a command" hint is the PHY's job, and it is why the model can
+                    // catch a master that sends a *packet* command by mistake: 0x40|PID decodes here as a
+                    // packet, which this model ignores, and the vector fails.
+                    end else if (!turn && ((rx_now[7:6] == 2'b10) || (rx_now[7:6] == 2'b11))) begin
+                        seen_cmd     <= rx_now;
+                        cmd_is_write <= (rx_now[7:6] == 2'b10);
+                        addr         <= rx_now[5:0];
+                        is_write     <= (rx_now[7:6] == 2'b10);
+                        // The witness this row exists for: a command decoded from a level the Link was NOT
+                        // driving. On a Link that holds 00h it can only ever be a real command.
+                        if (!link_oe) unsolicited_cmd <= 1'b1;
                         if (knop_wrong_cmd) begin
                             // The `cmd_wrong` vector: the Link must not accept 0xE3 as a valid encoding,
                             // so this model pretends 0xE3 is the only thing worth acknowledging. Passing
                             // this vector the way a naive master would (by retrying forever) is what the
                             // timeout bound is for.
-                            if (link_data == 8'hE3) begin
+                            if (rx_now == 8'hE3) begin
                                 state    <= S_NXT;
                                 nxt_hold <= 0;
                             end
@@ -229,7 +341,7 @@ module ulpi_phy_model #(
                     // drop nxt for C3. A Link that answers a cycle late latches its own TX CMD here, which
                     // is precisely what the silicon did (`0x96` stored for a write of `0x3c`); a model that
                     // stores the intended value instead is a model that hides the bug.
-                    seen_wdata <= link_data;
+                    seen_wdata <= rx_now;
                     phy_nxt    <= 1'b0;
                     nxt_hold   <= 8'd0;
                     state      <= S_WSTP;
@@ -281,7 +393,50 @@ module ulpi_phy_model #(
                     phy_dir   <= 1'b0;
                     phy_data  <= 8'h00;
                     phy_oe_r  <= 1'b0;
+                    turn      <= 1'b1;               // the Link gets this cycle to take the bus (§6.1.5.2 T6)
                     state     <= S_IDLE;
+                end
+
+                // ---- bug 3: the unsolicited USB Transmit ----------------------------------------------
+                // Entered from a LEVEL, not from a command: the PHY believes the Link is streaming a packet
+                // at it (Table 6-4, 01b). Consequences, all of them the measured bench symptom:
+                //   * a level on the pads is now DATA, so the next RegRead's TXD CMD is payload and is never
+                //     answered -- "succeeded and leaves the interface unable to answer the next access";
+                //   * the throttle is the transmit throttle, and on this PHY the offer is one `nxt` cycle
+                //     every 40 (`bench/2026-10-31_t18_after_scratchread_00.vcd`: 666.6 ns = 40 x 16.667 ns),
+                //     which is why a `RD_CMD` that waits on `nxt` advances and then hangs waiting for a `dir`
+                //     that cannot come;
+                //   * the only way out is the END marker IN A TRANSMIT CONTEXT, USB3300 §6.1.7: "The USB
+                //     Transmit ends when the Link asserts STP while NXT is asserted. (Note that the Link
+                //     cannot assert STP with NXT de-asserted since the USB3300 is expecting to fetch another
+                //     byte from the Link in this state.)" It explains the half of
+                //     `bench/2026-11-01_ulpi_t18_poison/cure_stdout.txt` that says a bare `stp` does NOT cure
+                //     it, and it is *a* mechanism for the other half (the RegWrite's END marker landing in the
+                //     window) rather than a measured match: §3.8.1's "a transmit ends when the Link stops
+                //     driving" explains that row just as well, and nothing here tells them apart. Recorded
+                //     because the difference matters to whoever reuses this model, not to the fix — driving the
+                //     idle level means there is no unsolicited transmit left to cure. What no reading supports
+                //     is what a model that exited on ANY `stp` would have prescribed: the abort path.
+                // The window is the cycle AFTER an offer, because that is the cycle in which a Link that
+                // *reacts* to `nxt` can have driven `stp`; it is one cycle wide out of forty, so an
+                // out-of-context `stp` is 1-in-40 likely to land in it by luck. That co-incidence is a fact
+                // about the model and is written here rather than hidden in the comparison.
+                S_TX: begin
+                    phy_dir  <= 1'b0;
+                    phy_data <= 8'h00;
+                    phy_oe_r <= 1'b0;              // the PHY is a receiver now: it does not own the pads
+                    nxt_window <= (phy_nxt == 1'b1);
+                    if (tx_tick >= TX_NXT_PERIOD - 8'd1) begin
+                        phy_nxt <= 1'b1;           // the offer: one cycle, once every TX_NXT_PERIOD
+                        tx_tick <= 8'd0;
+                    end else begin
+                        phy_nxt <= 1'b0;
+                        tx_tick <= tx_tick + 8'd1;
+                    end
+                    if (phy_stp && nxt_window) begin
+                        state <= S_IDLE;
+                        tx_tick <= 8'd0;
+                    end
                 end
 
                 // ---- §3.8.4.2: PHY-initiated disconnect ---------------------------------------------
@@ -294,9 +449,11 @@ module ulpi_phy_model #(
                     phy_data <= 8'h00;
                     if (phy_stp) begin
                         phy_dir <= 1'b0;
+                        turn    <= 1'b1;
                         state   <= S_IDLE;
                     end else if (abort_hold == 8'd0) begin
                         phy_dir <= 1'b0;
+                        turn    <= 1'b1;
                         state   <= S_IDLE;
                     end else begin
                         abort_hold <= abort_hold - 8'd1;

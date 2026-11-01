@@ -83,11 +83,17 @@ module ulpi_link_tb;
     );
 
     initial begin watch_oe = 1'b0; drove_after_reset = 1'b0; end
-    always @(posedge sys_clk) if (watch_oe && (|dut_oe)) drove_after_reset = 1'b1;
+    // **A NONZERO pattern**, not merely `oe`. Re-derived 2026-11-01 when the Link began driving the ULPI idle
+    // level (bug 3): `oe` high with `data`=00h is what ULPI 1.1 §2.3.2 *requires* of a Link that owns the bus,
+    // so watching the enable alone would now fail the row for obeying the spec. What the row is for is the
+    // command byte surviving on the pads into a transaction the host was told is dead -- a nonzero pattern --
+    // and `tools/ulpi_mutate.py no_relock_tail` still reddens exactly that.
+    always @(posedge sys_clk) if (watch_oe && dut_oe[0] && (dut_o != 8'h00)) drove_after_reset = 1'b1;
 
     // ---------------------------------------------------------------------------------------------
     // The model, and the knobs the vector's `fault` column turns.
     // ---------------------------------------------------------------------------------------------
+    reg         clr_seen = 0;
     reg         knop_stall_nxt = 0, knop_wrong_cmd = 0, knop_rev_bus = 0, knop_ignore_write = 0;
     reg  [ 3:0] knop_abort_n = 0;
     reg         knop_abort_forever = 0;
@@ -102,16 +108,27 @@ module ulpi_link_tb;
     ulpi_phy_model phy (
         .clk(usb_clk), .phy_reset(phy_reset),
         .link_data(dut_o), .link_oe(dut_oe[0]),
+        // The resolved net, which is the only thing a real PHY's data receiver has. Wiring the model to
+        // `dut_o`/`dut_oe` alone is what let this suite report 33/33 green against a Link that tri-states the
+        // bus and leaves the PHY's own answer for the PHY to decode as a command (bug 3, 2026-11-01).
+        .bus(ulpi_data),
+        .knop_ignore_float(1'b0),      // this PHY decodes what it samples; the board does, so the model must
         .phy_data(phy_data), .phy_dir(phy_dir), .phy_nxt(phy_nxt), .phy_stp(dut_stp),
         .phy_oe(phy_oe),
         .knop_stall_nxt(knop_stall_nxt), .knop_abort_n(knop_abort_n),
         .knop_abort_forever(knop_abort_forever), .knop_wrong_cmd(knop_wrong_cmd),
         .knop_rev_bus(knop_rev_bus), .knop_ignore_write(knop_ignore_write),
+        .clr_seen(clr_seen),
         .linestate(linestate),
         .seen_cmd(seen_cmd), .seen_wdata(seen_wdata), .saw_stp(saw_stp),
         .abort_count(abort_count), .cmd_is_write(cmd_is_write),
-        .nxt_cycles_too_long(nxt_cycles_too_long)
+        .nxt_cycles_too_long(nxt_cycles_too_long),
+        .unsolicited_tx(unsolicited_tx), .unsolicited_cmd(unsolicited_cmd),
+        .unsolicited_byte(unsolicited_byte)
     );
+
+    wire unsolicited_tx, unsolicited_cmd;
+    wire [7:0] unsolicited_byte;
 
     // Two continuous drivers on one net, which Verilog resolves. When both drive different values the
     // result is x -- and that is the outcome a check must never be able to mistake for 0x24.
@@ -230,6 +247,18 @@ module ulpi_link_tb;
         end
     endtask
 
+    // TB_HOLE, closed. `seen_cmd`/`seen_wdata`/`saw_stp` are the PHY's memory of the *file*, and the file is
+    // run down one shared model, so a row that decodes nothing used to inherit the previous row's command and
+    // PASS on it. Pulse the model's clear on an idle bus before every row. One `usb_clk`, not one `sys_clk`:
+    // the model is clocked by the PHY domain and a sys-domain pulse is 0.8 of a usb cycle, which is exactly
+    // the kind of thing that works until it does not.
+    task automatic clear_witnesses;
+        begin
+            @(posedge usb_clk); clr_seen = 1'b1;
+            @(posedge usb_clk); clr_seen = 1'b0;
+        end
+    endtask
+
     task automatic apply_fault(input [3:0] fault);
         begin
             knop_stall_nxt = 0; knop_wrong_cmd = 0; knop_rev_bus = 0; knop_ignore_write = 0;
@@ -329,6 +358,9 @@ module ulpi_link_tb;
                 if (!acc_ok) begin
                     ok  = 0;
                     why = "no ack inside the bound (hung, or died for a reason the row did not name)";
+                    // `ustx`/`ubyte` on the RESULT line carries it, not this string: `why` is a fixed-width
+                    // reg and a long sentence here silently truncates the reason the row exists.
+                    
                 end else if (acc_rdata !== exp) begin
                     ok  = 0;
                     why = "byte mismatch";
@@ -348,6 +380,9 @@ module ulpi_link_tb;
                 $display("RESULT %0d PASS rdata=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d",
                          n, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy,
                          acc_waited, acc_retry, state);
+            if (unsolicited_tx)
+                $display("     WITNESS row %0d: unsolicited USB Transmit, decoded %h off the pads (bug 3)",
+                         n, unsolicited_byte);
             end else begin
                 fail_n = fail_n + 1;
                 // One line, one format string, no concatenation: `check_row` is the only place a verdict is
@@ -409,6 +444,7 @@ module ulpi_link_tb;
 
             apply_pre(pre);
             apply_fault(fault);
+            clear_witnesses();          // TB_HOLE: a row may not pass on the previous row's decode
 
             // Two rows have no encoding to check: a PHY held in reset decodes nothing, and the reset-mid row
             // decodes a command whose transaction is then destroyed, so its `seen_cmd` belongs to an access
@@ -430,10 +466,25 @@ module ulpi_link_tb;
                         // Freeze it *while it is driving*, not N cycles into the access: a register read is
                         // over in five cd_usb cycles, so a counted delay freezes whatever happens to be
                         // there -- which is what this row originally did, freezing an idle master and
-                        // passing for the wrong reason. `wait (|dut_oe)` is event-driven: it fires in the
+                        // passing for the wrong reason. The wait is event-driven: it fires in the
                         // delta where the pad enable rises, which is by construction the cycle the master
                         // holds the command byte, and `driving` is therefore 1 when the clock stops.
-                        wait (|dut_oe);
+                        // **`oe` AND a nonzero byte**, not `oe` alone, and bug 3 is why: since the Link
+                        // drives the ULPI idle level whenever it owns the bus (ULPI 1.1 2.3.2, `idle_now`
+                        // in pano_ulpi.py), `|dut_oe` is true in EVERY idle cycle, so the original trigger
+                        // froze the clock the moment the master got the bus -- with the command not yet on
+                        // the pads, and the row silently measuring an idle master. `tools/ulpi_mutate.py
+                        // no_relock_tail` went BLIND exactly that way, and this is the general lesson:
+                        // once `oe` is a level and not an event, every trigger written as "the enable rose"
+                        // has to be re-read. A pattern is the event.
+                        //
+                        // And a comment warning nobody to read, in this file, by me, on the day this broke:
+                        // the first edit here replaced the `wait` line with this commentary and left NO wait
+                        // statement behind, so the clock froze the instant the fork started, with the master
+                        // still in IDLE. The symptom was not an error; it was `no_relock_tail` going BLIND and
+                        // the row still PASSING. A fork branch that does nothing looks exactly like a row
+                        // whose mechanism held.
+                        wait (dut_oe[0] && (dut_o != 8'h00));
                         usb_clk_en = 1'b0;                   // C12 dies underneath the transaction
                         repeat (60) @(posedge sys_clk);      // cd_sys counts; cd_usb is frozen mid-byte
                         phy_reset = 1'b1;                    // the operator's recovery, per the failure tree
@@ -470,13 +521,21 @@ module ulpi_link_tb;
             end else begin
                 do_access(op, addr, wdata);
                 // Remember what the PHY decoded for *this* access: the read-back below overwrites `seen_cmd`.
-                check_cmd = 1'b1; exp_cmd = op ? (`ULPI_BYTE_RD | addr) : (`ULPI_BYTE_WR | addr);
+                // **`(pre != P_PHY_RESET)` and not `1'b1`**, which is a bug this file had since it was
+                // written and which only became visible when `clr_seen` started clearing the witnesses per
+                // row: a PHY held in reset decodes NOTHING, so the main loop had already decided this row
+                // has no encoding to check -- and this line overrode that. It passed anyway, on the
+                // previous row's `seen_cmd`, which is precisely the hole (`TB_HOLE`) the clear closes. Two
+                // blind spots were covering for each other, and the second one only showed up when the
+                // first was fixed.
+                check_cmd = (pre != P_PHY_RESET); exp_cmd = op ? (`ULPI_BYTE_RD | addr)
+                                                              : (`ULPI_BYTE_WR | addr);
                 if (!op) begin
                     // A write vector's `exp` is the read-back, per the TSV's column definition: a write that
                     // "succeeded" without changing the register is the failure the row exists for, and only
                     // a read can tell.
                     do_access(1'b1, addr, 8'h00);
-                    check_cmd = 1'b1; exp_cmd = `ULPI_BYTE_RD | addr;
+                    check_cmd = (pre != P_PHY_RESET); exp_cmd = `ULPI_BYTE_RD | addr;
                 end
             end
 
