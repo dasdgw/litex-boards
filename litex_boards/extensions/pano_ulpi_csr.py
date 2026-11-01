@@ -15,6 +15,13 @@ which is the wrong thing to spend a simulation on, and the wrong thing to have t
 reaches the same two domains by Wishbone. So: ``pano_ulpi`` owns the Link, this file owns the register
 map, and the target owns wiring the two to a board.
 
+That split had a cost, found on 2026-11-01: the Link had a simulator and the register map had **none**, so the
+rules that decide whether a bench reading is trustworthy -- ``go`` is an edge, a ``go`` against a busy link is
+dropped and witnessed, ``rdata`` moves only on the ack -- had only ever been read, never executed. Hence
+:class:`UlpiCsrRules`: those rules are a plain-Signal ``Module``, simulated against their generated netlist by
+``tools/ulpi_csr_rules_sim.py`` (docs repo), and ``UlpiCsr`` is what is left -- names, descriptions, and
+``.storage``/``.status`` plumbing that cannot fail interestingly.
+
 The map, and why it looks like this
 -----------------------------------
 
@@ -71,12 +78,103 @@ from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 
 from litex_boards.extensions.pano_ulpi import UlpiLink, ack_unpack
 
-__all__ = ["UlpiCsr"]
+__all__ = ["UlpiCsr", "UlpiCsrRules", "ACK_WIDTH"]
+
+# The width of the Link's ack payload, in one place. `ack_unpack` slices `sig[26:30]`, so a rules module
+# that declared a 16-bit `h_ack_data` would still *work* for `rdata` and silently truncate `bus_waited`/
+# `retry`; the sim top and `tools/test_ulpi_csr_rules.py` both compare this number against the real
+# `link.h_ack_data`, so the disagreement is a red check instead of a bench mystery.
+ACK_WIDTH = 30
 
 
 def _edge(prev, cur):
     """One cycle, on the 0->1 transition of a CSR-held level."""
     return cur & ~prev
+
+
+class UlpiCsrRules(Module):
+    """Every *rule* of the ``ulpi_*`` map, with no CSR object anywhere in it.
+
+    Why a module and not ten lines inside :class:`UlpiCsr`: those ten lines are the whole interface
+    contract of the instrument -- ``go`` is an edge and not a level, a ``go`` against a busy link is dropped
+    and witnessed, ``rdata`` moves only on the ack -- and until now not one of them had ever been executed.
+    `tools/ulpi_rtl_sim.py` stops at ``UlpiLink`` on purpose (a Link sim that also needed a CSR model would
+    be testing LiteX's `CSRStorage` instead of our choreography), so the rules were proven by reading them.
+    That is how this repo has already been wrong twice: a `MultiReg(i, Signal(2))` that was a two-bit net
+    and not a synchroniser, and a `dst_req` whose only release was `dst_ack` (`docs/STATUS.md` 2026-10-31).
+    Both were readable and both were wrong.
+
+    The seam is plain Signals, which is what makes it simulatable: the inputs are what a CSR *holds*
+    (`go`/`abort`/`cmd`/`addr`/`wdata`) plus the Link's own ``cd_sys`` host side (`h_busy`/`h_ack`/
+    `h_ack_data`), and the outputs are what the Link receives and the host reads back. `UlpiCsr` therefore
+    keeps only plumbing, and the drift guard (`tools/test_ulpi_csr_rules.py`) is what keeps the fake honest:
+    it builds a real `UlpiLink` and refuses a build in which a name the rules are wired to has disappeared
+    or changed width.
+
+    Three behaviours it owns, each with a bench reason:
+
+    * **edge, not level.** Over a ~20 ms/transaction remote channel a host that timed out and retried its
+      write must not start a second transaction, so ``go`` triggers on 0->1 of the *stored bit*. Rewriting
+      1 is not an access; 0 then 1 is (the harness's documented way to force one).
+    * **a dropped ``go`` is counted.** `h_req` carries `~h_busy` twice over (here, and again inside
+      `UlpiLink`, whose bridge is single-outstanding by decision 10). Repeating the guard here is not
+      defensive coding, it is the only place the event can be *witnessed* rather than lost -- and an
+      uncounted drop leaves the status word describing the previous access, which reads as a fresh success.
+      `refused` is a **sticky bit, not a counter**: nothing clears it until the bitstream reloads, so its
+      meaning is "at least one ``go`` was dropped since boot", which is exactly what acceptance row A0 asks
+      and what per-phase accounting must come from `ulpi_cnt_*` instead.
+    * **``rdata`` on the ack, and nowhere else** (spec testing decision 8). It is a register, not a wire, so
+      a host reading it while ``done`` = 0 gets the previous byte and the ``done`` bit says so. A combinational
+      `rdata` would make ``done`` decorative.
+    """
+    def __init__(self):
+        # --- in: what the host wrote, as levels held by the CSR block ----------------------------------
+        self.go    = Signal()
+        # `abort_in`, not `abort`: a Verilated C++ model cannot have a port called `abort` (libc), which is
+        # the same reason `UlpiMaster` names its input `abort_req`. The CSR behind it stays `ulpi_abort`.
+        self.abort_in = Signal()
+        self.cmd   = Signal()
+        self.addr  = Signal(6)
+        self.wdata = Signal(8)
+        # --- in: the Link's cd_sys host side -------------------------------------------------------------
+        self.h_busy     = Signal()
+        self.h_ack      = Signal()
+        self.h_ack_data = Signal(ACK_WIDTH)
+        # --- out: what the Link receives ------------------------------------------------------------------
+        self.h_req     = Signal()
+        self.h_rw      = Signal()
+        self.h_addr    = Signal(6)
+        self.h_wdata   = Signal(8)
+        self.abort_req = Signal()
+        # --- out: what the host reads back -----------------------------------------------------------------
+        self.rdata   = Signal(8)
+        self.refused = Signal()
+
+        go_edge, abort_edge = Signal(), Signal()
+        prev_go, prev_abort = Signal(), Signal()
+        self.sync += [
+            prev_go.eq(self.go),
+            prev_abort.eq(self.abort_in),
+        ]
+        self.comb += [
+            go_edge.eq(_edge(prev_go, self.go)),
+            abort_edge.eq(_edge(prev_abort, self.abort_in)),
+        ]
+        # `h_req` is one cycle in cd_sys and the bridge ignores it while busy -- so "while busy" here is
+        # the bridge's own guard, restated only so it can be *counted* rather than lost.
+        self.comb += self.h_req.eq(go_edge & ~self.h_busy)
+        self.sync += If(go_edge & self.h_busy, self.refused.eq(1))
+        self.comb += [
+            self.h_rw.eq(self.cmd),
+            self.h_addr.eq(self.addr),
+            self.h_wdata.eq(self.wdata),
+            self.abort_req.eq(abort_edge),
+        ]
+
+        # The result bundle is copied on the ack and nowhere else. `a` is the field view of the Link's own
+        # `ack_unpack`, so a field offset cannot disagree with the Link that produced the payload.
+        a = ack_unpack(self.h_ack_data)
+        self.sync += If(self.h_ack, self.rdata.eq(a["rdata"]))
 
 
 class UlpiCsr(LiteXModule):
@@ -127,7 +225,7 @@ class UlpiCsr(LiteXModule):
                              "lost write is visible: the CSR bridge does not order a read after a write. "
                              "The trigger is the 0->1 transition, NOT any write -- a host retrying a write "
                              "it could not see must not start a second transaction. Write 0, then 1, to "
-                             "force another access. Ignored while ulpi_status.busy = 1, and counted in "
+                             "force another access. Ignored while ulpi_status.busy = 1, and witnessed by "
                              "ulpi_refused.")
         self.rdata = CSRStatus(8, description="The byte of the last access that COMPLETED a read. Only "
                              "meaningful together with ulpi_status.done = 1 for this access: read it while "
@@ -145,11 +243,14 @@ class UlpiCsr(LiteXModule):
                              "Link drives a TX CMD immediately after the turnaround the PHY may simply "
                              "re-assert dir -- this releases the bus and promises nothing more, which is "
                              "why go waits for idle and counts the wait instead of erroring.")
-        self.refused = CSRStatus(description="Writes to ulpi_go that arrived while an access was running "
-                             "and were dropped. The bridge is single-outstanding on purpose, so a go "
-                             "cannot be queued -- but a dropped go must never be silent, because the "
-                             "status word it left behind still describes the PREVIOUS access and reads as "
-                             "a fresh success.")
+        self.refused = CSRStatus(description="STICKY BIT, not a counter: once one ulpi_go has arrived "
+                             "while an access was running this reads 1 and stays 1 until the bitstream "
+                             "reloads. The bridge is single-outstanding on purpose, so a go cannot be "
+                             "queued -- but a dropped go must never be silent, because the status word it "
+                             "left behind still describes the PREVIOUS access and reads as a fresh success. "
+                             "So it answers 'has anything been dropped since boot' (acceptance row A0) and "
+                             "NOT 'how many, and when': per-phase accounting is ulpi_cnt_access against the "
+                             "go writes the harness knows it issued.")
 
         self.cnt_access    = CSRStatus(16, description="Completed accesses (ack), saturating.")
         self.cnt_dir_abort = CSRStatus(8,  description="Accesses that saw a dir abort. A successful "
@@ -170,34 +271,33 @@ class UlpiCsr(LiteXModule):
         self.retry = CSRStatus(4, description="dir aborts the LAST access retried (0 = clean).")
 
         # --- request: the CSR map -> the Link's cd_sys host side ----------------------------------------
-        go_edge, abort_edge = Signal(), Signal()
-        prev_go, prev_abort = Signal(), Signal()
-        self.sync += [
-            prev_go.eq(self.go.storage),
-            prev_abort.eq(self.abort.storage),
-        ]
+        # All of the behaviour lives in `UlpiCsrRules`, whose ports are plain Signals so that
+        # `tools/ulpi_csr_rules_sim.py` can drive it without a CSR model. What is left here is plumbing:
+        # `.storage` in, `.status` out. The rules module is the DUT the simulation runs, so this is the
+        # code the vectors have actually exercised -- not a copy of it.
+        self.rules = UlpiCsrRules()
         self.comb += [
-            go_edge.eq(_edge(prev_go, self.go.storage)),
-            abort_edge.eq(_edge(prev_abort, self.abort.storage)),
-        ]
-        # `h_req` is one cycle in cd_sys and the bridge ignores it while busy -- so "while busy" here is
-        # the bridge's own guard, restated only so it can be *counted* rather than lost.
-        self.comb += self.link.h_req.eq(go_edge & ~self.link.h_busy)
-        self.sync += If(go_edge & self.link.h_busy, self.refused.status.eq(1))
-        self.comb += [
-            self.link.h_rw.eq(self.cmd.storage[0]),
-            self.link.h_addr.eq(self.addr.storage[:6]),
-            self.link.h_wdata.eq(self.wdata.storage[:8]),
-            self.link.abort_req.eq(abort_edge),
+            self.rules.go.eq(self.go.storage),
+            self.rules.abort_in.eq(self.abort.storage),
+            self.rules.cmd.eq(self.cmd.storage[0]),
+            self.rules.addr.eq(self.addr.storage[:6]),
+            self.rules.wdata.eq(self.wdata.storage[:8]),
+            self.rules.h_busy.eq(self.link.h_busy),
+            self.rules.h_ack.eq(self.link.h_ack),
+            self.rules.h_ack_data.eq(self.link.h_ack_data),
+            self.link.h_req.eq(self.rules.h_req),
+            self.link.h_rw.eq(self.rules.h_rw),
+            self.link.h_addr.eq(self.rules.h_addr),
+            self.link.h_wdata.eq(self.rules.h_wdata),
+            self.link.abort_req.eq(self.rules.abort_req),
+            # Registers in the rules module, wired out combinationally: a second register here would put a
+            # cycle between the ack and what the host reads, which is the one thing `rdata` must not do.
+            self.rdata.status.eq(self.rules.rdata),
+            self.refused.status.eq(self.rules.refused),
         ]
 
-        # --- result: the Link's ack -> the CSRs, sampled ONLY on the ack --------------------------------
-        # The rule this honours (spec testing decision 8): the result bundle is copied on the ack and
-        # nowhere else. `rdata` is a register written on the ack edge, so a host that reads it while
-        # `done` = 0 gets the previous byte and the `done` bit says so -- the pair is the contract, and
-        # neither half alone can be mistaken for a fresh answer.
-        a = ack_unpack(self.link.h_ack_data)
-        self.sync += If(self.link.h_ack, self.rdata.status.eq(a["rdata"]))
+        # --- result: the Link's ack -> the CSRs, mirrored -----------------------------------------------
+        # (`rdata` itself is the rules module's register; see above.)
         self.comb += [
             self.status.status.eq(self.link.status()),
             self.cnt_access.status.eq(self.link.cnt_access),
