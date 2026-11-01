@@ -153,7 +153,8 @@ module ulpi_link_tb;
     // pad *after* the host was told the access was dead? `dut_oe` is the TSTriple's own enable, so this is
     // the pad, not the FSM's opinion about it.
     reg watch_oe, drove_after_reset;
-    localparam P_READY = 0, P_PHY_RESET = 1, P_HUB_RELEASED = 2, P_HUB_ASSERTED = 3, P_CLK_OOB = 4;
+    localparam P_READY = 0, P_PHY_RESET = 1, P_HUB_RELEASED = 2, P_HUB_ASSERTED = 3, P_CLK_OOB = 4,
+               P_RESET_PULSED = 5;
 
     // `P_CLK_OOB` = the meter says the clock is out of band while the domain is still being clocked. That is
     // NOT a fiction invented to give `err_no_clock` a row: it is the one way this board loses its clock, and
@@ -260,6 +261,21 @@ module ulpi_link_tb;
             // line state, which is the only way to see a hub reset work before enumeration.
             if (pre == P_HUB_RELEASED) linestate = 2'b01;
             if (pre == P_HUB_ASSERTED) linestate = 2'b00;
+            // A PULSE, not a hold -- the difference is the row. `P_PHY_RESET` asks what the PHY answers WHILE
+            // it is in reset (nothing); `P_RESET_PULSED` asks what SURVIVES the pulse, which is the question
+            // ticket 10 was opened for because both PHY models had just been changed to answer "the register
+            // array" on the strength of a bench measurement no vector covered (`bench/2026-11-01_reset_array/`).
+            // `clk_ok` is left at 1 on purpose: a reset pulse does not stop CLKOUT on this part (D14), so
+            // blinking the meter here would re-introduce the very fiction ticket 09 removed and make the row
+            // judge the meter instead of the array. 5 is the last value a 3-bit `pre` holds -- the 6th does not
+            // fit, and `parse_vectors` in tools/ulpi_vectors.py is the file that would notice first.
+            if (pre == P_RESET_PULSED) begin
+                // Long by ULPI's own rule (USB3300 wants >=1 us asserted), and grossly long in sim cycles so
+                // that no reader has to wonder whether the model saw it.
+                @(posedge sys_clk); phy_reset = 1;
+                repeat (200) @(posedge sys_clk);
+                @(posedge sys_clk); phy_reset = 0;
+            end
             // Wait for the clear to release. The boot and relock counters ARE the mechanism, so starting a
             // vector before `ulpi_clear` drops is testing a state the board can never be in.
             guard_clear;
