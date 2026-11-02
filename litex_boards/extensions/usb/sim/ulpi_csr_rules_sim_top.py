@@ -39,8 +39,13 @@ from litex_boards.extensions.pano_ulpi_csr import UlpiCsrRules   # ACK_WIDTH: th
 class UlpiCsrRulesSimTop(LiteXModule):
     """``UlpiCsrRules`` with ``cd_sys`` and every port promoted to a top-level input or output.
 
-    Nothing else. No CSR bank, no ``CSRStorage``, no address decode: the point of this suite is the three
-    rules, and every extra block in the DUT is a block whose bugs the suite would report as ours.
+    Nothing else. No CSR bank, no ``CSRStorage``, no address decode: the point of this suite is the rules,
+    and every extra block in the DUT is a block whose bugs the suite would report as ours.
+
+    One thing the simulation must model by hand instead of by instance: ``CSRStorage``'s own reset value.
+    ``ulpi_stp_drive`` is ``CSRStorage(reset = 1)``, so the testbench boots its ``stp_drive`` input at 1 and
+    ``stp_drive_applied`` must agree with it at reset -- a top that left the request at 0 would be simulating a
+    register map that does not exist, and would make the first write of 0 a non-edge.
     """
     def __init__(self):
         self.clock_domains.cd_sys = ClockDomain()
@@ -55,10 +60,18 @@ class UlpiCsrRulesSimTop(LiteXModule):
             self.cd_sys.clk, self.cd_sys.rst,
             # inputs
             r.go, r.abort_in, r.cmd, r.addr, r.wdata,
+            r.wake_req, r.stp_drive_req,
             r.h_busy, r.h_ack, r.h_ack_data,
             # outputs
             r.h_req, r.h_rw, r.h_addr, r.h_wdata, r.abort_req,
             r.rdata, r.refused,
+            # The wake gate's four, added 2026-11-02 because a testbench cannot audit a net it cannot name.
+            # Without these the generated module kept `wake_req` / `stp_drive_req` / `pad_refused` as INTERNAL
+            # registers -- the wake logic still synthesized, the vectors still passed at the Link level, and the
+            # rules module's own new behaviour was unobservable, which is exactly the gap ticket 01's exit note
+            # called out by name. `*_applied` is what the pad receives; `*_req` is what the CSR holds; the
+            # distance between them is the design.
+            r.wake_applied, r.stp_drive_applied, r.pad_refused,
         }
 
 

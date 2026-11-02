@@ -17,7 +17,27 @@
 //
 // Expectations live in this file, in the style of `ulpi_phy_selfcheck.v` (which guards the PHY model for the
 // same reason: a suite cannot audit its own oracle). What is NOT here is any opinion about ULPI wire
-// behaviour -- that is `ulpi_link_tb.v` + `ulpi_phy_model.v`, 35 rows. This DUT has no pads.
+// behaviour -- that is `ulpi_link_tb.v` + `ulpi_phy_model.v`, 38 rows. This DUT has no pads.
+//
+// **2026-11-02: the `wake` gate rows, which were owed by name.** The wake ticket shipped the gateware
+// (`fae7968e`) with the refuse rule in `UlpiCsrRules` -- `wake_req`/`stp_drive_req` are what the CSRs hold,
+// `wake_applied`/`stp_drive_applied` are what the pads may see, and a change written against a busy bridge is
+// DROPPED and counted in `ulpi_cnt_pad_refused` -- and its own exit note said the rules suite had no row for
+// it. That matters for a specific bench reason: `ulpi_cnt_pad_refused` is the only register that answers "did
+// the write I just issued reach the pin", and until these rows it had never been executed. A bench `refused=3`
+// would have been explainable in exactly the way bug 5 was (`ulpi_abort` had never pulsed `stp`, on any
+// build, and every note that used it as a recovery was measuring a forced timeout). The five mechanisms these
+// rows own, each with a datasheet or spec citation in the design note above them:
+//
+//   * the level is applied only while `h_busy` = 0, and only on the **edge** of the stored bit;
+//   * a dropped write stays dropped -- it is not queued for when the link goes quiet (`stp` asserting by
+//     itself, from a write nobody remembers making);
+//   * BOTH directions go through the gate -- releasing `stp` mid-transaction is the ULPI 1.1 §3.9.4
+//     *false-resume* case, not a no-op;
+//   * a `go` while `wake` is applied is refused and counted in `ulpi_refused` (USB3300 §6.1.9.2 has the Link
+//     driving IDLE for the whole resume window);
+//   * `stp_drive_applied` comes out of **reset at 1**, because 0 tri-states A5 and every spin to date drives
+//     the ULPI idle level (ULPI 1.1 §2.3.2).
 //
 //   iverilog -g2012 -o rules.out ulpi_csr_rules_tb.v ulpi_csr_rules.v
 //   vvp rules.out
@@ -48,6 +68,12 @@ module ulpi_csr_rules_tb;
 
     // --- host side (what a CSRStorage holds) -----------------------------------------------------------
     reg         go = 1'b0, abort_in = 1'b0, cmd = 1'b0;
+    // The two levels the wake ticket added: what `ulpi_wake.storage` / `ulpi_stp_drive.storage` hold. The DUT
+    // decides whether either of them reaches the pad, so the TB holds the request and reads the *applied* copy.
+    // `stp_drive` boots at 1 because that is what `CSRStorage(reset = 1)` holds -- a TB that booted it at 0
+    // would model a CSR bank that does not exist AND would make the first write of 0 a non-edge, which is the
+    // shape that hides a lost write. `ulpi_wake` has no reset, so it boots at 0 and agrees with its applied copy.
+    reg         wake = 1'b0, stp_drive = 1'b1;
     reg  [ 5:0] addr = 6'd0;
     reg  [ 7:0] wdata = 8'd0;
     // --- Link side (what the bridge shows the map) -------------------------------------------------------
@@ -57,13 +83,18 @@ module ulpi_csr_rules_tb;
     wire        h_req, h_rw, abort_req, refused;
     wire [ 5:0] h_addr;
     wire [ 7:0] h_wdata, rdata;
+    wire        wake_applied, stp_drive_applied;
+    wire [ 7:0] pad_refused;
 
     ulpi_csr_rules dut (
         .sys_clk(sys_clk), .sys_rst(sys_rst),
         .go(go), .abort_in(abort_in), .cmd(cmd), .addr(addr), .wdata(wdata),
+        .wake_req(wake), .stp_drive_req(stp_drive),
         .h_busy(h_busy), .h_ack(h_ack), .h_ack_data(h_ack_data),
         .h_req(h_req), .h_rw(h_rw), .h_addr(h_addr), .h_wdata(h_wdata),
-        .abort_req(abort_req), .rdata(rdata), .refused(refused)
+        .abort_req(abort_req), .rdata(rdata), .refused(refused),
+        .wake_applied(wake_applied), .stp_drive_applied(stp_drive_applied),
+        .pad_refused(pad_refused)
     );
 
     // The bridge's point of view: an access "started" when a clock edge found h_req high.
@@ -81,11 +112,14 @@ module ulpi_csr_rules_tb;
     // TB's wire floats to x, `!x` is x, the branch is not taken, and `busy-go-counted` reported PASS on a
     // register nobody drives. An x verdict is not a pass and it is not a fail either -- it means the harness
     // lost sight of the DUT, so it gets its own word and its own count, and the runner treats it as red.
-    task chk(input [8*26-1:0] id, input ok, input [8*96-1:0] detail);
+    // `id` is 32 chars and `detail` 160: a Verilog string assigned to a narrower formal keeps its TAIL, so a
+    // too-long argument prints as the last 96 characters of a sentence that started 40 characters earlier. The
+    // wake rows found that by printing "ue: 0 here TRI-STATES A5". Keep names <= 32, or widen deliberately.
+    task chk(input [8*32-1:0] id, input ok, input [8*160-1:0] detail);
         begin
             nchecks = nchecks + 1;
             if (ok !== 1'b1) nfail = nfail + 1;
-            $display("CSRCHK %-26s %s %0s", id,
+            $display("CSRCHK %-32s %s %0s", id,
                      ok === 1'b1 ? "PASS" : (ok === 1'b0 ? "FAIL" : "AMB"),
                      ok === 1'bx || ok === 1'bz ? "verdict is x/z: the DUT port moved or lost its driver" : detail);
         end
@@ -119,10 +153,30 @@ module ulpi_csr_rules_tb;
         end
     endtask
 
+    // Same convention as csr_go(): a CSR write lands an edge later, and `prev_wake` must not be able to
+    // sample the new level in the timestep it appeared. The wake rows are exactly the rows where that matters,
+    // because their subject is the *edge* of the stored bit.
+    task csr_wake(input v);
+        begin
+            @(posedge sys_clk);
+            #1;
+            wake = v;
+        end
+    endtask
+
+    task csr_stp_drive(input v);
+        begin
+            @(posedge sys_clk);
+            #1;
+            stp_drive = v;
+        end
+    endtask
+
     task apply_reset;
         begin
             @(posedge sys_clk); #1;
             sys_rst = 1'b1; go = 1'b0; abort_in = 1'b0; cmd = 1'b0; addr = 6'd0; wdata = 8'd0;
+            wake = 1'b0; stp_drive = 1'b1;   // the CSR's own reset values, not the TB's convenience
             h_busy = 1'b0; h_ack = 1'b0; h_ack_data = 30'd0;
             wait_cycles(4);
             sys_rst = 1'b0;
@@ -141,7 +195,7 @@ module ulpi_csr_rules_tb;
         end
     endfunction
 
-    integer b_walk;
+    integer b_walk, sat_i;
     reg     walk_ok;
 
     // ---------------------------------------------------------------------------------
@@ -259,6 +313,144 @@ module ulpi_csr_rules_tb;
         wait_cycles(3);
         chk("go-during-ack-both", (req_seen == 1) && (rdata == 8'h24),
             "the map must not lose an access because a result was landing, nor lose the result");
+
+        // ===============================================================================================
+        // W1..W20. THE WAKE GATE: what the CSRs hold is not what the pads see.
+        //
+        // `ulpi_wake` asserts `stp` asynchronously into a PHY that may be mid-transaction (ULPI §3.8.4.2: the
+        // PHY decodes `stp` as the end of a transmit), so the rules module keeps a second copy of the level --
+        // `*_applied` -- and moves it only while `h_busy` = 0. Everything below is a claim about THAT copy, or
+        // about the counter that witnesses the writes that never reached it.
+        //
+        // `h_busy` is the whole predicate on purpose. Everything the Link knows about the far side (`state`,
+        // `oe`, `xfer_active`) is `cd_usb`, and a suspend STOPS `cd_usb`: frozen, not false. A refusal
+        // predicate built on a frozen signal is a policy that quietly stops working in the one state the wake
+        // exists for -- which is also why these rows drive `h_busy` by hand and never ask the Link.
+        // ===============================================================================================
+        // ---- W1. the reset window itself, read WHILE `sys_rst` is still asserted --------------------------
+        // Not `apply_reset`: this read has to happen inside the reset, and the reason it does is a measured
+        // one. Changing `Signal(reset = 1)` to `Signal()` left every row read AFTER release green, because at
+        // boot `stp_drive_req` = 1 (the CSR's own reset) while `prev_stp_drive` = 0, so `stp_change` is high
+        // and the edge detector reloads the applied copy within a cycle of release. Post-reset, the missing
+        // reset value is self-healing -- but during reset it is what the pad's output-enable actually holds,
+        // which is the claim in the design note. A row that cannot see its own mutation is not a row.
+        @(posedge sys_clk); #1;
+        sys_rst = 1'b1; go = 1'b0; abort_in = 1'b0; cmd = 1'b0; addr = 6'd0; wdata = 8'd0;
+        h_busy = 1'b0; h_ack = 1'b0; h_ack_data = 30'd0;
+        wake = 1'b0; stp_drive = 1'b1;
+        wait_cycles(3);
+        chk("stp-drive-reset-window-drives", stp_drive_applied === 1'b1,
+            "in reset this IS the pad output-enable; 0 here tri-states A5 at configuration on a build whose CSR reads 'driving' (ULPI 1.1 2.3.2)");
+        @(posedge sys_clk); #1; sys_rst = 1'b0;
+        wait_cycles(4);
+        req_seen = 0; abort_seen = 0;
+        // ---- W2/W3/W4. what the pad-facing registers hold once the FPGA has configured ------------------
+        chk("wake-boot-quiet", (wake_applied === 1'b0) && (pad_refused == 8'd0),
+            "at boot the pad is NOT woken and nobody has been refused: a nonzero here is last run's state");
+        chk("stp-drive-boot-drives", stp_drive_applied === 1'b1,
+            "reset = 1 is the CSR's reset value: 0 here TRI-STATES A5 at configuration, on a build whose CSR reads 'driving' (ULPI 1.1 2.3.2)");
+        chk("applied-boot-matches-stored", (wake_applied === 1'b0) && (stp_drive === stp_drive_applied),
+            "at boot the stored bit and the pad agree for BOTH levels: if they did not, `ulpi_stp_pad` would be reading a difference nobody wrote");
+
+        // ---- W5. the legal case: write `wake` while the link is idle -> it reaches the pad, uncounted -----
+        csr_wake(1'b1);
+        wait_cycles(2);
+        chk("wake-assert-idle-applied", (wake_applied === 1'b1) && (pad_refused == 8'd0),
+            "a write the gate must ALLOW is allowed: a gate that refuses everything is indistinguishable from dead wiring");
+
+        // ---- W6. the converse door: no `go` while the resume window is open -------------------------------
+        req_seen = 0;
+        csr_go(1'b1);
+        wait_cycles(6);
+        chk("wake-blocks-go", (req_seen == 0) && (refused === 1'b1),
+            "USB3300 6.1.9.2 drives IDLE for the whole resume; a TX CMD into that window is a link fault we would report as the PHY's");
+
+        // ---- W7/W8. release it while idle: the pad follows down, and the door reopens ---------------------
+        csr_wake(1'b0);
+        wait_cycles(2);
+        csr_go(1'b0);              // a held-high go is still a level: no access on the fall either
+        wait_cycles(2);
+        csr_go(1'b1);
+        wait_cycles(2);
+        chk("wake-release-idle-applied", (wake_applied === 1'b0) && (pad_refused == 8'd0),
+            "the release direction is a real write too, and an allowed write must never move the refuse counter");
+        chk("go-after-wake-release-runs", req_seen == 1,
+            "the access the wake blocked must not fire late, and the next one must not be blocked: 1 is both claims");
+
+        // ---- W9/W10/W11. `wake` against a BUSY link: dropped, counted ONCE, and it stays dropped ---------
+        @(posedge sys_clk); #1; h_busy = 1'b1;          // busy BEFORE the write, or the row proves nothing
+        csr_wake(1'b1);
+        wait_cycles(6);
+        chk("wake-during-busy-dropped", wake_applied === 1'b0,
+            "ULPI 3.8.4.2: `stp` in the middle of a PHY transmit ENDS it -- the host asked for a wake, not an abort");
+        chk("wake-during-busy-counted-once", pad_refused == 8'd1,
+            "exactly one: a held mismatch counting every cd_sys cycle saturates the 8-bit counter in 5 us and its delta means nothing");
+        @(posedge sys_clk); #1; h_busy = 1'b0;
+        wait_cycles(12);
+        chk("wake-dropped-not-queued", (wake_applied === 1'b0) && (pad_refused == 8'd1),
+            "DROPPED, not deferred: `If(~busy, applied := req)` would assert stp ms later for a write nobody remembers");
+
+        // ---- W12/W13. the OTHER direction mid-access, which is the false-resume case ----------------------
+        // Park `wake` legally first, and note WHY two writes are needed: the stored bit is still 1 from W9,
+        // while the APPLIED copy is 0, because that write was refused. A single `csr_wake(1)` is therefore not
+        // an edge and would change nothing -- the same trap a bench operator hits, and the reason the documented
+        // recovery is "write 0, then 1".
+        csr_wake(1'b0);
+        wait_cycles(2);
+        csr_wake(1'b1);
+        wait_cycles(2);
+        @(posedge sys_clk); #1; h_busy = 1'b1;
+        csr_wake(1'b0);                                   // "resume the PHY" written while it is transacting
+        wait_cycles(6);
+        chk("wake-drop-during-busy-holds-pad", wake_applied === 1'b1,
+            "ULPI 1.1 3.9.4 false resume: releasing `stp` before the PHY has its clock puts it back to sleep");
+        chk("wake-drop-during-busy-counted", pad_refused == 8'd2,
+            "both directions of the level pay into the same counter, so the operator's 'why is the clock not back' has an answer");
+
+        // ---- W14. the stored bit and the pad now DISAGREE, and two allowed writes must realign them -------
+        @(posedge sys_clk); #1; h_busy = 1'b0;
+        csr_wake(1'b1);                                   // req 0 -> 1: applied already 1, so no visible change
+        wait_cycles(2);
+        csr_wake(1'b0);                                   // req 1 -> 0, link idle: this one lands
+        wait_cycles(2);
+        chk("wake-disagreement-clearable", (wake_applied === 1'b0) && (pad_refused == 8'd2),
+            "W12/W13 leave req=0 / pad=1 -- the state ulpi_stp_pad exists to witness -- and 0-then-1 escapes it free");
+
+        // ---- W15/W16/W17/W18. `stp_drive`: the same gate, the opposite default ----------------------------
+        csr_stp_drive(1'b0);
+        wait_cycles(2);
+        chk("stp-drive-clear-idle-applied", (stp_drive_applied === 1'b0) && (pad_refused == 8'd2),
+            "tri-stating the pad is allowed when nothing is in flight, and it is not a refusal");
+        @(posedge sys_clk); #1; h_busy = 1'b1;
+        csr_stp_drive(1'b1);
+        wait_cycles(6);
+        chk("stp-drive-during-busy-dropped", (stp_drive_applied === 1'b0) && (pad_refused == 8'd3),
+            "the second level goes through the SAME gate: a mid-access release of the idle driver is bug 4's shape");
+        @(posedge sys_clk); #1; h_busy = 1'b0;
+        wait_cycles(12);
+        chk("stp-drive-dropped-not-queued", stp_drive_applied === 1'b0,
+            "and it stays dropped: the pad must not change under a host that moved on");
+        // The stored bit is 1 and the pad is 0 (the write was refused), so the recovery is literally two edges:
+        csr_stp_drive(1'b0);
+        wait_cycles(2);
+        csr_stp_drive(1'b1);
+        wait_cycles(2);
+        chk("stp-drive-forced-after-busy", (stp_drive_applied === 1'b1) && (pad_refused == 8'd3),
+            "0 then 1 works on a quiet link and costs no extra refusal -- the recovery ulpi_stp_drive documents");
+
+        // ---- W19/W20. the counter itself: it counts WRITES, saturates, and never wraps ---------------------
+        @(posedge sys_clk); #1; h_busy = 1'b1;
+        for (sat_i = 0; sat_i < 300; sat_i = sat_i + 1) begin
+            @(posedge sys_clk); #1;
+            wake = ~wake;                                 // 300 attempted writes, all refused
+        end
+        wait_cycles(4);
+        chk("pad-refused-saturates", pad_refused == 8'hFF,
+            "8 bits that WRAP would read 'nobody has been refused' after 256, in the one state worth counting");
+        @(posedge sys_clk); #1; h_busy = 1'b0;
+        wait_cycles(2);
+        chk("pad-refused-stays-maxed", (pad_refused == 8'hFF) && (wake_applied === 1'b0),
+            "still maxed after the storm, and the pad still never moved while it rained");
 
         // ---- summary -----------------------------------------------------------------------------------
         $display("SUMMARY checks=%0d failed=%0d", nchecks, nfail);
