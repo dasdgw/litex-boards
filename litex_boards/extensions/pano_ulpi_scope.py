@@ -181,10 +181,19 @@ class UlpiUsbScope(LiteXModule):
         # spin simply does not exist). The pad's input buffer already exists for a different reason: the
         # Link's own `TSTriple`. Its `.i` is the same eight bits one buffer later, it is what Track A's
         # receiver will read too, and `OFFSET = IN` still applies to it -- the constraint is on the pad, not
-        # on which of its buffers the tap hangs off. `dir`/`nxt`/`stp` stay the raw pads, because those are
-        # single-direction nets and the tool allows it (spin 1 has always tapped `ulpi_dir` in cd_sys).
+        # on which of its buffers the tap hangs off.
+        #
+        # **`stp` joined `data` on 2026-11-02 and it is the same error, not an exception.** `stp` used to be a
+        # plain output, so tapping the pad net was legal and spin 1 always did. It is an `IOBUF` now, because
+        # `ulpi_stp_pad` (TODO (e): is A5 pulled up?) cannot be answered from an `OBUF` -- and the moment the
+        # pad is bi-directional, ngdbuild's rule applies to it too. Tapping `pads.stp` here after that change
+        # is not a warning to read later; it is a build that does not exist, with `924` naming eight... one
+        # bit. So: `link.master.stp_pad`, which is that `IOBUF`'s own `I`, one buffer later and the same
+        # level. `dir`/`nxt` stay the raw pads, because those really are single-direction.
         data_t = Signal(8, name = "data")
         self.comb += data_t.eq(link.master.tri.i)
+        stp_t  = Signal(name = "stp")
+        self.comb += stp_t.eq(link.master.stp_pad)
 
         clk_ok_t = Signal(name = "clk_ok")
         self.specials += MultiReg(link.clk_ok, clk_ok_t, odomain = domain)
@@ -205,6 +214,6 @@ class UlpiUsbScope(LiteXModule):
         # (`sd = getattr(self.sync, clock_domain)` in core.py), so the pad taps' D cone is pad -> IBUF ->
         # mux(1:1) -> flop and the OFFSET = IN budget is the only thing it has to meet.
         self.groups = {
-            0 : [ data_t, pads.dir, pads.nxt, pads.stp,
+            0 : [ data_t, pads.dir, pads.nxt, stp_t,
                   clk_ok_t, state_t, oe_t, busy_t, err_t ],
         }

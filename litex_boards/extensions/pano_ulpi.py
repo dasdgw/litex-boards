@@ -244,6 +244,32 @@ def ulpi_ucf_lines(clk_net = "usb_clk", clk_hz = 60e6, skew_ns = 0.0, data_net =
     return lines
 
 
+def ulpi_wake_false_path_lines(stp_net = "ulpi_stp", src = "cd_sys"):
+    """The UCF text that tells the static timer to leave the wake path alone, as data.
+
+    Why this exists at all: `wake` is a `cd_sys` level driven **combinationally** to the `stp` pad
+    (decision A, `ulpi_wake`'s own docstring), because every synchroniser into `cd_usb` is made of the clock
+    the suspend stopped. `stp` also carries an `OFFSET = OUT ... BEFORE usb_clk` from `ulpi_ucf_lines`, and
+    Xilinx will happily time the `cd_sys`-to-pad path against that offset and report a violation that means
+    nothing -- there is no phase relationship to violate, and there is no register on the path to move. An
+    unconstrained-but-reported path is worse than a false path: it is the row a future spin has to explain,
+    and the honest explanation is "this path is asynchronous by design", which is exactly what `TIG` says.
+
+    Shape copied from LiteX's own ISE emitter (`litex/build/xilinx/ise.py`, `add_false_path_constraint`), so
+    it is the same three lines the toolchain would write for `add_false_path_constraints()` -- which cannot be
+    called here because one endpoint is a *pad net*, not a clock, and the documented helper takes clocks.
+
+    `{src}` is left as LiteX's own placeholder: `add_platform_command` resolves a clock-domain name at build
+    time, and hardcoding the flattened net here is how a constraint silently stops matching anything --
+    an unmatched NET line is a warning nobody reads, and the path it was meant to free stays timed.
+    """
+    return [
+        'NET "{%s}" TNM_NET = "TIG{%s}";' % (src, src),
+        'NET "%s" TNM_NET = "TIGulpi_stp_wake";' % stp_net,
+        'TIMESPEC "TSulpi_wake" = FROM "TIG{%s}" TO "TIGulpi_stp_wake" TIG;' % src,
+    ]
+
+
 CMD_REG_WRITE = 0x80      # TX CMD bits 7:6 = 10b, immediate 6-bit address in 5:0
 CMD_REG_READ  = 0xC0      # TX CMD bits 7:6 = 11b
 # Deliberately absent: 0x00 NOOP (that is the idle *level*, not something to send), 0x40|PID packet
@@ -358,6 +384,40 @@ class UlpiMaster(Module):
         # promise has to live in the interface. One input now, versus a bus fight nobody would see from the
         # host side. (Spec decision 9.)
         self.bus_grant   = Signal()
+        # --- `wake`: the one input here that is NOT allowed to depend on `domain` -------------------------
+        # A `cd_sys` level whose only job is to reach the `stp` pad. It is deliberately **not** synchronised
+        # into `cd_usb`, and that is the whole point of the signal: `cd_usb` *is* the PHY's `CLKOUT`, and the
+        # state this input exists for (USB3300 §6.1.9 Low Power Mode: "DIR is asserted and the clock is
+        # stopped") is the state in which a synchroniser performs no edges at all. §3.9.3/§6.1.9.2 ask for an
+        # *asynchronous* assertion of `stp`; anything clocked on the way to that pad is the bug this file
+        # already had (`stp_drive` is a `cd_usb` register, so every writer of `stp` needed the clock that
+        # suspending the PHY removed).
+        #
+        # Consequences of taking it unsynchronised, both stated rather than assumed:
+        #   * it drives the pad combinationally and NOTHING samples it in `cd_usb` -- not the FSM, not
+        #     `drive_now`, not a counter. A metastable `wake` therefore cannot corrupt state, only the pad
+        #     level for a cycle, and the pad level is exactly what §3.9.3 wants asserted for milliseconds;
+        #   * it is a quasi-static CSR level, held for ~20 ms by a host that cannot poll faster, so there is
+        #     no fast-changing async input here to lose; and
+        #   * the `cd_sys` -> pad path needs a false path in the UCF, because the pad carries an
+        #     `OFFSET = OUT` referenced to `usb_clk` and a `cd_sys` launch has no relationship to it. See
+        #     `ulpi_wake_ucf_lines`.
+        self.wake         = Signal()
+        # 1 = we drive the `stp` pad (the ULPI idle level requires it: `stp` low, `data` 00h). Write 0 and
+        # the pad is tri-stated, which is the ONLY state in which `stp_pad` below says something about the
+        # board rather than about us. Default 1 so that an untouched spin behaves exactly as every spin
+        # before it did, and so a half-written harness leaves the bus in the spec's idle state.
+        self.stp_drive_en = Signal(reset = 1)
+        # The pad's own level, one buffer inside the pad (an `IOBUF`, not an `OBUF`), and the drive state
+        # that makes the reading mean what it says. `docs/NOTES.md`, learned on `W12`: **a pad's level
+        # read-back is not a reading of the board while our output driver is enabled** -- we win the
+        # contention, so a `0` there cannot distinguish "no pull-up" from "a pull-up we are overpowering".
+        # Unlike `W12` this is a plain `IOBUF` with no `ODDR2` on the path, so the input receiver is not
+        # expected to be *dead* (`LIT:675` was about a TBUF whose `T` came from DDR logic); that difference
+        # is an expectation about the toolchain and not a measurement, which is why the drive state travels
+        # with the level instead of being inferred from it.
+        self.stp_pad      = Signal()
+        self.stp_driving  = Signal()
 
         # --- analyzer taps, all registered --------------------------------------------------------------
         # LiteScope's format_groups() de-duplicates through a dict and a migen operator is unhashable, so
@@ -374,6 +434,13 @@ class UlpiMaster(Module):
         # --- pads -----------------------------------------------------------------------------------------
         self.tri = TSTriple(8, name = name + "_tri")
         self.specials += self.tri.get_tristate(pads.data)
+        # `stp` used to be a plain output. It is a `TSTriple` now for one reason: `TODO (e)` ("is there a
+        # pull-up on A5?") is a question about a pin, and a pin driven by an `OBUF` can never answer it. The
+        # platform declares `Subsignal("stp", Pins("A5"))` with no direction, so a bi-directional pad is
+        # legal without touching the platform file, and the same `NgdBuild:924` rule that forced the `data`
+        # tap in `pano_ulpi_scope.py` onto `tri.i` applies here: nothing may read the pad net itself.
+        self.stp_tri = TSTriple(1, name = name + "_stp_tri")
+        self.specials += self.stp_tri.get_tristate(pads.stp)
 
         # dir/nxt are registered **one stage, on purpose, and this must not become a MultiReg.** They are
         # synchronous here -- the PHY drives them from the same CLKOUT that clocks this domain, inside the
@@ -484,12 +551,47 @@ class UlpiMaster(Module):
             cmd_r.eq(Mux(rw_r, CMD_REG_READ | addr_r, CMD_REG_WRITE | addr_r)),
             self.tri.oe.eq(self.phy_reset | (drive_now & ~pads.dir) | idle_now),
             self.tri.o.eq(Mux(drive_now & ~self.phy_reset, tx_byte, 0)),
-            # `stp` is a separate pad, not part of the tri-state, and it is qualified by `~clear` for the
-            # same reason the data pad is: the ULPI idle level is `stp` low with `data` at 00h, and that is
-            # what must be on the pins whenever the PHY is in reset or the Link has been cleared. It is NOT
-            # qualified by `bus_grant`: §3.8.4.2 asks the Link to raise `stp` while the PHY holds `dir`, so
-            # the release path must work in exactly the moment the arbitration is telling us not to talk.
-            pads.stp.eq(stp_drive & ~self.clear),
+        ]
+
+        # ---- `stp`: the one pad on which `wake` outranks `clear`, and that is the whole design risk -------
+        # Read this equation as three sentences, because it looks like a bug and a reviewer who "cleans it
+        # up" re-creates the incident of 2026-11-01.
+        #
+        # 1. *Without `wake` it is exactly what it has always been*: `stp_drive & ~clear`. The idle level is
+        #    `stp` low with `data` at 00h and that is what must be on the pins whenever the PHY is in reset
+        #    or the Link has been cleared.
+        # 2. *`wake` escapes `clear`, on this pad and only this pad.* `clear` is `UlpiClear`, and two of its
+        #    three terms are `cd_usb`-timed: the boot counter and the 10 ms relock tail. If `C12` stops while
+        #    `clear` is asserted -- during that tail, or after any reset -- the tail **cannot finish**, so
+        #    `clear` is not false in the state we are trying to escape, it is *frozen asserted*. A `stp`
+        #    gated by it would make the wake pin unreachable in precisely the state it exists for, which is
+        #    bug 5's failure shape again: a control input whose effect depends on a clock that may not run.
+        #    And it is sanctioned, not merely convenient: USB3300 §6.1.9.3 *asks* for `stp` asserted while a
+        #    hardware reset is applied ("If the Link asserts STP on reset, the PHY will exit Low Power Mode
+        #    and start its clock") -- so `wake` is legal with `phy_reset` asserted too, which answers the
+        #    ticket's open question 1 the same way ADR-0006 answers it elsewhere: detect and expose, do not
+        #    add policy.
+        # 3. *`data`/`oe` keep their `clear` gating above and keep driving the idle level the whole time*
+        #    (ADR-0008). A Link that raises `stp` while floating `data` would trade a suspend for a bug-3
+        #    poisoning, which is a worse diagnosis than the one we started with.
+        #
+        # The hazard the override creates: a held `wake` on a healthy link holds `stp` high, and a PHY that
+        # sees `stp` rise inside an offer window reads the end of a transmit (§3.8.4.2 -- `diag_cure.py`'s
+        # five rows). That is why the *rules* module, not this equation, decides whether a `wake` write is
+        # applied at all (`UlpiCsrRules`: applied only while the bridge is idle, refused and counted
+        # otherwise), and why a `go` while `wake` is applied does not start an access.
+        #
+        # `stp` is NOT qualified by `bus_grant` either, unchanged from before: §3.8.4.2 asks the Link to
+        # raise `stp` while the PHY holds `dir`, so the release path must work in exactly the moment the
+        # arbitration is telling us not to talk.
+        self.comb += [
+            self.stp_tri.o.eq((stp_drive | self.wake) & ~(self.clear & ~self.wake)),
+            # `T = ~drive_stp`, and `drive_stp` includes `wake`: releasing the driver is a harness action, and
+            # an asserted wake must still reach the pad in that state. A `wake` that a `stp_drive=0` can
+            # switch off is the same class of bug as a `wake` that `clear` can switch off.
+            self.stp_driving.eq(self.stp_drive_en | self.wake),
+            self.stp_tri.oe.eq(self.stp_driving),
+            self.stp_pad.eq(self.stp_tri.i),
         ]
 
         # A `dir` abort (§3.8.4.1) is not a failure the first `retry_limit` times: "the Link must retry the
@@ -739,6 +841,22 @@ class UlpiLink(LiteXModule):
         self.bus_grant  = Signal()
         self.phy_reset  = Signal()          # logical level, 1 = PHY reset asserted (already cd_sys-clean)
         self.clk_ok     = Signal()          # spin 1's clock meter, already in cd_sys
+        # --- the wake path, and the two pad readings (spec ulpi-wake decisions A/B/D) ----------------------
+        # ``wake`` and ``stp_drive`` are ``cd_sys`` levels produced by the CSR rules module and passed
+        # straight through to the master, which uses them **combinationally on the pad**. They are not
+        # synchronised into ``cd_usb``, deliberately: ``cd_usb`` is the PHY's ``CLKOUT`` and Low Power Mode
+        # (§6.1.9) stops it, so a synchroniser here is a chain of flip-flops that performs no edges in
+        # exactly the state the wake exists for. "Levels cross; edges are made locally" (`pano_cdc.py`) is
+        # the rule, and this is the one signal pair on this block for which crossing a level is not enough --
+        # the level has to reach a *pin*, not a flop.
+        #
+        # ``stp_pad`` is the level on A5 as its own input receiver sees it, and ``stp_driving`` says whether
+        # we are the reason. They travel together because a level read while we drive is not a reading of the
+        # board (`docs/NOTES.md`, W12): see `UlpiMaster.stp_pad`.
+        self.wake       = Signal()
+        self.stp_drive  = Signal()
+        self.stp_pad    = Signal()          # cd_sys, synchronised copy (an async pad sample)
+        self.stp_driving = Signal()         # cd_sys, 1 = our output driver owns A5
 
         # --- latched status and counters, cd_sys --------------------------------------------------------
         self.done            = Signal()
@@ -793,6 +911,17 @@ class UlpiLink(LiteXModule):
             self.master.phy_reset.eq(self.phy_reset),
             self.master.clear.eq(self.ulpi_clear.clear),
             self.master.bus_grant.eq(self.bus_grant),
+            self.master.wake.eq(self.wake),
+            self.master.stp_drive_en.eq(self.stp_drive),
+        ]
+
+        # The two `stp` pad readings, into `cd_sys`. `MultiReg` and not a bare assign because `stp_pad` is
+        # asynchronous to `sys_clk` by nature (it is a pin), and a metastable sample of a *status* bit costs a
+        # dot on a waveform rather than a wrong transaction -- the same reasoning `dir_now`/`oe_now` above
+        # use. What must NOT happen is a synchroniser into `cd_usb`: see the `wake` comment at the ports.
+        self.specials += [
+            MultiReg(self.master.stp_pad, self.stp_pad, odomain = "sys"),
+            MultiReg(self.master.stp_driving, self.stp_driving, odomain = "sys"),
         ]
 
         # `abort` is a cd_sys pulse and the master consumes a cd_usb level. A *pulse* cannot cross into a

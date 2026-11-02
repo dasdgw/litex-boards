@@ -23,10 +23,50 @@ module ulpi_phy_model #(
     // (`bench/2026-10-31_t18_after_scratchread_00.vcd`, and the same cadence in
     // `bench/2026-10-31_t18_fresh_16.vcd`). A named parameter because a magic 40 in a comparison is the kind
     // of number a later reader assumes was invented, and it was not.
-    parameter integer TX_NXT_PERIOD = 40
+    parameter integer TX_NXT_PERIOD = 40,
+    // T_START, counted in cycles of the PHY's own reference. USB3300 Table 5-2: 2.25 ms min / 3.5 ms typ for
+    // the clock to return after a resume is asked for (`RESEARCH.md` §7.6 owns the citation). A parameter
+    // because a resume row cannot afford 3.5 ms of sim, and §3.9.4's row has to wait for TWO of them; the
+    // vectors run the model at 600 cycles (10 us) and the row note says so. The DEFAULT is the cited number,
+    // so a TB that forgets to override it is running the datasheet and not a fiction.
+    parameter integer T_START_CYCLES = 210_000
 ) (
-    input  wire       clk,          // 60 MHz, the same clock the Link is running on
+    input  wire       clk,          // the PHY's 60 MHz reference, same net the Link's `cd_usb` runs on
     input  wire       phy_reset,    // the reset pin, active high (our `phy_reset` CSR level)
+
+    // ---- Low Power Mode: §6.1.9 (enter), §6.1.9.2 / ULPI §3.9.3 (leave), §3.9.4 (false resume) ----------
+    // A PHY in Low Power Mode stops **CLKOUT**, not itself: it keeps watching `stp` and it keeps its own
+    // start-up timer. So this model runs on two clocks and the split IS the feature:
+    //
+    //   `clk`          the reference. Never stops. T_START counts on it, because a PHY that stopped its own
+    //                  reference could not count its way out -- which is the mistake that would let
+    //                  `wake_clear_frozen` pass for free.
+    //   `phy_clk_out`  what C12 delivers: `clk` while awake, **flat in LPM**. The DUT runs on it, because the
+    //                  testbench hands the Link the same net. That is what makes a suspended PHY freeze the
+    //                  Link's choreography instead of continuing to simulate it (spec testing decision 2),
+    //                  and `tools/ulpi_mutate.py model_clock_runs_in_lpm` deletes the gate to say which rows
+    //                  would then pass wrongly.
+    //
+    //                  **The interface FSM does NOT run on it, and that is a measured decision, not sloppiness.**
+    //                  Running the interface on the gated clock came back with a coverage REGRESSION somewhere
+    //                  else in the file: `no_dst_req_withdraw` in `tools/ulpi_mutate.py` -- a mutation two
+    //                  domains away from anything in this ticket -- went from reddening `freerun_rd` to BLIND,
+    //                  bisected to this net and to nothing else (model on `clk` + DUT on `phy_clk_out`:
+    //                  noticed; model on the gate: blind). A clock that reaches the model one delta later than
+    //                  `clk` reorders who samples the pad first, and a stale-request witness depends on exactly
+    //                  that ordering. Two lessons in one line: **a derived clock is not the same clock at the
+    //                  delta level**, and the reason to run mutation coverage on every change is that this is
+    //                  how you find out. What the LPM still has to express about the *interface* is the pad
+    //                  level, which is `phy_dir = dir_r | in_lpm` below and the quiescent `oe` beside it.
+    //
+    // The gate is an integrated-clock-gate shape (enable latched during the low phase) and not `clk & ~en`:
+    // the exit arrives asynchronously from the `stp` block, and a bare AND mints a rising edge the moment the
+    // hold drops with `clk` high -- an edge silicon does not produce, delivered in exactly the cycle the
+    // resume rows are about.
+    output wire       phy_clk_out,
+    output reg        in_lpm,           // witness: the PHY is in Low Power Mode (§6.1.9)
+    output reg        lpm_false_exit,   // witness: §3.9.4 fired -- `stp` fell before the resume completed
+    output reg [15:0] lpm_ticks,        // cycles spent in LPM; the resume's T_START counts inside it
 
     // Bus, as the Link sees it. The TB resolves the contention: `bus` is wired-OR of the two drivers and
     // both driving nonzero resolves to x, which is the point -- a Link that forgets to release does not
@@ -38,12 +78,27 @@ module ulpi_phy_model #(
     // enable.** It samples a level every cycle, whatever produced it. See `rx_r` below.
     input  wire [7:0] bus,
     output reg  [7:0] phy_data,
-    output reg        phy_dir,
+    // The interface FSM's OWN `dir`. What a TB and the Link see is `phy_dir`, below, and the two are
+    // deliberately not one signal: §6.1.9 asserts DIR on entering LPM, and the FSM cannot do that from inside
+    // LPM because the clock that would run the assertion is the clock LPM stops.
+    output reg        dir_r,
     output reg        phy_nxt,
     // The model's side of the tri-state. It is a separate signal and not `phy_dir` because the model
     // asserts dir one cycle before it drives the byte (§3.8.3.1), and a TB that wired `oe` to `dir` would
     // have the PHY sitting on the bus during its own announcement cycle -- which reads as a Link bug.
     output wire       phy_oe,
+    // §6.1.9: "Once the PHY enters Low Power Mode, DIR is asserted and the clock is stopped." Applied here
+    // rather than in the FSM for exactly that reason, and it falls again when `in_lpm` falls -- the same edge
+    // the clock returns on, so ULPI §3.9.3's order (clock up, then `dir` low) holds. The one-interface-cycle
+    // skew silicon has between those two is NOT modelled: nothing in the vector set can see the difference,
+    // and modelling it would need a third clock and an invented number.
+    output wire       phy_dir,
+    // The pad, as resolved by the testbench. There is no pull-up knob and no `phy_stp_raw` here: the TB owns
+    // the tri-state and `pullup(stp_net)` is a BOARD fact rather than a PHY one, so handing the model a
+    // "with/without pull-up" switch would let it disagree with the net on the same waveform. That is
+    // deliberately unlike the python twin, which has a `stp_pullup` attribute because there is no net in
+    // python to hang one on -- the asymmetry `IdealLink`'s docstring already records for bug 3. TODO (e) is
+    // answered by `ulpi_stp_pad` on silicon, not by either model.
     input  wire       phy_stp,
 
     // --- failure knobs, one per vector in tools/ulpi_vectors.tsv ----------------
@@ -159,10 +214,23 @@ module ulpi_phy_model #(
             // wrong against the doc, and **no vector reads either address**, so no vector could have said
             // so. A register the vectors do not read is exactly where a model is allowed to lie, which is
             // why the cross-check compares tables and not just outcomes.
-            regs[6'h04] = 8'h41;   // Function Control POR: OTG_EN|INDIRECT_ACCESS|DPDM_DIS
+            // Function Control, POR `0x41` = bit 6 `SuspendM` = 1 and bit 0 `XcvrSelect[0]` = 1 (full-speed
+            // transceiver), every other field 0: `XcvrSelect[1:0]`, `TermSelect`, `OpMode[1:0]`, `Reset`,
+            // `SuspendM` and Reserved are the fields, per `usb3300.pdf` §6.1.4.5 and ULPI 1.1 Table 11.
+            // **This comment used to name `OTG_EN | INDIRECT_ACCESS | DPDM_DIS`, three names that appear in
+            // neither datasheet** (ticket 01 item 6: grep, 0 hits each). The value was never wrong; the
+            // vocabulary came from another part, and a Track A driver author reading "OTG_EN" here is exactly
+            // how the 2026-11-01 wedge happened -- someone clears a bit named after a feature and does not
+            // notice it is the suspend bit (`RESEARCH.md` §7.10). The python twin's table carries the same
+            // correction, and these two files are the reason one correction is not enough.
+            regs[6'h04] = 8'h41;
             // §6.1.4's set/clear aliases read back the register they alias. They are modelled as separate
             // storage here (a write to `0x04` does not appear at `0x05`), which is honest because the Link
             // never uses the aliases (spec decision 2) and no vector reads them.
+            // 0x05/0x06 are ALIASES and not stored any more (see the commit path); these two lines set the
+            // shadow cells the register-table diff in tools/test_ulpi_phy_model.py still walks, so the
+            // python twin's `PHY_POR` entry for them has to stay in step for the same reason. Harmless here:
+            // nothing reads `regs[6'h05]`, and the read path answers from `regs[6'h04]`.
             regs[6'h05] = 8'h41;
             regs[6'h06] = 8'h41;
             regs[6'h0A] = 8'h06;   // OTG Control POR
@@ -171,7 +239,92 @@ module ulpi_phy_model #(
     endtask
 
     reg phy_oe_r;   // registered beside phy_data, never decoded from `state`
-    assign phy_oe = phy_oe_r;
+    // Quiescent while asleep. §6.1.9: in Low Power Mode the PHY's interface is unpowered -- DIR is the one
+    // thing it holds asserted, and it drives nothing else. (The interface FSM is on the reference clock, so
+    // without this term a PHY that claims to be asleep could still answer with `nxt` or a byte if it had been
+    // mid-transaction when SuspendM took effect.)
+    assign phy_oe = phy_oe_r & ~in_lpm;
+
+    // ===================== Low Power Mode, and the clock that stops with it =====================
+    // USB3300 §6.1.9: clearing `SuspendM` (bit 6 of Function Control, POR `1b`) puts the PHY in Low Power
+    // Mode, where "DIR is asserted and the clock is stopped". §6.1.9.2 and ULPI §3.9.3: the Link leaves by
+    // asserting `stp`, and the PHY restores the bit itself. §3.9.4: if `stp` falls before `dir` does, the PHY
+    // does not complete the resume and goes back to sleep.
+    //
+    // WHO OWNS WHAT, because this is two clock domains and a shared writer would be a race iverilog resolves
+    // by luck:
+    //   interface block (the DELIVERED clock): `susp_latch`, set from a Function-Control commit and cleared
+    //       when it takes the resume, and `regs[6'h04][6]`.
+    //   this block (the REFERENCE):            `in_lpm`, `resume_done`, `t_cnt`, `lpm_ticks`, `lpm_false_exit`.
+    //   two async edge blocks on the pad:      `stp_rise` / `stp_fall`, monotone counters that this block
+    //       only ever READS. A boolean "stp was asserted" would need a writer in both domains; a counter with
+    //       one writer and a baseline this block re-bases is the same fact with no shared variable -- and it
+    //       is what makes §3.9.4's *cancel* expressible, since cancelling is "forget the edges I have seen".
+    reg     susp_latch  = 1'b0;   // the last Function-Control commit asks for Low Power Mode
+    reg     resume_done = 1'b0;   // T_START expired: the clock is back, ask the interface to restore the bit
+    integer t_cnt       = 0;      // T_START, in cycles of the PHY's reference (never of the delivered clock)
+    integer stp_rise    = 0;
+    integer stp_fall    = 0;
+    integer base_rise   = 0;      // the edge counts as of entering LPM; a difference is a resume request
+    integer base_fall   = 0;
+
+    reg en_latch = 1'b1;
+    always @(clk or in_lpm) if (clk === 1'b0) en_latch = (in_lpm === 1'b1) ? 1'b0 : 1'b1;
+    assign phy_clk_out = clk & en_latch;
+    assign phy_dir     = dir_r | in_lpm;
+
+    // The `(in_lpm === 1'b1)` test, rather than `~in_lpm`, is for time 0: `in_lpm` is an output reg with no
+    // driver until this block's first edge, and `~x` is x, which would make `phy_clk_out` x and take neither
+    // branch of every clocked block below. Every other new receiver state in this file is initialised in the
+    // `initial` block for that reason; this one also has to be right *before* it.
+    wire resume_asked = in_lpm && (stp_rise != base_rise);
+
+    always @(posedge clk) begin
+        if (!in_lpm) begin
+            // `state == S_IDLE`, and that gate is a claim about the datasheet rather than a convenience.
+            // §6.1.9 says clearing `SuspendM` puts the PHY in Low Power Mode but gives no T_stop, and a PHY
+            // that stopped CLKOUT *during* the write that cleared it could not drive the `nxt`/`dir` that
+            // write still needs -- it would break every driver on the bus, and it would make the suspending
+            // access itself unanswerable, which is not what the register means. So the model stops the clock
+            // when the interface has retired the transaction, which is also when `susp_latch` is meaningful:
+            // it is set by the commit, and the commit is followed by the model's own release cycles.
+            // Ticket 03 asks the board what the real latency is; nothing in the vectors depends on it.
+            if (susp_latch && !resume_done && (state == S_IDLE)) begin
+                in_lpm    <= 1'b1;
+                lpm_ticks <= 16'd0;
+                t_cnt     <= 0;
+                base_rise <= stp_rise;
+                base_fall <= stp_fall;
+            end
+        end else begin
+            lpm_ticks <= lpm_ticks + 16'd1;
+            if ((stp_rise != base_rise) && (stp_fall != base_fall)) begin
+                // Either the false resume put us back to sleep and `stp` has been asked again since (clear the
+                // witness, judge the new attempt on its own edges), or §3.9.4 fired: `stp` fell before the
+                // resume completed, so the PHY never started. Both are "re-base and keep sleeping"; they
+                // differ only in whether the witness is raised, and §3.9.4's is raised only when a resume was
+                // actually in flight -- a bare release with nothing asked for is not a false resume.
+                base_rise <= stp_rise;
+                base_fall <= stp_fall;
+                t_cnt     <= 0;
+                if (resume_asked) lpm_false_exit <= 1'b1;
+            end else if (resume_asked) begin
+                if (t_cnt >= T_START_CYCLES) begin
+                    resume_done <= 1'b1;   // the clock returns; the interface puts SuspendM back
+                    in_lpm      <= 1'b0;
+                    t_cnt       <= 0;
+                end else t_cnt <= t_cnt + 1;
+            end
+        end
+        // The interface has taken the resume: it cleared the request on the clock this block just returned.
+        if (resume_done && !susp_latch) resume_done <= 1'b0;
+    end
+
+    // §3.9.3 / §6.1.9.2: "To exit Low Power Mode, the Link will assert STP". Async on the pad, because there
+    // is no clock left to sample it with -- the entire reason `.scratch/ulpi-wake/` exists. A level trigger
+    // would also "wake" the model on the way down.
+    always @(posedge phy_stp) stp_rise = stp_rise + 1;
+    always @(negedge phy_stp) stp_fall = stp_fall + 1;
 
     // The receiver, and the retention. When neither side drives, a real CMOS net KEEPS its last level for a
     // long time (measured: 70 interface cycles above), so `rx_r` holds. Holding it FOREVER is the harsher
@@ -193,7 +346,12 @@ module ulpi_phy_model #(
 
     initial begin
         byte_r = 8'h00; phy_oe_r = 1'b0; rx_r = 8'h00; tx_tick = 8'h00;
-        phy_data = 8'h00; phy_dir = 1'b0; phy_nxt = 1'b0;
+        phy_data = 8'h00; dir_r = 1'b0; phy_nxt = 1'b0;
+        // The Low Power Mode witnesses, for the reason the line above exists: an unknown `in_lpm` is not
+        // "awake", it is unknown, and it propagates into `phy_clk_out` -- which deletes every behaviour in
+        // this file at once and reports nothing. (`en_latch` is initialised at its declaration because it is
+        // combinational from time 0 and this block is too late for it.)
+        in_lpm = 1'b0; lpm_false_exit = 1'b0; lpm_ticks = 16'd0;
         state = S_IDLE; addr = 6'h00; is_write = 1'b0;
         seen_cmd = 8'h00; seen_wdata = 8'h00; saw_stp = 1'b0; abort_count = 4'd0;
         cmd_is_write = 1'b0; nxt_cycles_too_long = 1'b0;
@@ -205,6 +363,9 @@ module ulpi_phy_model #(
         // does not fail loudly; it silently deletes the model's behaviour.
         unsolicited_tx = 1'b0; unsolicited_cmd = 1'b0; unsolicited_byte = 8'h00;
         nxt_window = 1'b0; turn = 1'b0;
+        // Same rule, same reason: an unknown `in_lpm` propagates into `phy_clk_out`, and an unknown clock
+        // deletes every behaviour in this file at once rather than reporting itself.
+        in_lpm = 1'b0; lpm_false_exit = 1'b0; lpm_ticks = 16'd0;
         set_id_regs;
     end
 
@@ -219,7 +380,7 @@ module ulpi_phy_model #(
     // and reads back. Ticket 10.
     always @(posedge clk or posedge phy_reset) begin
         if (phy_reset) begin
-            phy_data <= 8'h00; phy_dir <= 1'b0; phy_nxt <= 1'b0;
+            phy_data <= 8'h00; dir_r <= 1'b0; phy_nxt <= 1'b0;
             state    <= S_IDLE;
             nxt_hold <= 0; abort_hold <= 0;
             // Bug 3's state dies here and nowhere else, and that IS the bench result: `diag_cure.py` row
@@ -238,8 +399,15 @@ module ulpi_phy_model #(
 
             case (state)
                 S_IDLE: begin
+                    // The resume's restore, on the clock that has just returned and independent of any
+                    // transaction: a resume completing while this FSM is mid-write must not have to wait for
+                    // an End-of-Packet that may never arrive.
+                    if (resume_done) begin
+                        regs[6'h04][6] <= 1'b1;
+                        susp_latch     <= 1'b0;
+                    end
                     phy_nxt  <= 1'b0;
-                    phy_dir  <= 1'b0;
+                    dir_r  <= 1'b0;
                     phy_data <= 8'h00;
                     if (turn) turn <= 1'b0;          // §2.3.1: the hand-back cycle is not a command
                     // ---- bug 3, the entry, and the reason this model used to be blind ---------------------
@@ -362,12 +530,50 @@ module ulpi_phy_model #(
                     // never marks the end is caught.
                     if (phy_stp) begin
                         saw_stp <= 1'b1;
+                        // §6.1.9, decided at the only moment it CAN be decided: a Function-Control commit
+                        // whose byte has `SuspendM` low asks for Low Power Mode, one with it high releases the
+                        // request. Read from `seen_wdata` and not from `regs`, because the commit IS this edge
+                        // and `regs` still holds the previous value here. The `knop_ignore_write` gate is
+                        // deliberately NOT applied: a PHY that swallows the byte also never clears the bit, so
+                        // it never suspends, which is that row's own meaning rather than a hole in it.
+                        //
+                        // The aliases are included because the bench is told to suspend through them
+                        // (`.scratch/ulpi-wake/issues/03`), and the storage above models them as separate
+                        // addresses -- so this is where the alias's REAL semantics appear: §6.1.4 says a write
+                        // to `0x05`/`0x06` is a bit set/clear of Function Control `0x04`, not a write to a
+                        // third register.
+                        if      (addr == 6'h04) susp_latch <= (seen_wdata & 8'h40) == 8'h00;
+                        else if (addr == 6'h05) susp_latch <= ((regs[6'h04] |  seen_wdata) & 8'h40) == 8'h00;
+                        else if (addr == 6'h06) susp_latch <= ((regs[6'h04] & ~seen_wdata) & 8'h40) == 8'h00;
+                        // §6.1.9.2, taken on the clock that has just come back: the PHY restores SuspendM
+                        // itself. ONLY bit 6 moves -- `XcvrSelect`, `TermDP/DM` and `OpMode` stay exactly as
+                        // the driver left them, which is spec decision F: waking does not undo a whole-byte
+                        // write, and a row that read `0x04` back as `0x41` after a wake would be a fiction
+                        // about a driver that only ever touched one bit.
+                        if (resume_done) begin
+                            regs[6'h04][6] <= 1'b1;
+                            susp_latch     <= 1'b0;
+                        end
                         // Commit the byte captured in S_NXT, **not `link_data` now**: `stp` is asserted the
                         // cycle after the last data byte, and a Link that has already released the bus
                         // presents 00h (per the idle level), so committing `link_data` here writes 00 into
                         // every register -- which is exactly what this model did, and it looked like a Link
                         // that could not write. A real PHY latches the byte when it takes it.
-                        if (!knop_ignore_write) regs[addr] <= seen_wdata;
+                        // §6.1.4: `0x05`/`0x06` are not registers, they are a SET and a CLEAR of the bits
+                        // written into Function Control. They used to be separate storage here, which was
+                        // honest while nothing used them ("the Link never uses the aliases"); the harness now
+                        // is TOLD to use them (`.scratch/ulpi-wake/issues/03` writes `0x06=0x40` precisely
+                        // because a whole-byte write can move `XcvrSelect` with it), and a model whose alias
+                        // is a third register would let a bench instruction pass in sim that cannot work on
+                        // the part. The python twin stores the same way, and `tools/test_ulpi_phy_model.py`
+                        // diffs the two register tables address by address.
+                        if (!knop_ignore_write) begin
+                            case (addr)
+                                6'h05: regs[6'h04] <= regs[6'h04] |  seen_wdata;
+                                6'h06: regs[6'h04] <= regs[6'h04] & ~seen_wdata;
+                                default: regs[addr] <= seen_wdata;
+                            endcase
+                        end
                         state   <= S_IDLE;
                     end
                 end
@@ -383,13 +589,15 @@ module ulpi_phy_model #(
                 // idle level and reports 00h. That is a model bug wearing a Link bug's clothes, and it is
                 // the reason this comment is longer than the code.
                 S_RD_DIR: begin
-                    phy_dir   <= 1'b1;
+                    dir_r   <= 1'b1;
                     phy_nxt   <= 1'b0;
                     phy_data  <= 8'h00;              // §3.8.3.1: the idle level while `dir` goes up
                     state     <= S_RD_DATA;
                 end
                 S_RD_DATA: begin
-                    byte_r = regs[addr];
+                    // An alias is not storage: reading `0x05`/`0x06` reads Function Control (§6.1.4), which
+                    // is what makes `wr 0x05 = 08h` then `rd 0x05` answer `49h` and not `08h`.
+                    byte_r = (addr == 6'h05 || addr == 6'h06) ? regs[6'h04] : regs[addr];
                     if (addr == 6'h15) byte_r[1:0] = linestate;   // live, not stored -- see above
                     phy_data  <= knop_rev_bus ? { byte_r[0], byte_r[1], byte_r[2], byte_r[3],
                                                   byte_r[4], byte_r[5], byte_r[6], byte_r[7] }
@@ -398,7 +606,7 @@ module ulpi_phy_model #(
                     state     <= S_RD_END;
                 end
                 S_RD_END: begin
-                    phy_dir   <= 1'b0;
+                    dir_r   <= 1'b0;
                     phy_data  <= 8'h00;
                     phy_oe_r  <= 1'b0;
                     turn      <= 1'b1;               // the Link gets this cycle to take the bus (§6.1.5.2 T6)
@@ -430,7 +638,7 @@ module ulpi_phy_model #(
                 // out-of-context `stp` is 1-in-40 likely to land in it by luck. That co-incidence is a fact
                 // about the model and is written here rather than hidden in the comparison.
                 S_TX: begin
-                    phy_dir  <= 1'b0;
+                    dir_r  <= 1'b0;
                     phy_data <= 8'h00;
                     phy_oe_r <= 1'b0;              // the PHY is a receiver now: it does not own the pads
                     nxt_window <= (phy_nxt == 1'b1);
@@ -452,15 +660,15 @@ module ulpi_phy_model #(
                 // it detects stp asserted or it is ready to receive again." Both prior references call a
                 // Link that ignores this "permanently wedged"; the vectors exist so we cannot.
                 S_ABORT: begin
-                    phy_dir  <= 1'b1;
+                    dir_r  <= 1'b1;
                     phy_nxt  <= 1'b0;
                     phy_data <= 8'h00;
                     if (phy_stp) begin
-                        phy_dir <= 1'b0;
+                        dir_r <= 1'b0;
                         turn    <= 1'b1;
                         state   <= S_IDLE;
                     end else if (abort_hold == 8'd0) begin
-                        phy_dir <= 1'b0;
+                        dir_r <= 1'b0;
                         turn    <= 1'b1;
                         state   <= S_IDLE;
                     end else begin
@@ -477,7 +685,9 @@ module ulpi_phy_model #(
     // for our own model violating it, because a model that drives dir randomly makes every abort vector
     // meaningless.
     always @(posedge clk) begin
-        if (!phy_reset && (state == S_IDLE) && phy_dir) begin
+        // `dir_r` and not `phy_dir`: LPM holds `phy_dir` up by definition (§6.1.9), and this check is about
+        // the FSM asserting dir out of turn, which is a different sentence about a different signal.
+        if (!phy_reset && (state == S_IDLE) && dir_r) begin
             $display("ulpi_phy_model: MODEL BUG: dir asserted while idle at time %0t", $time);
         end
     end

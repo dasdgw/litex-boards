@@ -1220,7 +1220,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 # at the slow corner (~1 ns on `data`, ~3.3 ns on `stp`, spin `ulpi_t16`), and that deficit is an
                 # accepted deviation with a trigger attached: ADR-0005 + ticket 06. `--no-ulpi-io-offsets` exists
                 # to isolate which constraint a failure belongs to on a bench, never to make a report prettier.
-                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns)
+                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns,
+                                          cd_sys = self.crg.cd_sys.clk)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -1228,7 +1229,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 pads         = platform.request_all("user_led"),
                 sys_clk_freq = sys_clk_freq)
 
-    def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = ULPI_SKEW_NS_DEFAULT):
+    def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = ULPI_SKEW_NS_DEFAULT,
+                             cd_sys = None):
         """The ULPI pad input/output timing, as raw UCF.
 
         **Why raw.** LiteX in this tree has no `add_input_delay_constraint`/`add_output_delay_constraint`
@@ -1285,9 +1287,25 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
         # The arithmetic and the text live in pano_ulpi.py as pure functions, so they can be asserted
         # without running ISE -- see `ulpi_io_windows` for why that mattered within the hour of writing it.
         # It raises if the window cannot close at this clock, which is a build error and not a UCF line.
-        from litex_boards.extensions.pano_ulpi import ulpi_ucf_lines
+        from litex_boards.extensions.pano_ulpi import ulpi_ucf_lines, ulpi_wake_false_path_lines
         for line in ulpi_ucf_lines(clk_net = clk_net, clk_hz = 60e6, skew_ns = skew_ns):
             platform.add_platform_command(line)
+        # ... and the one path that must NOT be timed against them. `ulpi_wake` is a `cd_sys` level driven
+        # combinationally to the `stp` pad, because every synchroniser into `cd_usb` is built from the clock
+        # a suspend stops (`pano_ulpi.py`, decision A); leaving it timed asks Xilinx to meet an `OFFSET`
+        # across two clocks that have no phase relationship, on a path with no register to move.
+        # `ulpi_wake_false_path_lines` explains why the documented `add_false_path_constraints()` cannot be
+        # used here (one endpoint is a pad, not a clock) and why the net name is LiteX's `{cd_sys}`
+        # placeholder rather than a string we typed.
+        # `cd_sys` is passed as a SIGNAL and not spelled, because `add_platform_command` resolves each
+        # `{name}` from its kwargs (`generic_platform.resolve_signals`: `template.format(**name_dict)` with
+        # the names coming out of the VerilogNetlist). Passing the bare word raised `KeyError: 'cd_sys'` at
+        # build time -- which is the loud failure; the silent one would be a NET line naming a net that does
+        # not exist, and Xilinx accepts that with a warning nobody reads while the path stays timed. That is
+        # why `tools/test_ulpi_csr_map.py` asserts no brace survives into the emitted `.ucf`.
+        if cd_sys is not None:
+            for line in ulpi_wake_false_path_lines(stp_net = "ulpi_stp"):
+                platform.add_platform_command(line, cd_sys = cd_sys)
 
 
 # Build --------------------------------------------------------------------------------------------

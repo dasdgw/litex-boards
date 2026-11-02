@@ -55,12 +55,20 @@ module ulpi_abort_idle_tb;
 
     wire [ 7:0] ulpi_data;
     wire [ 7:0] dut_o, dut_oe;
-    wire        dut_stp;
+    wire        dut_stp_o, dut_stp_oe, dut_stp_pad, dut_stp_driving;
+    wire        phy_clk, in_lpm, lpm_false_exit;
+    wire [15:0] lpm_ticks;
+    // Same net the Link reads back through its own `IOBUF`: see `ulpi_link_tb.v` for why these are two
+    // tri-states and not a mux, and why there is no pull-up on it.
+    wire        stp_net;
+    reg         tb_stp_drive = 1'b0, tb_stp_oe = 1'b0, tb_wake = 1'b0, tb_stp_drive_en = 1'b1;
+    assign stp_net = dut_stp_oe ? dut_stp_o    : 1'bz;
+    assign stp_net = tb_stp_oe  ? tb_stp_drive : 1'bz;
     wire        phy_dir, phy_nxt, phy_oe;
     wire [ 7:0] phy_data;
 
     ulpi_link dut (
-        .sys_clk(sys_clk), .usb_clk(usb_clk), .sys_rst(sys_rst),
+        .sys_clk(sys_clk), .usb_clk(phy_clk), .sys_rst(sys_rst),
         .h_req(h_req), .h_rw(h_rw), .h_addr(h_addr), .h_wdata(h_wdata),
         .h_ack(h_ack), .h_ack_data(h_ack_data), .h_busy(h_busy),
         .abort_req(abort_req), .bus_grant(bus_grant), .phy_reset(phy_reset), .clk_ok(clk_ok),
@@ -72,7 +80,10 @@ module ulpi_abort_idle_tb;
         .cnt_access(cnt_access), .cnt_dir_abort(cnt_dir_abort), .cnt_timeout(cnt_timeout),
         .cnt_reset(cnt_reset), .cnt_no_clock(cnt_no_clock),
         .ulpi_data_o(dut_o), .ulpi_data_oe(dut_oe), .ulpi_data_i(ulpi_data),
-        .ulpi_stp(dut_stp), .ulpi_dir(phy_dir), .ulpi_nxt(phy_nxt)
+        .ulpi_stp_o(dut_stp_o), .ulpi_stp_oe(dut_stp_oe), .ulpi_stp_i(stp_net),
+        .ulpi_dir(phy_dir), .ulpi_nxt(phy_nxt),
+        .wake(tb_wake), .stp_drive(tb_stp_drive_en),
+        .stp_pad(dut_stp_pad), .stp_driving(dut_stp_driving)
     );
 
     reg        knop_stall_nxt = 0, knop_wrong_cmd = 0, knop_rev_bus = 0, knop_ignore_write = 0;
@@ -89,7 +100,9 @@ module ulpi_abort_idle_tb;
         .clk(usb_clk), .phy_reset(phy_reset),
         .link_data(dut_o), .link_oe(dut_oe[0]), .bus(ulpi_data),
         .knop_ignore_float(1'b0),
-        .phy_data(phy_data), .phy_dir(phy_dir), .phy_nxt(phy_nxt), .phy_stp(dut_stp),
+        .phy_clk_out(phy_clk), .in_lpm(in_lpm), .lpm_false_exit(lpm_false_exit),
+        .lpm_ticks(lpm_ticks),
+        .phy_data(phy_data), .phy_dir(phy_dir), .phy_nxt(phy_nxt), .phy_stp(stp_net),
         .phy_oe(phy_oe),
         .knop_stall_nxt(knop_stall_nxt), .knop_abort_n(knop_abort_n),
         .knop_abort_forever(knop_abort_forever), .knop_wrong_cmd(knop_wrong_cmd),
@@ -112,7 +125,7 @@ module ulpi_abort_idle_tb;
     // is what §3.8.1.2's "assert stp for only one cycle" is a statement about.
     integer      stp_cycles = 0;
     reg          stp_watch  = 0;
-    always @(posedge usb_clk) if (stp_watch && dut_stp) stp_cycles = stp_cycles + 1;
+    always @(posedge usb_clk) if (stp_watch && stp_net === 1'b1) stp_cycles = stp_cycles + 1;
 
     localparam integer ACCESS_BOUND = 200_000;
     reg        acc_ok;

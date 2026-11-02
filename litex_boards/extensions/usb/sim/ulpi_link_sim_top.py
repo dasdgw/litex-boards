@@ -36,9 +36,13 @@ def ulpi_pad_record(name = "ulpi"):
     `dir`/`nxt` are plain inputs. If the platform resource for `ulpi` ever changes shape, the simulation
     top and the target must move together, and this is the one place to look.
     """
+    # `stp` is a tri-state record too as of the wake ticket, and the reason is the same one that made `data`
+    # one: the pad is now an `IOBUF`, so its level has to come back in (`probe_stp_pad`, spec decision D).
+    # `dir`/`nxt` stay plain inputs. The testbench is the only other place this shape appears
+    # (`ulpi_link_tb.v` wires `ulpi_stp_o/_oe` into a resolved net the PHY model reads).
     return Record([
         ("data", [("o", 8), ("oe", 8), ("i", 8)]),
-        ("stp",  1),
+        ("stp",  [("o", 1), ("oe", 1), ("i", 1)]),
         ("dir",  1),
         ("nxt",  1),
     ], name = name)
@@ -71,10 +75,14 @@ class UlpiLinkSimTop(LiteXModule):
             l.h_req, l.h_rw, l.h_addr, l.h_wdata,
             l.h_ack, l.h_ack_data, l.h_busy,
             l.abort_req, l.bus_grant, l.phy_reset, l.clk_ok, l.ulpi_clear.clear,
+            # `wake` and `stp_drive` are host-side LEVELS on purpose: the testbench holds them across a clock
+            # stop, which is the whole content of the wake rows. They are not pulsed and they are not
+            # synchronised -- `cd_usb` is the clock the row stops.
+            l.wake, l.stp_drive, l.stp_pad, l.stp_driving,
             l.done, l.err_dir_abort, l.err_nxt_timeout, l.err_no_clock, l.err_reset,
             l.dir_now, l.oe_now, l.state, l.last_bus_waited, l.last_retry,
             l.cnt_access, l.cnt_dir_abort, l.cnt_timeout, l.cnt_reset, l.cnt_no_clock,
-            p.data.o, p.data.oe, p.data.i, p.stp, p.dir, p.nxt,
+            p.data.o, p.data.oe, p.data.i, p.stp.o, p.stp.oe, p.stp.i, p.dir, p.nxt,
         }
 
 

@@ -76,7 +76,10 @@ from migen import *
 from litex.gen import LiteXModule
 from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 
-from litex_boards.extensions.pano_ulpi import UlpiLink, ack_unpack
+# `_inc_sat` lives in pano_ulpi.py because it is what the Link's own error counters use; the wake
+# refuse counter is the fifth user and the sixth would be a copy of a saturating adder in a file that
+# cannot be tested against the other five. Import it, do not re-derive it.
+from litex_boards.extensions.pano_ulpi import UlpiLink, ack_unpack, _inc_sat
 
 __all__ = ["UlpiCsr", "UlpiCsrRules", "ACK_WIDTH"]
 
@@ -136,6 +139,10 @@ class UlpiCsrRules(Module):
         self.cmd   = Signal()
         self.addr  = Signal(6)
         self.wdata = Signal(8)
+        # `wake_req`: what `ulpi_wake.storage` holds. `wake_applied`: what the pad is allowed to see. They
+        # are different signals because they must be -- see the refuse rule below, and spec decision C.
+        self.wake_req = Signal()
+        self.stp_drive_req = Signal()
         # --- in: the Link's cd_sys host side -------------------------------------------------------------
         self.h_busy     = Signal()
         self.h_ack      = Signal()
@@ -149,6 +156,64 @@ class UlpiCsrRules(Module):
         # --- out: what the host reads back -----------------------------------------------------------------
         self.rdata   = Signal(8)
         self.refused = Signal()
+        self.wake_applied      = Signal()
+        # **reset = 1, and it is the CSR's reset value, not a default.** `stp_drive_applied` is what reaches
+        # the pad's output enable; 0 there TRI-STATES A5. Every spin before this ticket drove `stp` low as the
+        # ULPI idle level requires (ULPI 1.1 §2.3.2), so a rules module that comes out of reset with 0 would
+        # hand the pad to whatever is on the board the moment the FPGA configures, on a build whose CSR reads
+        # "driving". It must also agree with `UlpiMaster.stp_drive_en`'s own reset, or the two halves of one
+        # promise disagree during the boot clear.
+        self.stp_drive_applied = Signal(reset = 1)
+        self.pad_refused       = Signal(8)
+
+        # ---- `wake`, and why the stored level is not the applied level ------------------------------------
+        # `ulpi_wake` asserts `stp` asynchronously into a PHY that may be holding a transaction open. ULPI
+        # §3.8.4.2 makes that a *packet-ending* event ("the PHY decodes stp as the end of a transmit"), so an
+        # applied-in-the-middle `wake` would end a transfer the host never asked to end -- the same class of
+        # fault as bug 4, where an `abort` written on an idle link aborted the NEXT access. Decision C: apply
+        # the level only while the bridge reports nothing in flight, and count the refusal.
+        #
+        # The predicate is `h_busy` and nothing else, for the reason decision C states: `bridge.busy` is
+        # `cd_sys`, so it is a real answer in the state the wake exists for. Anything from `cd_usb` (`state`,
+        # `oe`, `xfer_active`) is FROZEN there, not false, and a refusal predicate built on a frozen signal is
+        # a policy that quietly stops working when it is needed. `phy_reset` is deliberately NOT part of the
+        # predicate: §6.1.9.3 asks for `stp` asserted while a hardware reset is applied, and ADR-0006's rule
+        # for a rule about the far side is detect-and-report, not gate (that is ticket 01's open question 1,
+        # answered here: a `wake` is legal during a PHY reset).
+        #
+        # Both directions of the level go through the same gate. Dropping `wake` is the §3.9.4 *false-resume*
+        # case -- release `stp` before the PHY has had its clock and it goes back to sleep -- and a drop that
+        # arrived mid-access is exactly as unwelcome as an assert that did; the harness drops it when the link
+        # is idle, or not at all.
+        # Both are *edges of the stored bit*, not levels, and that is a decision rather than a detail. Two
+        # wrong shapes were available:
+        #   * `If(~busy, applied := req)` follows the level whenever the link goes quiet, so a `wake` written
+        #     during an access is applied ~ms later to a board whose host has moved on -- `stp` asserting by
+        #     itself, from a write nobody now remembers making. Spec decision C says DROPPED, and a dropped
+        #     write must stay dropped.
+        #   * counting "while busy and different" counts every `cd_sys` cycle of a stalled access, so the
+        #     counter saturates in 5 us and the delta the harness reads means nothing.
+        # So: a change of the stored bit is one attempted write, exactly like `go`'s edge, and it is either
+        # applied (link idle) or dropped-and-counted (link busy). A refused write is not queued and not
+        # retried: the operator writes 0 then 1, which is already this map's documented way to force an event
+        # (`ulpi_go`), and `ulpi_stp_pad` is the register that says what is really on the pin when the stored
+        # bit and the pad disagree.
+        prev_wake, prev_stp_drive = Signal(), Signal()
+        self.sync += [prev_wake.eq(self.wake_req), prev_stp_drive.eq(self.stp_drive_req)]
+        wake_change, stp_change = Signal(), Signal()
+        self.comb += [wake_change.eq(self.wake_req ^ prev_wake),
+                      stp_change.eq(self.stp_drive_req ^ prev_stp_drive)]
+        self.sync += If(wake_change & ~self.h_busy, self.wake_applied.eq(self.wake_req))
+        self.sync += If(stp_change & ~self.h_busy,
+                        self.stp_drive_applied.eq(self.stp_drive_req))
+        self.sync += If((wake_change | stp_change) & self.h_busy, _inc_sat(self.pad_refused))
+        # And the converse door: a `go` while `wake` is applied does not start an access. §6.1.9.2's own
+        # figure has the Link driving *idle* for the whole resume window, because the PHY is running its
+        # start-up sequence and cannot answer a CMD byte; a Link that drove a TX CMD into that window would
+        # get an abort or a corrupt byte and would report it as a link fault. Refused here (ticket 01 open
+        # question 2, answered: refuse) and witnessed in `refused`, whose description names both causes -- the
+        # host that wrote `wake` knows which one it caused, and one bit with two documented meanings is a
+        # better object than a second bit nobody reads.
 
         go_edge, abort_edge = Signal(), Signal()
         prev_go, prev_abort = Signal(), Signal()
@@ -162,8 +227,8 @@ class UlpiCsrRules(Module):
         ]
         # `h_req` is one cycle in cd_sys and the bridge ignores it while busy -- so "while busy" here is
         # the bridge's own guard, restated only so it can be *counted* rather than lost.
-        self.comb += self.h_req.eq(go_edge & ~self.h_busy)
-        self.sync += If(go_edge & self.h_busy, self.refused.eq(1))
+        self.comb += self.h_req.eq(go_edge & ~self.h_busy & ~self.wake_applied)
+        self.sync += If(go_edge & (self.h_busy | self.wake_applied), self.refused.eq(1))
         self.comb += [
             self.h_rw.eq(self.cmd),
             self.h_addr.eq(self.addr),
@@ -252,14 +317,17 @@ class UlpiCsr(LiteXModule):
                              "extensions/usb/sim/ulpi_abort_idle_tb.v and kept red-able by tools/ulpi_mutate.py "
                              "'s abort_idle mutation.")
 
-        self.refused = CSRStatus(description="STICKY BIT, not a counter: once one ulpi_go has arrived "
-                             "while an access was running this reads 1 and stays 1 until the bitstream "
-                             "reloads. The bridge is single-outstanding on purpose, so a go cannot be "
-                             "queued -- but a dropped go must never be silent, because the status word it "
-                             "left behind still describes the PREVIOUS access and reads as a fresh success. "
-                             "So it answers 'has anything been dropped since boot' (acceptance row A0) and "
-                             "NOT 'how many, and when': per-phase accounting is ulpi_cnt_access against the "
-                             "go writes the harness knows it issued.")
+        self.refused = CSRStatus(description="STICKY BIT, not a counter: once one ulpi_go has been DROPPED "
+                             "this reads 1 and stays 1 until the bitstream reloads. The bridge is "
+                             "single-outstanding on purpose, so a go cannot be queued -- but a dropped go "
+                             "must never be silent, because the status word it left behind still describes "
+                             "the PREVIOUS access and reads as a fresh success.\n"
+                             "TWO causes, one bit, since 2026-11-02: a go against a busy link, and a go "
+                             "while ulpi_wake = 1 (the second is §6.1.9.2's rule that the Link drives IDLE "
+                             "during a resume, not a command). It is not split, because the question it "
+                             "answers is 'has this map ever dropped a request since boot' (acceptance row "
+                             "A0) and not 'which', and the harness that wrote ulpi_wake knows which it "
+                             "caused. A per-write count is ulpi_cnt_access and ulpi_cnt_pad_refused.")
 
         self.cnt_access    = CSRStatus(16, description="Completed accesses (ack), saturating.")
         self.cnt_dir_abort = CSRStatus(8,  description="Accesses that saw a dir abort. A successful "
@@ -279,6 +347,59 @@ class UlpiCsr(LiteXModule):
                              "verdict today and a different diagnosis next month.")
         self.retry = CSRStatus(4, description="dir aborts the LAST access retried (0 = clean).")
 
+        # --- the wake path and the `stp` pad readings, APPENDED LAST ---------------------------------------
+        # Appended, never inserted: ADR-0007, and `tools/test_ulpi_csr_map.py` refuses a build where a
+        # spin-1 address moved. These four are the whole `ulpi_*` addition of the wake ticket and the four
+        # addresses ticket 02 hard-codes; the order here IS the map.
+        self.wake = CSRStorage(description="1 = hold the ULPI `stp` pad high, asynchronously, with no "
+                             "cd_usb edge required. This is the ONLY way out of a PHY in Low Power Mode: "
+                             "USB3300 §6.1.9 says clearing `SuspendM` (bit 6 of Function Control, 0x04) "
+                             "stops the PHY's clock and asserts dir, and §6.1.9.2 / ULPI 1.1 §3.9.3 say the "
+                             "exit is the Link asserting stp -- which every other writer of stp in this "
+                             "design cannot do, because `stp_drive` lives in the clock that just stopped.\n"
+                             "A LEVEL, not a pulse: T_START is 2.25-3.5 ms (RESEARCH.md §7.6) and one "
+                             "transaction on this link costs ~20 ms, so a host-side pulse-and-poll is a race "
+                             "that is lost by construction. Assert it, walk away, come back.\n"
+                             "REFUSED while ulpi_status.busy = 1 (and counted by ulpi_cnt_pad_refused): "
+                             "asserting stp in the middle of someone's transaction is §3.8.4.2's end-of-"
+                             "packet event. A refused write is DROPPED, not queued -- write 0 then 1 to try "
+                             "again, the same way ulpi_go works.\n"
+                             "RELEASE IT ONLY WHEN THE LINK IS IDLE AND THE CLOCK IS BACK (§3.9.4). "
+                             "Releasing stp before the PHY drops dir returns it to Low Power Mode, so a "
+                             "timeout is not a reason to drop this bit; read ulpi_stp_pad/dir and decide."
+                             "\nAlso refused: a ulpi_go written while this reads 1 (witnessed in "
+                             "ulpi_refused). §6.1.9.2's figure has the Link driving idle for the whole resume "
+                             "window, and a CMD byte driven into a PHY that is still starting up is a fault "
+                             "report, not a read.")
+        self.stp_drive = CSRStorage(reset = 1, description="1 (the default, and every spin before this one) "
+                             "= we drive the stp pad, which is what ULPI requires of a Link: the idle level "
+                             "is stp low with data at 00h. Write 0 to TRI-STATE A5 so that ulpi_stp_pad "
+                             "becomes a reading of the BOARD instead of a reading of our own output driver -- "
+                             "that is TODO (e), whether anything pulls the wake line up.\n"
+                             "This changes what the PHY sees on a running interface: a floating stp is not "
+                             "the ULPI idle level. Read it, then write 1 back. It is refused while "
+                             "ulpi_status.busy = 1 for that reason (ulpi_cnt_pad_refused), and `wake` "
+                             "outranks it: asserting wake drives the pad whatever this says, because a wake "
+                             "that a stray 0 could switch off is the same bug as a wake that `clear` could "
+                             "switch off.")
+        self.stp_pad = CSRStatus(2, description="bits [0] the level on the stp pad (A5), as its own input "
+                             "receiver sees it; [1] = WE are driving it. Read them together, and read [1] "
+                             "first: with [1]=1 this says what our flop drove and NOTHING about the board "
+                             "(docs/NOTES.md, learned the expensive way on W12 -- a pad's level read-back "
+                             "while its output driver is enabled is not a measurement of the pin). With "
+                             "[1]=0 it is a reading: 0 with no driver = no pull-up, TODO (e) answered.\n"
+                             "While [1]=0 the pad is floating and the PHY may see anything on it; see "
+                             "ulpi_stp_drive.")
+        self.cnt_pad_refused = CSRStatus(8, description="Writes to ulpi_wake or ulpi_stp_drive that arrived "
+                             "while an access was running and were DROPPED (saturating). One counter for "
+                             "both, because they are one rule -- 'a write that changes what the PHY sees on "
+                             "stp, while the link owns a transaction'; the harness knows which write it "
+                             "issued, and the alternative was a register nobody reads. Not the same witness "
+                             "as ulpi_refused, which is sticky and about go: this one answers 'how many, and "
+                             "did the one I just tried land', which is what a bench operator asks while "
+                             "holding a dark board.\nIf this moves and the clock did not come back, the "
+                             "write never reached the pad: retry with the link idle (write 0, then 1).")
+
         # --- request: the CSR map -> the Link's cd_sys host side ----------------------------------------
         # All of the behaviour lives in `UlpiCsrRules`, whose ports are plain Signals so that
         # `tools/ulpi_csr_rules_sim.py` can drive it without a CSR model. What is left here is plumbing:
@@ -291,6 +412,13 @@ class UlpiCsr(LiteXModule):
             self.rules.cmd.eq(self.cmd.storage[0]),
             self.rules.addr.eq(self.addr.storage[:6]),
             self.rules.wdata.eq(self.wdata.storage[:8]),
+            self.rules.wake_req.eq(self.wake.storage[0]),
+            self.rules.stp_drive_req.eq(self.stp_drive.storage[0]),
+            self.link.wake.eq(self.rules.wake_applied),
+            self.link.stp_drive.eq(self.rules.stp_drive_applied),
+            self.stp_pad.status[0].eq(self.link.stp_pad),
+            self.stp_pad.status[1].eq(self.link.stp_driving),
+            self.cnt_pad_refused.status.eq(self.rules.pad_refused),
             self.rules.h_busy.eq(self.link.h_busy),
             self.rules.h_ack.eq(self.link.h_ack),
             self.rules.h_ack_data.eq(self.link.h_ack_data),
