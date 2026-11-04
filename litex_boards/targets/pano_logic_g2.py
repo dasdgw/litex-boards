@@ -71,6 +71,71 @@ from migen.fhdl.specials import Tristate
 
 from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
 from litex_boards.extensions.pano_ulpi_scope import UlpiUsbScope
+from litex_boards.extensions.pano_usb_host import UsbHostCore
+
+# The vendor cores' Wishbone window, and where their Verilog comes from -------------------------------
+# PLAN.md M3. `usbh_host` decodes `cfg_awaddr_i[7:0]` and its registers end at 0x20, so the window is 4 KiB
+# and the top bits are pure chip-select: a smaller region would still work and a larger one would overlap
+# nothing, so the number is a map decision and not a technical one. It is here rather than inline because
+# M4's device tree has to say the same address, and an address that lives in two files is two addresses.
+USB_HOST_BASE_DEFAULT = 0xC0000000
+USB_HOST_SIZE        = 0x1000
+
+# The two upstream trees, by environment variable and with the defaults this host uses. They are NOT vendored
+# into litex-boards: `tools/usbh_ls_timing.py` judges `core_usb_host@81eb9f1` by A/B against that exact commit,
+# and a copy inside a third repo is a second source of truth that can drift from the one being tested. A build
+# on a machine without them refuses (see `add_usb_host_sources`) rather than producing a netlist with an
+# `Instance` of a module nobody compiles -- which Xilinx reports at the end of a two-minute run instead of at
+# the start of a two-second one.
+CORE_USB_HOST_DEFAULT    = os.path.expanduser("~/fpga/upstream/core_usb_host")
+CORE_ULPI_WRAPPER_DEFAULT = os.path.expanduser("~/fpga/upstream/core_ulpi_wrapper")
+
+
+def add_usb_host_sources(platform, core_usb_host=None, core_ulpi_wrapper=None):
+    """Add `core_usb_host` + `core_ulpi_wrapper` Verilog to `platform`. Returns the file list it added.
+
+    Two things this function exists to get right, both of them the 2023 wrapper getting them wrong:
+
+    * **`usbh_host_defs.v` is `include`d, not compiled.** ``usbh_host.v:35`` says
+      ```include "usbh_host_defs.v"``, so it belongs on the *include path* and not in the source list. Adding
+      it as a compilation unit too is not an error, it is a warning and a redefinition -- which is exactly the
+      kind of noise that makes a real one scroll past. The include path is added for the whole directory, the
+      sources are listed explicitly, and the exclusion is asserted rather than assumed.
+    * **Paths are absolute and come from the environment.** The 2023 code passed
+      ``add_source_dir("core_usb_host/src_v")`` -- a path relative to the *build* directory, which only worked
+      because something else copied the tree in first. A relative path here would build on the machine that
+      happens to have a scratch copy and fail on every other one.
+
+    Raises with the env var named when a tree is missing; never silently skips.
+    """
+    core_usb_host     = core_usb_host     or os.environ.get("CORE_USB_HOST", CORE_USB_HOST_DEFAULT)
+    core_ulpi_wrapper = core_ulpi_wrapper or os.environ.get("CORE_ULPI_WRAPPER", CORE_ULPI_WRAPPER_DEFAULT)
+
+    for name, root, sub in (("CORE_USB_HOST", core_usb_host, "src_v"),
+                            ("CORE_ULPI_WRAPPER", core_ulpi_wrapper, "src_v")):
+        if not os.path.isdir(os.path.join(root, sub)):
+            raise EnvironmentError(
+                "%s=%s has no %s/. The USB host core is not vendored here on purpose (it is the tree "
+                "tools/usbh_ls_timing.py A/B-tests at commit 81eb9f1); point the variable at a checkout or "
+                "build without --with-usb-host." % (name, root, sub))
+
+    added = []
+    host_v  = os.path.join(core_usb_host, "src_v")
+    wrapp_v = os.path.join(core_ulpi_wrapper, "src_v")
+    platform.add_verilog_include_path(host_v)
+    for d in (host_v, wrapp_v):
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".v"):
+                continue
+            if fn == "usbh_host_defs.v":
+                continue                      # `include`d by usbh_host.v:35, not a compilation unit
+            platform.add_source(os.path.join(d, fn))
+            added.append(os.path.join(d, fn))
+    # The wrapper's own defs, if it gains them, must be found the same way; asserting the include path covers
+    # the one file we know is included keeps this honest if upstream splits the header.
+    assert os.path.exists(os.path.join(host_v, "usbh_host_defs.v")), \
+        "usbh_host_defs.v is missing from %s: the `include` at usbh_host.v:35 cannot resolve" % host_v
+    return added
 
 # ULPI Probe ---------------------------------------------------------------------------------------
 
@@ -979,6 +1044,11 @@ class BaseSoC(SoCCore):
         ulpi_stall_timeout = 1 << 16,
         ulpi_retry_limit   = 3,
         ulpi_io_offsets    = True,
+        with_usb_host      = False,
+        usb_host_base      = USB_HOST_BASE_DEFAULT,
+        usb_clk_freq       = 60e6,
+        usb_bridge_timeout_ms = 10,
+        usb_irq          = 1,
         **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         assert sdram_chip in ["a", "b"]
@@ -986,8 +1056,27 @@ class BaseSoC(SoCCore):
         # CRG --------------------------------------------------------------------------------------
         # Requested once here and handed down: `platform.request()` consumes the resource, so a second
         # request for the same group anywhere else fails with "Resource not found".
-        ulpi_pads   = platform.request("ulpi") if (with_ulpi_probe or with_ulpi_master) else None
-        refclk_pads = platform.request("usb_refclk") if (with_ulpi_probe or with_ulpi_master) else None
+        # Three possible owners of these pads now: the probe (observe + its own idle level), the ULPI Link
+        # (`--with-ulpi-master`, RegRead/RegWrite only), and the vendor host core (`--with-usb-host`). The
+        # request is unconditional on which one, because the platform's `ulpi` group is a single resource and
+        # requesting it twice is a LiteX error we do not want to reach; the *ownership* is decided below, by
+        # asserts that fire before any pad is driven.
+        ulpi_pads   = platform.request("ulpi") \
+                      if (with_ulpi_probe or with_ulpi_master or with_usb_host) else None
+        refclk_pads = platform.request("usb_refclk") \
+                      if (with_ulpi_probe or with_ulpi_master or with_usb_host) else None
+        if with_usb_host:
+            # Both before anything is built. The first is decision 8 restated for a third owner: the probe
+            # keeps PHY reset, the clock meter and the W12 refclock, and a core that re-derives them is a
+            # second opinion where the bench needs one. The second is the pad: `data` and `stp` cannot have
+            # two drivers, and the Link's `bus_grant.eq(1)` interlock -- whose comment already says "a future
+            # second owner must fail here rather than share the pads silently" -- is that sentence as a net.
+            assert with_ulpi_probe, "--with-usb-host needs --with-ulpi-probe: the probe owns phy_reset, " \
+                                    "clk_ok and the W12 refclock (spec decision 8, decision 14)."
+            assert not with_ulpi_master, "--with-usb-host and --with-ulpi-master both own the ULPI data/stp " \
+                                         "pads. Two masters on one bus is a bus fight, not an arbitration: " \
+                                         "`ulpi_wake`, `stp` and the idle level would have two writers. Build " \
+                                         "one at a time; M3's build check says which is which."
 
         if with_ulpi_probe:
             # Built before the probe so the probe can be handed the clock and, more importantly, its lock.
@@ -1126,8 +1215,10 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 refclk_lock  = self.refclk_pll.lock  if with_ulpi_probe else None,
                 hub_rst_pad  = platform.request("usb_hub_rst_n"),
                 with_analyzer= with_analyzer,
-                # With the Link present it owns the pads; see the flag's comment in ULPIProbe.
-                bus_owner    = with_ulpi_master)
+                # With the Link OR the host core present it owns the pads; see the flag's comment in
+                # ULPIProbe. The probe keeps every register and every analyzer slot either way -- they just
+                # observe the owner instead of driving an idle level themselves.
+                bus_owner    = with_ulpi_master or with_usb_host)
             if w12_pullup and refclk_pads is not None:
                 # The pull-up half of "floating or actively held". An attribute on the NET, because that
                 # is all PULLUP is on this FPGA -- see the W12 block in ULPIProbe.
@@ -1222,6 +1313,87 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 # to isolate which constraint a failure belongs to on a bench, never to make a report prettier.
                 self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns,
                                           cd_sys = self.crg.cd_sys.clk)
+
+        # The USB host core (PLAN.md M3) ---------------------------------------------------------------
+        # `core_usb_host` + `core_ulpi_wrapper`, behind `Wishbone2AXILiteCDC` (cd_sys -> cd_usb). Built AFTER
+        # the probe for the same reason the Link is: `clk_ok` and the logical PHY reset come from it, and the
+        # function signature enforces that better than a comment would.
+        #
+        # What this build LOSES, stated here because it is the first thing to ask when a byte is wrong:
+        # `usb_scope` -- the 60 MHz capture -- belongs to `UlpiCsr`'s Link, so **a --with-usb-host spin has no
+        # instrument on the ULPI bytes at all**. The 50 MHz `analyzer` still sees `dir`/`nxt`/`oe` transitions
+        # (the probe keeps those taps and they are fed from the core's registered views below), and the core's
+        # own FIFO/state registers are readable through `usb_host_ctrl`, but a wrong *byte* costs a logic
+        # analyser on the pads instead of `litescope_cli --csv=usb_scope.csv`. That is a deliberate trade for
+        # M3 (the question is "does a transfer happen and does the window answer"), and it is the argument for
+        # moving the capture taps onto the pads rather than onto the Link, which is M5 work.
+        if with_usb_host:
+            # FIRST, before the map is touched: it is the cheapest precondition this block has, and the order
+            # is a measured lesson. With the sources added last, a machine without the trees died at
+            # `self.irq.add(...)` with a bare `litex.soc.integration.soc.SoCError` naming neither the tree nor
+            # `$CORE_USB_HOST` -- the refusal still happened, but not in a sentence anyone could act on, which
+            # is the difference between a guard and a mystery.
+            add_usb_host_sources(platform)
+            assert getattr(self, "cpu", None) is not None and \
+                   getattr(self.cpu, "interrupt", None) is not None, \
+                "--with-usb-host needs a CPU with an interrupt input: `usbh_host.o_intr_o` has nowhere to go " \
+                "otherwise, and LiteX's own answer is a bare SoCError from irq.add. M3's spin is " \
+                "`--cpu-type=vexriscv --cpu-variant=linux`; a CPU-less probe spin has nothing to interrupt."
+            self.usb_host = UsbHostCore(ulpi_pads,
+                clk_ok       = self.probe.clk_ok.status,
+                phy_reset    = self.probe.rst_level_logical,
+                sys_clk_freq = sys_clk_freq,
+                usb_clk_freq = usb_clk_freq,
+                timeout_ms   = usb_bridge_timeout_ms,
+            )
+            # 4 KiB at 0xC000_0000 (see USB_HOST_BASE_DEFAULT). LiteX's own interconnect refuses two slaves
+            # on one range, so an overlap is a build error and not a silent alias -- the reason no local check
+            # duplicates that arithmetic here.
+            #
+            # **Inside the window, offsets >= 0x100 DO alias, and that is stated rather than fixed.** The
+            # bridge crosses six address bits because that is all the core decodes (`cfg_awaddr_i[7:0]`,
+            # usbh_host.v:53), so a write to +0x100 arrives as +0x00. Shrinking the region to 256 bytes would
+            # turn the alias into an unmapped access, which on LiteX means *no ack at all* -- a hung CPU
+            # instead of a wrong register, and a worse failure to diagnose over a 20 ms serial link. The row
+            # `read-addr-above-core-decode` (tools/wb_axil_cdc_sim.py) is what keeps this a known property
+            # instead of a surprise, and `--usb-host-base` exists so M4's DTS and this line cannot drift.
+            #
+            # `cached=False` is LiteX making the argument for us: an IO-region region may not be cached
+            # (`ERROR:SoCBusHandler: usb_host_ctrl Region in IO region, it can't be cached`), which is also
+            # the only sane mapping for a FIFO door — a cached `USB_XFER_TOKEN` write is a write nobody
+            # performed. It is the same reason the core was chosen over a DMA core (PLAN.md: FIFO only, no
+            # coherency protocol to build), so the property arrives from the bus layer rather than as a
+            # custom flag.
+            self.bus.add_slave("usb_host_ctrl", self.usb_host.wishbone,
+                               SoCRegion(size=USB_HOST_SIZE, origin=usb_host_base,
+                                         mode="rw", cached=False))
+            # An asserted location, not the first free one -- and 0 is NOT free here: this build's own log
+            # says `timer0 IRQ allocated at Location 0`, which is what the first draft of this line found in
+            # twenty seconds instead of at the end of a synth run. 1 is chosen because it is free on every map
+            # this repo has built, and because PLAN.md M4.1's device tree will say the number we allocated
+            # rather than the number the allocator happened to reach for: `use_loc_if_exists=True` would make
+            # "the DTS matches the bitstream" a promise that changes whenever another interrupt source is
+            # added. If this raises, the fix is a deliberate change here AND in the DTS, never a quieter flag.
+            self.irq.add("usb_host", usb_irq)
+
+            # The probe's two pad views, now the core's. Registered drivers rather than TSTriple internals,
+            # which is the ERROR:Pack:2531 rule the W12 group and the Link both already obey: pulling an
+            # output cell's Q side back into fabric makes the packer refuse the design. `bus_oe` is the
+            # wrapper's turnaround release (`~dir`) and `bus_o` its `ulpi_data_q`, so `probe_oe` on this spin
+            # means "we are driving", exactly as ADR-0008 made it mean for the Link.
+            self.comb += [
+                self.probe.bus_oe.eq(self.usb_host.bus_oe),
+                self.probe.bus_o.eq(self.usb_host.bus_o),
+            ]
+
+            if ulpi_io_offsets:
+                # The same OFFSET block the Link build emits -- these are the same pads, and ADR-0005's
+                # accepted deficit applies to whatever drives them. `cd_sys=None` on purpose: the false-path
+                # line that usually travels with it names the probe's `ulpi_wake` net, which exists only in a
+                # --with-ulpi-master build, and `add_platform_command` accepts a NET line about a net that is
+                # not there with a warning nobody reads (`tools/test_ulpi_csr_map.py` refuses a surviving
+                # brace for exactly that reason).
+                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns, cd_sys = None)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -1368,6 +1540,31 @@ def main():
              "on the ULPI input pads in the PHY's clock domain, so it is the thing to remove when a timing "
              "failure on those pads needs an owner. Not a way to get a greener report: without it a wrong "
              "byte costs another spin instead of another capture.")
+    parser.add_target_argument("--with-usb-host", action="store_true",
+        help="Add the Track A USB host: `core_usb_host` + `core_ulpi_wrapper` on the PHY's 60 MHz, behind a "
+             "cd_sys->cd_usb Wishbone window at --usb-host-base (PLAN.md M3). Needs --with-ulpi-probe, which "
+             "keeps owning phy_reset, clk_ok and the W12 refclock, and is MUTUALLY EXCLUSIVE with "
+             "--with-ulpi-master: both drive ulpi data/stp. Also needs $CORE_USB_HOST and $CORE_ULPI_WRAPPER "
+             "pointing at the vendor checkouts (the tree tools/usbh_ls_timing.py A/B-tests at 81eb9f1); the "
+             "build refuses without them rather than emitting a netlist with an uncompiled Instance. Note what "
+             "this spin has no instrument for: `usb_scope` belongs to the Link, so ULPI *bytes* are not "
+             "capturable here -- see the block in the target.")
+    parser.add_target_argument("--usb-host-base", default=USB_HOST_BASE_DEFAULT, type=lambda x: int(x, 0),
+        help="Wishbone origin of the USB host register window (default 0xC0000000, size 4 KiB). M4's device "
+             "tree must say the same number; PLAN.md M4.1 owns that half.")
+    parser.add_target_argument("--usb-clk-freq", default=60e6, type=float,
+        help="Value passed to usbh_host's USB_CLK_FREQ parameter. It must be the PHY's REAL CLKOUT (60 MHz): "
+             "the core derives CLKS_PER_BIT from it, and the 2023 wrapper passed the string \"60e6\", which "
+             "migen emitted verbatim and the core turned into 5 -- a build with no error and no traffic.")
+    parser.add_target_argument("--usb-bridge-timeout-ms", default=10, type=float,
+        help="cd_sys cycles the Wishbone->AXI4-Lite bridge waits before it declares a crossed access lost. "
+             "A lost access is reported as `err`, never `ack`: a zero is a plausible USB_STATUS value "
+             "(tools/wb_axil_cdc_sim.py's `lost-is-err-not-ack`).")
+    parser.add_target_argument("--usb-irq", default=1, type=int,
+        help="IRQ line the USB host core's `intr_o` is wired to (default 1). 0 is NOT free: `timer0` takes "
+             "it on every map this repo builds. M4.1's device tree must say this same number, and a build "
+             "that refuses because the line is taken is the intended behaviour -- the fix is to change both "
+             "files deliberately, not to ask for the next free one.")
     parser.add_target_argument("--cpu-reset-pin", default=None,
         help="Also reset from this platform resource (active low, e.g. user_btn_n). Default: boot counter only.")
     ethopts = parser.target_group.add_mutually_exclusive_group()
@@ -1403,6 +1600,11 @@ def main():
         ulpi_stall_timeout  = args.ulpi_stall_timeout,
         ulpi_retry_limit    = args.ulpi_retry_limit,
         ulpi_io_offsets     = not args.no_ulpi_io_offsets,
+        with_usb_host       = args.with_usb_host,
+        usb_host_base       = args.usb_host_base,
+        usb_clk_freq        = args.usb_clk_freq,
+        usb_bridge_timeout_ms = args.usb_bridge_timeout_ms,
+        usb_irq               = args.usb_irq,
         **parser.soc_argdict
     )
     builder = Builder(soc, **parser.builder_argdict)
