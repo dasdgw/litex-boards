@@ -234,6 +234,16 @@ module ulpi_phy_model #(
             regs[6'h05] = 8'h41;
             regs[6'h06] = 8'h41;
             regs[6'h0A] = 8'h06;   // OTG Control POR
+            // The two Interrupt Enables were absent from BOTH models until 2026-11-04: the table diff compares
+            // this task against tools/ulpi_phy_model.py::PHY_POR, so an address missing from both agrees with
+            // itself and reads 00h by the zeroing loop above -- which is a CLAIM of 00h, and Table 6-3 says 1Fh.
+            // Neither model was ever wrong in a way the other could see. Bits 4:0 are
+            // HostDisconnect/VbusValid/SessValid/SessEnd/IdGnd, each default 1b; 7:5 reserved, driven low.
+            // `0x0D` is now also the register ticket 10 parks its second byte in, because these two are the only
+            // registers on this part whose WRITE is documented inert (RESEARCH.md §7.2 owns that argument, and
+            // the bit-by-bit reason 0x07 Interface Control and 0x0A OTG Control are NOT inert).
+            regs[6'h0D] = 8'h1F;   // USB Interrupt Enable Rising  (6.1.4.8)
+            regs[6'h10] = 8'h1F;   // USB Interrupt Enable Falling (6.1.4.9)
             regs[6'h15] = 8'h00;   // Debug: the linestates are overlaid at read time, not stored
         end
     endtask
