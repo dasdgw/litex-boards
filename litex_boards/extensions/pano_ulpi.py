@@ -135,6 +135,7 @@ from litex_boards.extensions.pano_cdc import CdcLevel, ReqAckCDC
 
 __all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
            "STATUS_FIELDS", "status_decode", "ulpi_io_windows", "ulpi_output_budget", "ulpi_budget_name",
+           "PANO_TDD_MAX_NS", "PANO_TDD_MIN_NS", "PANO_TSD_MIN_NS",
            "ulpi_ucf_lines",
            "UlpiMaster", "UlpiLink", "UlpiClear"]
 
@@ -175,23 +176,38 @@ def status_decode(word):
 ULPI_TDD_MAX_NS = 9.0    # CLKOUT rising -> PHY drives data/stp (max)
 ULPI_TDD_MIN_NS = 0.0    # CLKOUT rising -> PHY releases data/stp (min). ULPI 1.1 Table 5 lists **no**
                          # minimum for control/data out, so 0 is the conservative reading of the ceiling
-                         # and not a measurement. The soldered part (USB3300 Table 6-2) says 2.0, and
-                         # whether that part budget is admissible for this board is
-                         # `.scratch/usb-core-m3/issues/10` (open, ready-for-human): it also moves
-                         # `T_SD`/`TSD_min` from 6.0 to 5.0, which is ADR-0005's territory.
+                         # and not a measurement. It is also why the ceiling is structurally tight rather
+                         # than merely tight: `trce`'s hold allowance is `v - d = TDD_min - skew`, so at 0
+                         # the hold requirement becomes `F <= -skew` -- the design must out-hold a board
+                         # term we have never measured. That is what ADR-0011 spent portability to buy
+                         # back; the soldered part (USB3300 Table 6-2) says 2.0.
 ULPI_TSD_MIN_NS = 6.0    # the PHY must see our data this far before the next CLKOUT rising edge
 
 # The same two quantities for the part that is physically on this board: `datasheets/usb3300.pdf` §6.1.3,
 # Table 6-2 ("The USB300 PHY provides CLKOUT and all timing is relative to the rising clock edge ... apply
 # to Synchronous Mode only" -- that is us): output delay `T_DC`/`T_DD` **min 2.0 / max 5.0** ns, setup at the
-# PHY `T_SC`/`T_SD` **5.0** ns, hold 0. They are here so a spin can *name* the budget it chose
-# (`--ulpi-tdd-min-ns=2 --ulpi-tdd-max-ns=5 --ulpi-tsd-min-ns=5`) and so `ulpi_budget_name()` can tell the
-# two apart in a build log. **Using them is not free**: it is `.scratch/usb-core-m3/issues/10`, because a
-# design constrained to a part's numbers is not portable to another ULPI PHY, and the `T_SD` half moves the
-# output budget ADR-0005's accepted deficit was measured against by 1.0 ns.
+# PHY `T_SC`/`T_SD` **5.0** ns, hold 0. They are here so a spin can *name* the budget it chose and so
+# `ulpi_budget_name()` can tell the candidates apart in a build log.
 USB3300_TDD_MIN_NS = 2.0
 USB3300_TDD_MAX_NS = 5.0
 USB3300_TSD_MIN_NS = 5.0
+
+# **ADR-0011 (docs repo, accepted 2026-11-05): the budget this board builds with.** The operator decided the
+# design is explicitly Pano Logic G2-specific, so the input side may be written against the PHY that is
+# soldered to it. Only the `T_DD` pair is taken, and the reason is arithmetic rather than taste:
+#  * `TDD_min` is the **only term that produces a hold allowance at all** (`v - d = TDD_min - skew`), so taking
+#    2.0 removes a structural requirement to out-hold an unsourced `skew`. ~4 ns of setup allowance with it.
+#  * `T_SD = 5.0` moves a **verdict** and nothing else: every `OFFSET = OUT` row 1.0 ns kinder, `data` to
+#    roughly even, `stp` still failing, no change to the design. That verdict is the deficit **ADR-0005**
+#    accepted on the 6.0 basis and the board has since judged, so taking it would re-baseline an accepted
+#    deviation as a side effect of an input-side decision -- refused. **Do not pass `--ulpi-tsd-min-ns 5`
+#    without a new ADR superseding ADR-0005 and the deficit re-measured.**
+# The **defaults stay the ceiling** on purpose: an un-flagged build remains the conservative one, and
+# `tools/test_ulpi_ucf.py` (docs repo) pins the default text deliberately. Flipping them is a separate,
+# ordered decision -- see docs/ULPI_COMPLIANCE.md for what it takes to go back the other way.
+PANO_TDD_MAX_NS = USB3300_TDD_MAX_NS
+PANO_TDD_MIN_NS = USB3300_TDD_MIN_NS
+PANO_TSD_MIN_NS = ULPI_TSD_MIN_NS
 
 
 def ulpi_budget_name(tdd_max_ns = ULPI_TDD_MAX_NS, tdd_min_ns = ULPI_TDD_MIN_NS,
@@ -204,6 +220,11 @@ def ulpi_budget_name(tdd_max_ns = ULPI_TDD_MAX_NS, tdd_min_ns = ULPI_TDD_MIN_NS,
         return "ULPI 1.1 Table 5 ceiling"
     if triple == (float(USB3300_TDD_MAX_NS), float(USB3300_TDD_MIN_NS), float(USB3300_TSD_MIN_NS)):
         return "USB3300 Table 6-2 (the soldered part)"
+    # ADR-0011's budget is a *pair*, not the whole table, so it is a third named candidate and not `custom`:
+    # a build line that printed "custom" would lose the one property the budget line exists to provide, and
+    # `ulpi_t23`-style evidence would stop saying which two datasheets it was earned against.
+    if triple == (float(PANO_TDD_MAX_NS), float(PANO_TDD_MIN_NS), float(PANO_TSD_MIN_NS)):
+        return ("USB3300 Table 6-2 T_DD + ULPI 1.1 Table 5 T_SD (Pano-specific, ADR-0011)")
     return f"custom (TDD {tdd_min_ns}..{tdd_max_ns} ns, TSD {tsd_ns} ns)"
 
 
@@ -313,9 +334,10 @@ def ulpi_ucf_lines(clk_net = "usb_clk", clk_hz = 60e6, skew_ns = 0.0, data_net =
 
     The three `*_ns` arguments are the **budget**, and they are a decision rather than a reading: the
     defaults are the ULPI 1.1 Table 5 interoperability ceiling, while the soldered USB3300's own Table 6-2
-    is `tdd_max_ns = 5.0, tdd_min_ns = 2.0, tsd_ns = 5.0`. Which one this board is constrained to is
-    `.scratch/usb-core-m3/issues/10`; a spin chooses it with `--ulpi-tdd-*-ns` / `--ulpi-tsd-min-ns` and
-    does not edit this file, so the evidence says which budget a Timing Score was measured against.
+    is `tdd_max_ns = 5.0, tdd_min_ns = 2.0, tsd_ns = 5.0`. **ADR-0011 decided this board's budget: the part's
+    `T_DD` pair with Table 5's `T_SD`** (`PANO_*_NS` above), which is what `--ulpi-tdd-*-ns` is passed for and
+    what the build line prints through `ulpi_budget_name()`. A spin chooses the budget on its command line and
+    does not edit this file, so the evidence always says which budget a Timing Score was measured against.
     """
     offset_in, valid_in, offset_out = ulpi_io_windows(clk_hz = clk_hz, skew_ns = skew_ns,
                                                       tdd_max_ns = tdd_max_ns, tdd_min_ns = tdd_min_ns,

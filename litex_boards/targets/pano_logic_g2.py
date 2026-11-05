@@ -1441,7 +1441,14 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
           into that field is the bug this file had, and `trce`'s own `Requirement:` line caught it: it
           asked for clock-to-pad <= 6 ns and invented 4.67 ns of violation on every output.
 
-        **Which datasheet the numbers come from is a decision, and it is open.** The defaults are
+        **Which datasheet the numbers come from is a decision, and ADR-0011 made it** (docs repo, accepted
+        2026-11-05: this design is explicitly Pano Logic G2-specific). The budget this board builds with is
+        the soldered part's `T_DD` pair with ULPI's `T_SD` -- `--ulpi-tdd-max-ns 5 --ulpi-tdd-min-ns 2`, and
+        **not** `--ulpi-tsd-min-ns 5`, because `TDD_min` is the only term that produces a hold allowance at all
+        while `T_SD` only moves the verdict ADR-0005 was written against. The defaults below stay the ceiling
+        deliberately, so an un-flagged build is the conservative one; the route back to a portable budget, and
+        what it costs, is `docs/ULPI_COMPLIANCE.md`. The defaults are:
+
         ULPI v1.1 §3.7.2 Table 5, the "Output clock" group (`datasheets/ULPI_v1_1.pdf`; AN19.17 §5.1
         restates it and adds "it is expected that any SoC that integrates a link meets the setup and hold
         times defined here") -- the *interoperability ceiling*: `TDD_max = 9.0`, no `TDD` minimum
@@ -1449,8 +1456,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
         §6.1.3 Table 6-2 says `T_DC/T_DD = 2.0…5.0` and `T_SC/T_SD = 5.0`, which is 4 ns kinder on the
         input and 1 ns kinder on the output. `--ulpi-tdd-max-ns`, `--ulpi-tdd-min-ns` and
         `--ulpi-tsd-min-ns` pick one without editing code, so a Timing Score always records the budget it
-        was measured against; adopting the part's numbers changes the basis of ADR-0005 and is
-        `.scratch/usb-core-m3/issues/10` (ready-for-human). Table 5 also measures everything *at the PHY's
+        was measured against (`ulpi_budget_name()` names the ceiling, the whole part table, and ADR-0011's
+        hybrid as three distinct budgets). Table 5 also measures everything *at the PHY's
         clock pin*, which is why skew is a term of the constraint and not a rounding error.
 
         **History, because the same trap bit this file twice.**
@@ -1572,19 +1579,26 @@ def main():
     parser.add_target_argument("--ulpi-tdd-max-ns", default=ULPI_TDD_MAX_NS, type=float,
         help=f"PHY clock-to-out maximum, ns, for the ULPI input constraint. Default {ULPI_TDD_MAX_NS} is "
              "ULPI v1.1 s3.7.2 Table 5 (the interoperability ceiling). The soldered USB3300 says "
-             f"{USB3300_TDD_MAX_NS} (its s6.1.3 Table 6-2); which budget this board is constrained to is "
-             ".scratch/usb-core-m3/issues/10, so pick it here rather than editing the extension. It goes "
+             f"{USB3300_TDD_MAX_NS} (its s6.1.3 Table 6-2), and ADR-0011 decided this board builds with that "
+             f"value -- pass it on the command line (docs/COMMANDS.md) rather than editing the extension, so "
+             "the build log records the choice. It goes "
              "into OFFSET IN as `period - tdd_max - skew` (a margin before the capturing edge).")
     parser.add_target_argument("--ulpi-tdd-min-ns", default=ULPI_TDD_MIN_NS, type=float,
         help=f"PHY clock-to-out minimum, ns. Table 5 lists NO minimum for control/data out, so the default "
              f"{ULPI_TDD_MIN_NS} is the conservative reading, not a measurement; the USB3300 says "
              f"{USB3300_TDD_MIN_NS}. It is the only term that widens VALID: a byte released earlier means "
-             "the next one is not our problem for longer.")
+             "the next one is not our problem for longer -- and it is the only term that produces a HOLD "
+             "allowance at all, since trce's hold check is `valid - offset >= F` and `valid - offset` is "
+             "exactly `tdd_min - skew`. At the default 0 that requirement is `F <= -skew`: the design must "
+             "out-hold an allowance we have never measured. ADR-0011: this board builds with "
+             f"{USB3300_TDD_MIN_NS}, passed together with --ulpi-tdd-max-ns {USB3300_TDD_MAX_NS}.")
     parser.add_target_argument("--ulpi-tsd-min-ns", default=ULPI_TSD_MIN_NS, type=float,
         help=f"Setup the PHY needs on our outputs, ns, used as the OFFSET OUT *margin*. Default "
              f"{ULPI_TSD_MIN_NS} (Table 5); the USB3300 says {USB3300_TSD_MIN_NS}, which moves the budget "
              "trce checks (period - margin) by 1.0 ns and therefore moves the basis of the deficit "
-             "ADR-0005 accepted. Changing it with the input flags above is the same open decision.")
+             "ADR-0005 accepted. **ADR-0011 keeps this default on purpose**: taking the part's 5.0 would buy "
+             "a kinder verdict with no change to the design, so it needs a NEW ADR superseding ADR-0005 and "
+             "the deficit re-measured -- do not pass it alongside the two input flags.")
     parser.add_target_argument("--ulpi-stall-timeout", default=1 << 16, type=int,
         help="cd_usb cycles a ULPI access waits before it declares itself stuck (2^16 = ~1.1 ms). The PHY "
              "may hold nxt indefinitely per ULPI 1.1, so this bound is ours and is never evidence of a PHY "
