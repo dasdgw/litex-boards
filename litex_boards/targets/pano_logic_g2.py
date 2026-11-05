@@ -74,7 +74,7 @@ from litex_boards.extensions.pano_ulpi import (ULPI_TDD_MAX_NS, ULPI_TDD_MIN_NS,
                                              ulpi_budget_name)
 from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
 from litex_boards.extensions.pano_ulpi_scope import UlpiUsbScope
-from litex_boards.extensions.pano_usb_host import UsbHostCore
+from litex_boards.extensions.pano_usb_host import UsbHostCore, vendor_provenance
 
 # The vendor cores' Wishbone window, and where their Verilog comes from -------------------------------
 # PLAN.md M3. `usbh_host` decodes `cfg_awaddr_i[7:0]` and its registers end at 0x20, so the window is 4 KiB
@@ -121,6 +121,17 @@ def add_usb_host_sources(platform, core_usb_host=None, core_ulpi_wrapper=None):
                 "%s=%s has no %s/. The USB host core is not vendored here on purpose (it is the tree "
                 "tools/usbh_ls_timing.py A/B-tests at commit 81eb9f1); point the variable at a checkout or "
                 "build without --with-usb-host." % (name, root, sub))
+
+    # Record what is about to be compiled. On 2026-11-05 a spin went to the bench from a working tree that
+    # held both low-speed patch sets while its evidence cited the bare pinned commit, and nothing said so --
+    # HEAD was the pin, so `git log` looked clean. Loud, deliberately not refusing: the operator may intend
+    # the patch, and ADR-0010 already decided that a printed verdict beats a signature nobody reads.
+    # (`.scratch/usb-core-m3/issues/11-*.md`, "Separate hazard".) Note the two resolvers this exposes:
+    # `pano_usb_host.core_source_dirs()` exists too and nothing called it -- the promise in its docstring was
+    # the reason this line was invisible, so the print lives here, on the path a build actually takes.
+    for line in vendor_provenance({"core_usb_host": core_usb_host,
+                                   "core_ulpi_wrapper": core_ulpi_wrapper}):
+        print(line, flush=True)
 
     added = []
     host_v  = os.path.join(core_usb_host, "src_v")

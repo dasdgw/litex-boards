@@ -88,6 +88,7 @@ reason**. That is a claim about hardware we have not built yet; ticket 03 says h
 """
 
 import os
+import subprocess
 
 from migen import *
 from migen.genlib.cdc import MultiReg
@@ -117,6 +118,60 @@ USBH_REGS = {
 }
 
 
+# The commits the low-speed patch set (`tools/core_usb_host-*.patch`), `tools/sync_pin.txt` and every bench
+# note are written against. Not enforced by the build (see `vendor_provenance`), but named by it.
+CORE_SOURCE_PINS = {"core_usb_host": "81eb9f1", "core_ulpi_wrapper": "3c20296"}
+
+
+def _git_state(path):
+    """``(short_head, dirty_or_na)`` for a vendor checkout, never raising.
+
+    ``dirty_or_na`` is ``"clean"``, ``"DIRTY(+n)"`` (n = changed/untracked paths that would be compiled) or
+    ``"not a git tree"``. Read-only: ``rev-parse`` and ``status --porcelain`` write nothing, so a build can
+    ask this of a tree it is about to consume. Failures return ``("?", "git unavailable")`` rather than an
+    exception, because a provenance line must never be the reason a bench build dies.
+    """
+    def git(*args):
+        try:
+            r = subprocess.run(["git", "-C", path] + list(args), capture_output=True, text=True,
+                               timeout=20)
+        except Exception:
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    head = git("rev-parse", "--short", "HEAD")
+    if head is None:
+        return "?", "not a git tree"
+    status = git("status", "--porcelain", "--untracked-files=normal")
+    if status is None:
+        return head.strip(), "git unavailable"
+    n = len([line for line in status.splitlines() if line.strip()])
+    return head.strip(), ("clean" if n == 0 else "DIRTY(+%d)" % n)
+
+
+def vendor_provenance(roots=None):
+    """One line per vendor tree: which commit the build is about to compile, and whether it is unmodified.
+
+    **Why this exists, measured:** on 2026-11-05 a spin was built, loaded and pressed on the bench while
+    ``core_usb_host``'s working tree held both low-speed patch sets (``git status``: three modified files,
+    stamped the previous evening), and the evidence for that session cited the bare pinned commit. The tree
+    *was* the pin at HEAD, but the compiled text was not the pin's text, and **nothing in the build said
+    so** -- `ls-timing` is immune because it `git archive`s, and the build is what reaches a board. The rule
+    this implements is the cheap half of reproducibility: a build cannot be attributed after the fact unless
+    it records what it compiled, so it now records it. Loud, **not refusing** -- refusing would stop a bench
+    build for a condition the operator may well intend, and this repo has decided (ADR-0010) that a
+    measurement plus a printed verdict beats a signature nobody reads.
+    """
+    lines = []
+    for name, path in (roots if roots is not None else core_source_dirs()).items():
+        head, state = _git_state(path)
+        pin = CORE_SOURCE_PINS.get(name, "?")
+        off_pin = "" if head == pin else "  <<< NOT THE PIN (%s)" % pin
+        lines.append("CORE PROVENANCE: %-18s @ %-8s %-16s (pinned %s)%s  %s"
+                     % (name, head, state, pin, off_pin, path))
+    return lines
+
+
 def core_source_dirs():
     """The two vendor ``src_v`` directories, or a refusal naming the environment variables.
 
@@ -142,6 +197,11 @@ def core_source_dirs():
             "\n  ".join(missing) +
             "\nSet $CORE_USB_HOST / $CORE_ULPI_WRAPPER. core_usb_host should be at 81eb9f1 "
             "(the commit the low-speed patch set and tools/sync_pin.txt are written against).")
+    # Say what is about to be compiled. Deliberately after the missing-tree refusal (that one is fatal and
+    # must be the first thing read) and before any build artefact exists, so the line is at the top of the
+    # log the spin's evidence will quote.
+    for line in vendor_provenance(roots):
+        print(line, flush=True)
     return roots
 
 
