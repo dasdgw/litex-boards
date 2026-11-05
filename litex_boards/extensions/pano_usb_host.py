@@ -104,15 +104,36 @@ __all__ = ["UsbReset", "UsbHostCore", "core_source_dirs", "USBH_REGS"]
 # The core's register file, as names. Owned here because the BIOS test (M3.3) and this file must not
 # disagree with each other about an offset, and the vendor header is not on the include path of either.
 # Byte offsets, exactly as `usbh_host_defs.v` decodes `cfg_awaddr_i[7:0]`.
+# Bit fields below are `usbh_host_defs.v@81eb9f1`, restated because a wrong one here is how a bench session
+# writes the wrong value: an earlier version of this comment claimed `[5] SOF_EN`, `[1] USB_RST` and
+# `[0] CORE_RST`, none of which exist, and a `USB_CTRL` built from it (`0xC0`) selects the PHY's **Host
+# Hi-Speed** signaling instead of Host Full Speed -- measured on `usb_t3`, where `0xE8` tracks the hub's line
+# state and `0xC0` does not (panologic_g2 `bench/2026-11-05_usb_ctrl_hostfs_t3/`). Core reset is the
+# `usb_host_core_rst` CSRStorage below, not a bit in this register file.
 USBH_REGS = {
-    "USB_CTRL":      0x00,   # [8] TX_FLUSH  [7:6] PHY pulldowns  [5] SOF_EN  [1] USB_RST  [0] CORE_RST
-    "USB_STATUS":    0x04,   # line state, rx error, frame time
-    "USB_IRQ_ACK":   0x08,
-    "USB_IRQ_STS":   0x0c,
-    "USB_IRQ_MASK":  0x10,
-    "USB_XFER_DATA": 0x14,   # Tx payload length
-    "USB_XFER_TOKEN":0x18,   # transfer control (pid/type/endpoint/address)
-    "USB_RX_STAT":   0x1c,   # Rx length, error, idle
+    "USB_CTRL":      0x00,   # [8] TX_FLUSH (auto-clear, NOT in the read mux) [7] DM_PD [6] DP_PD
+                             # [5] TERMSELECT [4:3] XCVRSELECT (01b = FS) [2:1] OPMODE [0] ENABLE_SOF
+                             # Host Full Speed = 0xE8 (usb3300.pdf Table 6-8; ue11-hcd usbhw_hub_enable)
+    "USB_STATUS":    0x04,   # [31:16] SOF_TIME: counts usb_clk, HOLDS at USB_CLK_FREQ/1000-1 (0xEA5F @60MHz)
+                             # and resets only on send_sof_w -- so a pinned 0xEA5F means "no SOF ever fired",
+                             # not "the field is unused". [2] RX_ERROR [1:0] LINESTATE (a LATCH: written only
+                             # by the wrapper's RX CMD decode, reset 0, so 00 = "no status byte since reset")
+    "USB_IRQ_ACK":   0x08,   # WRITE-ONLY, every bit a one-cycle strobe (auto_clr), and the read mux has no
+                             # arm for it -- a read is always 0, so NEVER verify an ACK by read-back; verify it
+                             # by re-reading USB_IRQ_STS (measured: 0x1 -> ACK -> 0x0).
+                             # [3] DEVICE_DETECT [2] ERR [1] DONE [0] SOF
+    "USB_IRQ_STS":   0x0c,   # sticky until ACKed, and readable with USB_IRQ_MASK at 0. [3] DEVICE_DETECT IS A
+                             # HARDWIRED 1'b0 (usbh_host.v:1076 -- device_det_q feeds only intr_o), so that bit
+                             # can never read 1 in any configuration: do not put it in an acceptance list.
+                             # [2] ERR [1] DONE [0] SOF. DONE cannot fire for a core-generated SOF at all
+                             # (usbh_sie.v writes status_tx_done_q only in STATE_TX_CRC2, which the SOF route
+                             # TOKEN1->TOKEN2->TOKEN3->TX_IFS->IDLE never enters).
+    "USB_IRQ_MASK":  0x10,   # [3:0] gates ONLY intr_o; the status bits above are live regardless of the mask.
+                             # Keep it 0 on a bench where no handler owns that CPU interrupt line.
+    "USB_XFER_DATA": 0x14,   # [15:0] TX_LEN
+    "USB_XFER_TOKEN":0x18,   # [31] START [30] IN [29] ACK [28] PID_DATAX [23:16] PID [15:9] DEV_ADDR [8:5] EP
+    "USB_RX_STAT":   0x1c,   # [31] START_PEND [30] CRC_ERR [29] RESP_TIMEOUT [28] IDLE (the SIE's own idle)
+                             # [23:16] RESP_BITS [15:0] COUNT_BITS
     "USB_WR_DATA":   0x20,   # Tx FIFO (write) -- same offset as USB_RD_DATA
     "USB_RD_DATA":   0x20,   # Rx FIFO (read)
 }
