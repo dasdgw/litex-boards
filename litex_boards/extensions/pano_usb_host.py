@@ -110,10 +110,40 @@ __all__ = ["UsbReset", "UsbHostCore", "core_source_dirs", "USBH_REGS"]
 # Hi-Speed** signaling instead of Host Full Speed -- measured on `usb_t3`, where `0xE8` tracks the hub's line
 # state and `0xC0` does not (panologic_g2 `bench/2026-11-05_usb_ctrl_hostfs_t3/`). Core reset is the
 # `usb_host_core_rst` CSRStorage below, not a bit in this register file.
+#
+# **THE SECOND TIME THIS COMMENT COST A SESSION, AND IT WAS A TRUE SENTENCE.** It said "Host Full Speed =
+# 0xE8", which is correct about the PHY and silent about the bus, and every bench ladder written from it used
+# that value -- with bit 0 cleared **this core never emits a SOF frame, and a device with no frames on the bus
+# suspends** (USB 2.0 7.1.7.6: "In the absence of any other bus traffic, the SOF token ... will occur once per
+# (micro)frame to keep full-/high-speed devices from suspending"). Measured on `usb_t3`, one bit, alternating
+# on one load with the hub untouched: `0xE8` -> SETUP `resp=0x00` with `RESP_TIMEOUT=1` and zero bytes, eight
+# legs; `0xE9` -> SETUP ACKed (`resp=0xd2`) and the IN returning DATA1 with 8 bytes of a device descriptor
+# (`12 01 00 02 09 00 00 40` -- the USB2514 talking about itself). panologic_g2
+# `bench/2026-11-05_usb_frame_setup_t3/` is that A/B, and `bench/2026-11-05_usb_cold_boot_sof_t3/` repeats it
+# on a hub cold-booted on its reset pad across four sequences in two runs: **the VALUE is the constraint and
+# the ORDER is free** -- frames started 100 ms after the hub's reset release work exactly as well as frames
+# already running before it, and a silent leg recovers from the bit alone with no further reset.
+#
+# **AND THE VENDOR LINUX DRIVER NEVER WRITES 0xE8.** `ue11-hcd.c:430` (`port_power`) and `:1399`
+# (`ue11h_timer`, at reset completion) both call `usbhw_hub_enable(..., enable_sof = 1)`, i.e. `0x1E9`, whose
+# read-back is `0xE9` because bit 8 is not in the read mux. The ONLY place in the vendor tree that writes
+# `0xE8` is `sw/core/usb_hw.c:467` -- an intermediate step of `usbhw_reset()`, which writes `0x1E9` at `:479`
+# after device detect. A session that copied the bare-metal value and stopped there was not choosing a
+# configuration; it was parking in the middle of someone else's init sequence.
+# **TAKE THE OFFSETS FROM THIS DICT, NOT FROM MEMORY.** `USB_IRQ_STS` is `0x0c`; `0x10` is `USB_IRQ_MASK`,
+# which reads 0 by construction on any bench that (correctly) never writes it -- deliberately: a 1 ms
+# interrupt into a BIOS with no handler is a crash. Reading `0x10` and calling it a status register produced
+# TWO false findings in one session ("the SOF interrupt does not re-fire", "DONE never sets on a completed
+# transfer"), both printed in confident prose, both from a register that cannot be anything but 0
+# (panologic_g2 `bench/2026-11-05_usb_frame_setup_t3/`). A leg that reads a constant witnesses nothing.
 USBH_REGS = {
     "USB_CTRL":      0x00,   # [8] TX_FLUSH (auto-clear, NOT in the read mux) [7] DM_PD [6] DP_PD
                              # [5] TERMSELECT [4:3] XCVRSELECT (01b = FS) [2:1] OPMODE [0] ENABLE_SOF
-                             # Host Full Speed = 0xE8 (usb3300.pdf Table 6-8; ue11-hcd usbhw_hub_enable)
+                             # Host Full Speed WITH FRAMES = **0xE9 -- THE VALUE THAT TALKS TO A DEVICE**.
+                             # 0xE8 is the same PHY set (usb3300.pdf Table 6-8 row "Host Full Speed") with bit
+                             # 0 CLEAR, and with bit 0 clear EVERY transaction to EVERY device times out: the
+                             # PHY is right and the bus is asleep. Copy 0xE9. A ladder that ENDS at 0xE8 hands
+                             # the next session a silent bus and a parked frame timer with no explanation.
     "USB_STATUS":    0x04,   # [31:16] SOF_TIME: counts usb_clk, HOLDS at USB_CLK_FREQ/1000-1 (0xEA5F @60MHz)
                              # and resets only on send_sof_w -- so a pinned 0xEA5F means "no SOF ever fired",
                              # not "the field is unused". [2] RX_ERROR [1:0] LINESTATE (a LATCH: written only
@@ -135,7 +165,11 @@ USBH_REGS = {
     "USB_RX_STAT":   0x1c,   # [31] START_PEND [30] CRC_ERR [29] RESP_TIMEOUT [28] IDLE (the SIE's own idle)
                              # [23:16] RESP_BITS [15:0] COUNT_BITS
     "USB_WR_DATA":   0x20,   # Tx FIFO (write) -- same offset as USB_RD_DATA
-    "USB_RD_DATA":   0x20,   # Rx FIFO (read)
+    "USB_RD_DATA":   0x20,   # Rx FIFO (read). WARNING: an EMPTY FIFO does not read 0 and does not flag an
+                             # underflow -- it REPEATS a byte (measured on `usb_t3`: 0x12 four times at a cold
+                             # start, 0x00 four times after a fully-popped leg). "Drain until you read 0" is
+                             # therefore NOT an emptiness test on this core; the only length witness is
+                             # USB_RX_STAT.COUNT_BITS, so pop exactly that many bytes and no more.
 }
 
 
