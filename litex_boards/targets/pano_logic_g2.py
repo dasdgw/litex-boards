@@ -69,6 +69,9 @@ from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 from migen.genlib.cdc import MultiReg
 from migen.fhdl.specials import Tristate
 
+from litex_boards.extensions.pano_ulpi import (ULPI_TDD_MAX_NS, ULPI_TDD_MIN_NS, ULPI_TSD_MIN_NS,
+                                             USB3300_TDD_MAX_NS, USB3300_TDD_MIN_NS, USB3300_TSD_MIN_NS,
+                                             ulpi_budget_name)
 from litex_boards.extensions.pano_ulpi_csr import UlpiCsr
 from litex_boards.extensions.pano_ulpi_scope import UlpiUsbScope
 from litex_boards.extensions.pano_usb_host import UsbHostCore
@@ -1041,6 +1044,9 @@ class BaseSoC(SoCCore):
         with_ulpi_master   = False,
         with_ulpi_scope    = True,
         ulpi_skew_ns       = ULPI_SKEW_NS_DEFAULT,
+        ulpi_tdd_max_ns    = ULPI_TDD_MAX_NS,
+        ulpi_tdd_min_ns    = ULPI_TDD_MIN_NS,
+        ulpi_tsd_min_ns    = ULPI_TSD_MIN_NS,
         ulpi_stall_timeout = 1 << 16,
         ulpi_retry_limit   = 3,
         ulpi_io_offsets    = True,
@@ -1312,7 +1318,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 # accepted deviation with a trigger attached: ADR-0005 + ticket 06. `--no-ulpi-io-offsets` exists
                 # to isolate which constraint a failure belongs to on a bench, never to make a report prettier.
                 self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns,
-                                          cd_sys = self.crg.cd_sys.clk)
+                                          tdd_max_ns = ulpi_tdd_max_ns, tdd_min_ns = ulpi_tdd_min_ns,
+                                          tsd_ns = ulpi_tsd_min_ns, cd_sys = self.crg.cd_sys.clk)
 
         # The USB host core (PLAN.md M3) ---------------------------------------------------------------
         # `core_usb_host` + `core_ulpi_wrapper`, behind `Wishbone2AXILiteCDC` (cd_sys -> cd_usb). Built AFTER
@@ -1393,7 +1400,9 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 # --with-ulpi-master build, and `add_platform_command` accepts a NET line about a net that is
                 # not there with a warning nobody reads (`tools/test_ulpi_csr_map.py` refuses a surviving
                 # brace for exactly that reason).
-                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns, cd_sys = None)
+                self._add_ulpi_io_offsets(platform, skew_ns = ulpi_skew_ns,
+                                          tdd_max_ns = ulpi_tdd_max_ns, tdd_min_ns = ulpi_tdd_min_ns,
+                                          tsd_ns = ulpi_tsd_min_ns, cd_sys = None)
 
         # Leds -------------------------------------------------------------------------------------
         if with_led_chaser:
@@ -1402,7 +1411,8 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                 sys_clk_freq = sys_clk_freq)
 
     def _add_ulpi_io_offsets(self, platform, clk_net = "usb_clk", skew_ns = ULPI_SKEW_NS_DEFAULT,
-                             cd_sys = None):
+                             tdd_max_ns = ULPI_TDD_MAX_NS, tdd_min_ns = ULPI_TDD_MIN_NS,
+                             tsd_ns = ULPI_TSD_MIN_NS, cd_sys = None):
         """The ULPI pad input/output timing, as raw UCF.
 
         **Why raw.** LiteX in this tree has no `add_input_delay_constraint`/`add_output_delay_constraint`
@@ -1410,57 +1420,93 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
         documented helper cannot be used and `add_platform_command` is the only door. Net names are taken
         from the requested pads rather than hardcoded, because they are LiteX's naming, not ours.
 
-        **The numbers, and what they are made of.** Read off **ULPI v1.1 §3.7.2 Table 5, the "Output clock"
-        group** (`datasheets/ULPI_v1_1.pdf`, verified 2026-10-31; Microchip AN19.17 §5.1 restates the same
-        table and adds "it is expected that any SoC that integrates a link meets the setup and hold times
-        defined here"). Two things that citation settles, and that an earlier version of this docstring got
-        wrong: the *other* group in that table, "Input clock (optional)", is where the Link supplies the clock
-        and `TSD` is only 3.0 ns -- not this board, where the PHY outputs CLKOUT; and every parameter is
-        measured "with respect to the clock as seen at the PHY clock pin", which is exactly why skew is a term
-        of the constraint and not a rounding error.
+        **ROLES before numbers.** `trce` reads ``OFFSET = IN d VALID v`` as a window on the *internal
+        arrival*: ``[C - d, C + (v - d)]``, so ``d`` is the setup allowance **before** the capturing edge
+        and ``v`` is the **width** of the guaranteed-valid interval, not its end. Measured against `trce`'s
+        own printed slacks (10/10 pads x both axes x 8 reports, `bench/2026-11-04_ulpi_offset_in_window/`):
+        `setup passes <=> d >= S` and `hold passes <=> v - d >= F`, where `S`/`F` are that report's
+        *Data Window* rows and therefore properties of the placement. The arithmetic and its derivation
+        live in `pano_ulpi.ulpi_io_windows`; the emitted numbers, at the default ceiling budget and skew
+        0.3 ns, are `d = 7.367`, `v = 7.067`:
 
-        * ``OFFSET IN  = TDD_max + skew`` -- `TDC/TDD` is the PHY's worst clock-to-output on `data`/`dir`/`nxt`
-          (9.0 ns max), plus the board skew above.
-        * ``OFFSET OUT = TSD_min + skew`` -- **a margin, not a budget.** Xilinx checks an output offset as "the
-          pad must stay quiet for d before the NEXT clock edge", so the budget it enforces is `period - d`
-          (= 10.667 ns at 60 MHz) and `d` is ULPI's `TSD_min` (6.0 ns). Writing `period - TSD` into this field
-          is the bug this file had, and `trce`'s own `Requirement:` line is what caught it: it asked for
-          clock-to-pad <= 6 ns and invented 4.67 ns of violation on every output. See `ulpi_io_windows` and
-          `docs/NOTES.md`; `tools/test_ulpi_ucf.py` now refuses the complement on the ground that *a margin
-          cannot depend on the clock while a budget must*.
-        * ``VALID = period - TDD_max = 7.667 ns`` -- the honest window: the PHY's byte is valid at the pin
-          from TDD_max after its own edge until the next byte replaces it one period later. (The §7.4
-          "capture at 7.7 ns" figure is the *internal* setup budget; it happens to be the same number here
-          because the budget is the complement of the same TDD_max, but it is not what a VALID window means,
-          and an earlier draft of this method computed ``period - 2*TDD_max`` and emitted a **negative**
-          window -- which Xilinx accepts without complaint. A constraint the tool will take silently is a
-          constraint that needs a test, so see `tools/test_ulpi_ucf.py`.)
+        * ``OFFSET IN  = period - TDD_max - skew`` -- the byte the FF captures was launched by the PHY
+          **one period earlier**, so its worst arrival (`TDD_max` + board skew) sits that far *before* the
+          capturing edge. It is a margin, not the PHY's arrival delay.
+        * ``VALID      = period + TDD_min - TDD_max - 2*skew`` -- the **width** of the interval: good from
+          `d` before the edge until `TDD_min - skew` after it (skew counted at both ends, because the PHY
+          measures against CLKOUT at its pin and `trce` measures at ours). **Not** ``period - d``.
+        * ``OFFSET OUT = TSD_min + skew`` -- also **a margin, not a budget**: `trce` checks an output
+          offset as "stay quiet for d before the NEXT edge", so it enforces `period - d` (it printed
+          `Requirement: 5.999ns` for `OFFSET = OUT 10.667` at a 16.667 ns period). Writing `period - TSD`
+          into that field is the bug this file had, and `trce`'s own `Requirement:` line caught it: it
+          asked for clock-to-pad <= 6 ns and invented 4.67 ns of violation on every output.
 
-        **And the measured fact about this file, which is why it is not silently turned off.** Measured on
-        this part (xc6slx100fgg484-**2**, the fastest grade it ships in) with a throwaway that copies this
-        constraint block exactly, and reported rather than tuned away:
+        **Which datasheet the numbers come from is a decision, and it is open.** The defaults are
+        ULPI v1.1 §3.7.2 Table 5, the "Output clock" group (`datasheets/ULPI_v1_1.pdf`; AN19.17 §5.1
+        restates it and adds "it is expected that any SoC that integrates a link meets the setup and hold
+        times defined here") -- the *interoperability ceiling*: `TDD_max = 9.0`, no `TDD` minimum
+        (⇒ `ULPI_TDD_MIN_NS = 0.0`, the conservative reading), `TSD_min = 6.0`. The soldered USB3300's own
+        §6.1.3 Table 6-2 says `T_DC/T_DD = 2.0…5.0` and `T_SC/T_SD = 5.0`, which is 4 ns kinder on the
+        input and 1 ns kinder on the output. `--ulpi-tdd-max-ns`, `--ulpi-tdd-min-ns` and
+        `--ulpi-tsd-min-ns` pick one without editing code, so a Timing Score always records the budget it
+        was measured against; adopting the part's numbers changes the basis of ADR-0005 and is
+        `.scratch/usb-core-m3/issues/10` (ready-for-human). Table 5 also measures everything *at the PHY's
+        clock pin*, which is why skew is a term of the constraint and not a rounding error.
 
-        | constraints                       | trce result                                  |
-        |-----------------------------------|----------------------------------------------|
-        | ``VALID 7.667`` (the honest one)  | **HOLD** fails, ~4.8 ns, on `dir`/`nxt`      |
-        | ``VALID 16.667`` (widened)        | **SETUP** fails instead                      |
+        **History, because the same trap bit this file twice.**
 
-        That is not the constraint being wrong; it is the constraint *working*. With the pads registered in
-        fabric, the clock reaches the flop ~3.5-4.8 ns after it reaches the pin while the data path from the
-        same pin is ~1.5 ns, so the *next* byte (launched 0-9 ns after the edge) reaches the D pin before the
-        capturing edge does. Widening `VALID` does not remove the race, it moves it onto the setup axis. The
-        fix order is therefore fixed, in this order:
+        * 2026-10-31: ``VALID = period - 2*TDD_max`` was emitted, i.e. **−1.333 ns**. Xilinx synthesised,
+          placed, routed and built a bitstream from a window smaller than nothing. `trce` does not reject a
+          negative VALID; neither does `map`. That is why this is a pure function with a test.
+        * 2026-10-31 .. 2026-11-05: ``OFFSET IN = TDD_max + skew`` with ``VALID = period - d`` -- the
+          PHY's arrival delay in the field `trce` reads as a margin, the mirror image of the `OFFSET = OUT`
+          trap above. At `skew = 0` the wrong pair is `(9.000, 7.667)` and the right one `(7.667, 7.667)`:
+          **`VALID` is identical**, only the roles differ, which is what made it survive a month of being
+          looked at -- and what made `tools/test_ulpi_ucf.py` green while asserting the wrong pair. Fixed by
+          `.scratch/usb-core-m3/issues/09`; every `OFFSET = IN` slack this repo recorded before that date is
+          1.933 ns too flattering on setup and 1.633 ns too harsh on hold.
 
-        1. **IO-register the pads** (ILOGIC/OLOGIC, where clock and data arrive together). This is the only
-           fix that keeps the spec's numbers, and it is a gateware change in `pano_ulpi.py`.
-        2. Never "fix" it by relaxing `OFFSET`, `VALID` or the clock: a relaxed OFFSET is how a Link that
-           corrupts one byte in 10^9 ships as green.
+        **The table that was measured under that wrong text** (xc6slx100fgg484-2, a throwaway copying this
+        constraint block, 2026-10-31), kept as history because it reads as physics and is not:
+
+        | constraints (as the text then read)      | trce result                             |
+        |------------------------------------------|-----------------------------------------|
+        | ``OFFSET 9.0 / VALID 7.667``             | **HOLD** fails ~4.8 ns on `dir`/`nxt`   |
+        | ``OFFSET 9.0 / VALID 16.667`` (widened)  | **SETUP** fails instead                 |
+
+        With `d` and `v` in their right roles that experiment does not reproduce: `v - d` is then
+        `TDD_min - skew` = −0.3 ns instead of the −1.933 ns the old text invented, which is why the pad
+        that appeared to fail hold by 1 ns passes it once the text is corrected. **And the honest text closes
+        when `par` is asked from the start:** `usb_t2` (this SoC class) is **Timing Score 0** and `ulpi_t22`
+        meets every `OFFSET = IN` row, because the lax `d = 9.300` had told the placer that a pad→capture path
+        needing `S ≈ 9.2 ns` was acceptable
+        (`bench/2026-11-05_ulpi_offset_in_fixed/`; the +0.619 ns figure quoted for a while was `trce` judging
+        the new text on the *old* placement, which measures the placement). What the table *was* showing is real
+        and still stands as a warning: a 60 MHz BUFG clock plus a several-ns pad→register route leaves little
+        room on a 16.7 ns bus -- the corrected text closes with **13–18 ps** of hold margin, which is `par`
+        stopping at zero and not a design margin -- and the honest fix order is unchanged --
+
+        1. Name the budget (`--ulpi-tdd-*-ns`) and the skew (`--ulpi-skew-ns`) from a datasheet or a
+           measurement, and say which in the commit.
+        2. Shorten the pad→capture route (pblock / IO-registering the pads) if the named budget does not
+           close. I-registering buys ~0.3 ns here, measured 2026-10-31 (`bench/2026-10-31_ulpi_iob/`).
+        3. Never "fix" it by relaxing `OFFSET`, `VALID` or the clock: a relaxed OFFSET is how a Link that
+           corrupts one byte in 10^9 ships as green. `--no-ulpi-io-offsets` exists to attribute a failure,
+           never to make a report prettier.
         """
         # The arithmetic and the text live in pano_ulpi.py as pure functions, so they can be asserted
         # without running ISE -- see `ulpi_io_windows` for why that mattered within the hour of writing it.
         # It raises if the window cannot close at this clock, which is a build error and not a UCF line.
-        from litex_boards.extensions.pano_ulpi import ulpi_ucf_lines, ulpi_wake_false_path_lines
-        for line in ulpi_ucf_lines(clk_net = clk_net, clk_hz = 60e6, skew_ns = skew_ns):
+        from litex_boards.extensions.pano_ulpi import (ulpi_io_windows, ulpi_ucf_lines,
+                                                       ulpi_wake_false_path_lines)
+        # Print what was emitted, and from which budget: a Timing Score is meaningless without the
+        # constraint text it was earned against, and the two candidate budgets differ by 4 ns.
+        _d, _v, _o = ulpi_io_windows(clk_hz = 60e6, skew_ns = skew_ns, tdd_max_ns = tdd_max_ns,
+                                     tdd_min_ns = tdd_min_ns, tsd_ns = tsd_ns)
+        print(f"[ULPI] OFFSET IN {_d:.3f} ns VALID {_v:.3f} ns | OFFSET OUT {_o:.3f} ns | skew {skew_ns} ns "
+              f"| budget {ulpi_budget_name(tdd_max_ns, tdd_min_ns, tsd_ns)}")
+        for line in ulpi_ucf_lines(clk_net = clk_net, clk_hz = 60e6, skew_ns = skew_ns,
+                                   tdd_max_ns = tdd_max_ns, tdd_min_ns = tdd_min_ns, tsd_ns = tsd_ns):
             platform.add_platform_command(line)
         # ... and the one path that must NOT be timed against them. `ulpi_wake` is a `cd_sys` level driven
         # combinationally to the `stp` pad, because every synchroniser into `cd_usb` is built from the clock
@@ -1523,6 +1569,22 @@ def main():
              "from Microchip AN19.17 s3 (50-60 ohm, <3 in, within 0.5 in of CLKOUT => ~0.1 ns) plus a factor, "
              "because the Pano's layout is unknown to us; 0.0 would claim matched traces. Measure it with a "
              "scope on CLKOUT and one data line, then pass the number.")
+    parser.add_target_argument("--ulpi-tdd-max-ns", default=ULPI_TDD_MAX_NS, type=float,
+        help=f"PHY clock-to-out maximum, ns, for the ULPI input constraint. Default {ULPI_TDD_MAX_NS} is "
+             "ULPI v1.1 s3.7.2 Table 5 (the interoperability ceiling). The soldered USB3300 says "
+             f"{USB3300_TDD_MAX_NS} (its s6.1.3 Table 6-2); which budget this board is constrained to is "
+             ".scratch/usb-core-m3/issues/10, so pick it here rather than editing the extension. It goes "
+             "into OFFSET IN as `period - tdd_max - skew` (a margin before the capturing edge).")
+    parser.add_target_argument("--ulpi-tdd-min-ns", default=ULPI_TDD_MIN_NS, type=float,
+        help=f"PHY clock-to-out minimum, ns. Table 5 lists NO minimum for control/data out, so the default "
+             f"{ULPI_TDD_MIN_NS} is the conservative reading, not a measurement; the USB3300 says "
+             f"{USB3300_TDD_MIN_NS}. It is the only term that widens VALID: a byte released earlier means "
+             "the next one is not our problem for longer.")
+    parser.add_target_argument("--ulpi-tsd-min-ns", default=ULPI_TSD_MIN_NS, type=float,
+        help=f"Setup the PHY needs on our outputs, ns, used as the OFFSET OUT *margin*. Default "
+             f"{ULPI_TSD_MIN_NS} (Table 5); the USB3300 says {USB3300_TSD_MIN_NS}, which moves the budget "
+             "trce checks (period - margin) by 1.0 ns and therefore moves the basis of the deficit "
+             "ADR-0005 accepted. Changing it with the input flags above is the same open decision.")
     parser.add_target_argument("--ulpi-stall-timeout", default=1 << 16, type=int,
         help="cd_usb cycles a ULPI access waits before it declares itself stuck (2^16 = ~1.1 ms). The PHY "
              "may hold nxt indefinitely per ULPI 1.1, so this bound is ours and is never evidence of a PHY "
@@ -1597,6 +1659,9 @@ def main():
         with_ulpi_master    = args.with_ulpi_master,
         with_ulpi_scope     = not args.no_ulpi_scope,
         ulpi_skew_ns        = args.ulpi_skew_ns,
+        ulpi_tdd_max_ns     = args.ulpi_tdd_max_ns,
+        ulpi_tdd_min_ns     = args.ulpi_tdd_min_ns,
+        ulpi_tsd_min_ns     = args.ulpi_tsd_min_ns,
         ulpi_stall_timeout  = args.ulpi_stall_timeout,
         ulpi_retry_limit    = args.ulpi_retry_limit,
         ulpi_io_offsets     = not args.no_ulpi_io_offsets,

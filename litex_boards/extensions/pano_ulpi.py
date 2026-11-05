@@ -134,7 +134,8 @@ from litex.gen import LiteXModule
 from litex_boards.extensions.pano_cdc import CdcLevel, ReqAckCDC
 
 __all__ = ["STATE", "REQ_FIELDS", "ACK_FIELDS", "req_pack", "ack_unpack",
-           "STATUS_FIELDS", "status_decode", "ulpi_io_windows", "ulpi_output_budget", "ulpi_ucf_lines",
+           "STATUS_FIELDS", "status_decode", "ulpi_io_windows", "ulpi_output_budget", "ulpi_budget_name",
+           "ulpi_ucf_lines",
            "UlpiMaster", "UlpiLink", "UlpiClear"]
 
 # The analyzer taps `state`, so these numbers are part of what a capture *means*: renumbering one
@@ -168,45 +169,120 @@ def status_decode(word):
 # ---------------------------------------------------------------------------------------------
 
 # USB 2.0 ULPI 1.1 Table 5, the 192.6..255 MHz column that a 60 MHz `C12` selects. Sourced once, in
-# RESEARCH.md §7.3; the numbers are the *wire* budget, not an internal setup budget.
+# RESEARCH.md §7.3; the numbers are the *wire* budget measured at the PHY's own pins, not an internal
+# setup/hold budget, and -- see `ulpi_io_windows` -- not the same quantity as either field of an
+# `OFFSET = IN` line.
 ULPI_TDD_MAX_NS = 9.0    # CLKOUT rising -> PHY drives data/stp (max)
+ULPI_TDD_MIN_NS = 0.0    # CLKOUT rising -> PHY releases data/stp (min). ULPI 1.1 Table 5 lists **no**
+                         # minimum for control/data out, so 0 is the conservative reading of the ceiling
+                         # and not a measurement. The soldered part (USB3300 Table 6-2) says 2.0, and
+                         # whether that part budget is admissible for this board is
+                         # `.scratch/usb-core-m3/issues/10` (open, ready-for-human): it also moves
+                         # `T_SD`/`TSD_min` from 6.0 to 5.0, which is ADR-0005's territory.
 ULPI_TSD_MIN_NS = 6.0    # the PHY must see our data this far before the next CLKOUT rising edge
 
+# The same two quantities for the part that is physically on this board: `datasheets/usb3300.pdf` §6.1.3,
+# Table 6-2 ("The USB300 PHY provides CLKOUT and all timing is relative to the rising clock edge ... apply
+# to Synchronous Mode only" -- that is us): output delay `T_DC`/`T_DD` **min 2.0 / max 5.0** ns, setup at the
+# PHY `T_SC`/`T_SD` **5.0** ns, hold 0. They are here so a spin can *name* the budget it chose
+# (`--ulpi-tdd-min-ns=2 --ulpi-tdd-max-ns=5 --ulpi-tsd-min-ns=5`) and so `ulpi_budget_name()` can tell the
+# two apart in a build log. **Using them is not free**: it is `.scratch/usb-core-m3/issues/10`, because a
+# design constrained to a part's numbers is not portable to another ULPI PHY, and the `T_SD` half moves the
+# output budget ADR-0005's accepted deficit was measured against by 1.0 ns.
+USB3300_TDD_MIN_NS = 2.0
+USB3300_TDD_MAX_NS = 5.0
+USB3300_TSD_MIN_NS = 5.0
 
-def ulpi_io_windows(clk_hz = 60e6, skew_ns = 0.0, tdd_ns = ULPI_TDD_MAX_NS, tsd_ns = ULPI_TSD_MIN_NS):
+
+def ulpi_budget_name(tdd_max_ns = ULPI_TDD_MAX_NS, tdd_min_ns = ULPI_TDD_MIN_NS,
+                     tsd_ns = ULPI_TSD_MIN_NS):
+    """Which datasheet a budget matches, as text. Not cosmetics: the two candidates differ by 4 ns of
+    input constraint budget, so a Timing Score is uninterpretable without the budget it was earned
+    against, and "the build says 37594" cannot be compared to "the build says 0" across the two."""
+    triple = (float(tdd_max_ns), float(tdd_min_ns), float(tsd_ns))
+    if triple == (float(ULPI_TDD_MAX_NS), float(ULPI_TDD_MIN_NS), float(ULPI_TSD_MIN_NS)):
+        return "ULPI 1.1 Table 5 ceiling"
+    if triple == (float(USB3300_TDD_MAX_NS), float(USB3300_TDD_MIN_NS), float(USB3300_TSD_MIN_NS)):
+        return "USB3300 Table 6-2 (the soldered part)"
+    return f"custom (TDD {tdd_min_ns}..{tdd_max_ns} ns, TSD {tsd_ns} ns)"
+
+
+def ulpi_io_windows(clk_hz = 60e6, skew_ns = 0.0, tdd_max_ns = ULPI_TDD_MAX_NS,
+                    tdd_min_ns = ULPI_TDD_MIN_NS, tsd_ns = ULPI_TSD_MIN_NS):
     """``(offset_in, valid_in, offset_out)`` in ns for the ULPI pads, relative to the PHY's clock.
 
-    * ``offset_in``  = TDD_max + skew -- our worst-case arrival, so the internal setup budget is the rest
-      of the period.
-    * ``valid_in``   = period - offset_in -- the byte is valid at the pin from TDD_max after the PHY's edge
-      until the next byte replaces it one period later. **Not** ``period - 2*TDD_max``, which is what an
-      earlier draft of this file said and what it then *emitted*: at 60 MHz that is -1.333 ns, a window
-      smaller than nothing, and Xilinx wrote it into the UCF without a word of complaint. That is the whole
-      reason this function exists separately from the code that formats it.
-    * ``offset_out``  = **TSD_min + skew = 6.0 ns, and it does not depend on the clock.** This is the line
-      that was wrong before, and wrong in the way that looks like a hardware problem: `OFFSET = OUT d` in
-      Xilinx's model is the **quiet margin the data must hold before the NEXT clock edge**, so the tool's own
-      requirement is ``period - d`` (measured: `trce` printed ``Requirement: 5.999ns`` for
-      ``OFFSET = OUT 10.667`` at a 16.667 ns period). Emitting the *budget* (10.667) instead of the *margin*
-      (6.0) therefore demanded clock-to-pad <= 6.0 ns when ULPI only asks for <= 10.667 ns -- a phantom
-      4.67 ns violation on every output, on top of the real one. The complement was inherited from the
-      ticket's wording ("OFFSET_OUT ~ 10.5 ns = period - TSD - margin") and nobody checked it against the
-      tool's arithmetic; the fact that both numbers are complements of the same two quantities at this one
-      clock is what made it survivable in prose. A margin is a margin at any clock: that invariance is now
-      asserted in `tools/test_ulpi_ucf.py`, because it is the only cheap thing that distinguishes the two
-      readings.
+    ROLES FIRST. ``OFFSET = IN d VALID v BEFORE CLK`` is not "the data arrives d after the edge"; `trce`
+    reads ``d`` as how far **before** the capturing edge the data is guaranteed to be valid, and ``v`` as
+    the **width** of that guaranteed-valid interval, so the window it hands the internal arrival is
+
+        ``[C - d,  C + (v - d)]``        with ``d`` the setup allowance and ``v - d`` the hold allowance
+
+    and its two checks are, per pad (verified against `trce`'s own printed slacks on 10/10 pads x both
+    axes x 8 reports, 0 mismatches -- `bench/2026-11-04_ulpi_offset_in_window/`):
+
+        ``setup passes  <=>  d      >= S``      ``hold  passes  <=>  v - d >= F``
+
+    where ``S``/``F`` are the **Data Window** rows of the report, i.e. properties of the placed design.
+    That invariance is what lets any candidate ``(d, v)`` be judged against an existing placement without
+    re-running par, and it is why getting the roles right is arithmetic rather than taste. **It answers "what
+    does this placement do with this text", not "can a design meet this text"** -- `par` optimises the route to
+    whatever it is asked for, so a candidate text judged on a netlist routed for a different one measures the
+    netlist. Measured the hard way on 2026-11-05: `usb_t1`'s feasible-`d` interval is empty and the same design,
+    placed for the honest text (`usb_t2`), closes with Timing Score 0
+    (`bench/2026-11-05_ulpi_offset_in_fixed/`).
+
+    What the ULPI budget says, for the byte captured at edge ``C``: it was launched by the PHY at
+    ``C - period``, so at our pin it is guaranteed valid from ``C - period + TDD_max + skew`` (worst
+    clock-to-out, plus board skew) until the next byte replaces it at ``C + TDD_min - skew`` (skew counted
+    at both ends, because the PHY measures against CLKOUT *at its pin* and `trce` measures against the
+    clock *at our FF*). Therefore
+
+    * ``offset_in`` = ``period - TDD_max - skew``     -- how far BEFORE the capturing edge the byte is valid.
+    * ``valid_in``  = ``period + TDD_min - TDD_max - 2*skew`` -- the **width** of that interval: the byte is
+      good from ``offset_in`` before the edge until ``TDD_min - skew`` after it. Note ``valid_in`` is *not*
+      ``period - offset_in``; that is the same expression with one skew term missing and one role swapped.
+    * ``offset_out`` = ``TSD_min + skew`` -- **a margin, not a budget.** This is the line that was wrong
+      before, and wrong in the way that looks like a hardware problem: `trce` checks an output offset as
+      "the pad must stay quiet for d before the NEXT clock edge", so what it enforces is ``period - d``
+      (measured: it printed ``Requirement: 5.999ns`` for ``OFFSET = OUT 10.667`` at a 16.667 ns period).
+      Emitting the *budget* (10.667) instead of the *margin* (6.0) demanded clock-to-pad <= 6.0 ns where
+      ULPI only asks for <= 10.667 ns -- a phantom 4.67 ns violation on every output, on top of the real
+      one. A margin is a margin at any clock: that invariance is asserted in
+      `tools/test_ulpi_ucf.py`, because it is the cheapest thing that distinguishes the two readings.
+
+    **The history, because the same trap bit this file twice.**
+
+    * 2026-10-31, `period - 2*TDD_max`: emitted ``VALID = -1.333 ns``. Xilinx built a bitstream from it
+      without a word. That is the reason this function exists separately from the code that formats it.
+    * 2026-10-31 .. 2026-11-05, ``offset_in = TDD_max + skew`` / ``valid_in = period - offset_in``: the
+      PHY's **arrival delay** in the field `trce` reads as a **margin**. At `skew = 0` the wrong pair is
+      ``(9.000, 7.667)`` and the right one ``(7.667, 7.667)`` -- `VALID` identical, only the roles
+      swapped -- which is exactly what made it survivable in prose, and what `RESEARCH.md` §7.4 already
+      records for the mirror-image `OFFSET = OUT` bug. Consequence: **every `OFFSET = IN` slack recorded in
+      this repo before 2026-11-05 is 1.933 ns more flattering on setup and 1.633 ns harsher on hold** than
+      the design's own ``S``/``F`` warrant, including `ulpi_t16`'s "all ten `OFFSET = IN` met, worst
+      +3.380 ns". Fixed by `.scratch/usb-core-m3/issues/09`, measured on already-placed netlists in
+      `bench/2026-11-04_ulpi_offset_in_window/`; `tools/test_ulpi_ucf.py` now asserts the roles against a
+      vendored copy of the pre-fix function, because the suite that "checks" this arithmetic was itself
+      asserting the wrong pair.
 
     Raises rather than emitting a window that cannot exist: at a clock where the PHY's own TDD exceeds the
     period there is no constraint to write, and the build must say so instead of synthesising a race.
     """
     period = 1e9/clk_hz
-    offset_in  = tdd_ns + skew_ns
-    valid_in   = period - offset_in
-    offset_out = tsd_ns + skew_ns        # a MARGIN, not a budget -- see the docstring
+    offset_in  = period - tdd_max_ns - skew_ns     # the MARGIN before the capturing edge -- see docstring
+    valid_in   = period + tdd_min_ns - tdd_max_ns - 2*skew_ns   # the WIDTH, not `period - offset_in`
+    offset_out = tsd_ns + skew_ns                  # a MARGIN, not a budget -- see the docstring
     if valid_in <= 0:
-        raise ValueError(f"ULPI input window cannot close at {clk_hz/1e6:.1f} MHz: TDD_max "
-                         f"{offset_in:.2f} ns leaves {valid_in:.2f} ns of valid window. A 60 MHz C12 is "
-                         f"the fastest this budget supports; check --sys-clk-freq and the PHY's CLKOUT mode.")
+        raise ValueError(f"ULPI input window cannot close at {clk_hz/1e6:.1f} MHz: TDD spans "
+                         f"{tdd_max_ns - tdd_min_ns:.2f} ns of {period:.2f} ns plus 2 x {skew_ns:.2f} ns "
+                         f"of skew, leaving {valid_in:.2f} ns of valid window. A 60 MHz C12 is the fastest "
+                         f"this budget supports; check --sys-clk-freq and the PHY's CLKOUT mode.")
+    if offset_in <= 0:
+        raise ValueError(f"ULPI input constraint is meaningless at {clk_hz/1e6:.1f} MHz: the PHY's worst "
+                         f"arrival ({tdd_max_ns:.2f} ns) plus skew ({skew_ns:.2f} ns) is not inside the "
+                         f"{period:.2f} ns period, so the byte we are capturing was launched by the edge "
+                         f"we are capturing on. No OFFSET value fixes that; the clock is too fast.")
     if period - offset_out <= 0:
         raise ValueError(f"ULPI output budget cannot close at {clk_hz/1e6:.1f} MHz: the PHY needs TSD_min "
                          f"{tsd_ns:.2f} ns of the {period:.2f} ns period, leaving nothing for our clock "
@@ -225,15 +301,25 @@ def ulpi_output_budget(clk_hz = 60e6, skew_ns = 0.0, tsd_ns = ULPI_TSD_MIN_NS):
 
 
 def ulpi_ucf_lines(clk_net = "usb_clk", clk_hz = 60e6, skew_ns = 0.0, data_net = "ulpi_data",
-                    in_nets = ("ulpi_dir", "ulpi_nxt"), out_nets = ("ulpi_stp",), bits = 8):
+                    in_nets = ("ulpi_dir", "ulpi_nxt"), out_nets = ("ulpi_stp",), bits = 8,
+                    tdd_max_ns = ULPI_TDD_MAX_NS, tdd_min_ns = ULPI_TDD_MIN_NS,
+                    tsd_ns = ULPI_TSD_MIN_NS):
     """The UCF text for the ULPI pads, as data.
 
     A function rather than f-strings inside the target, so the emitted text is assertable without running
     ISE (which is the only way this block gets checked on every commit). One line per net and per bit, no
     wildcards: `trce` reports failures per bit, and `NET "ulpi_data[*]"` would hide *which* bit failed --
     the difference between "a byte lane is bad" and "the whole bus is bad".
+
+    The three `*_ns` arguments are the **budget**, and they are a decision rather than a reading: the
+    defaults are the ULPI 1.1 Table 5 interoperability ceiling, while the soldered USB3300's own Table 6-2
+    is `tdd_max_ns = 5.0, tdd_min_ns = 2.0, tsd_ns = 5.0`. Which one this board is constrained to is
+    `.scratch/usb-core-m3/issues/10`; a spin chooses it with `--ulpi-tdd-*-ns` / `--ulpi-tsd-min-ns` and
+    does not edit this file, so the evidence says which budget a Timing Score was measured against.
     """
-    offset_in, valid_in, offset_out = ulpi_io_windows(clk_hz = clk_hz, skew_ns = skew_ns)
+    offset_in, valid_in, offset_out = ulpi_io_windows(clk_hz = clk_hz, skew_ns = skew_ns,
+                                                      tdd_max_ns = tdd_max_ns, tdd_min_ns = tdd_min_ns,
+                                                      tsd_ns = tsd_ns)
     lines = []
     # `data` is bidirectional and ULPI puts a budget on each half, so it appears in both lists.
     for net in list(in_nets) + [f"{data_net}[{i}]" for i in range(bits)]:
