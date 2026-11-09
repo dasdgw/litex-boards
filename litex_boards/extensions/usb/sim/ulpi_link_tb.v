@@ -210,6 +210,13 @@ module ulpi_link_tb;
     // that happens while the access runs, which is exactly what `fault` already means here (`F_RESET_MID`
     // takes the clock away mid-access; this one offers a resume and snatches it back).
     reg         pre_witness_bad;
+    // `pre_recovered` is the second half of the answer to ticket 05, and it exists because the first half
+    // (waking the link) is a CURE, and "a cure applied before every measurement also removes the disease
+    // from the record". A `pre` that silently repairs the state is an oracle that manufactures its own
+    // precondition, which is what the python twin did and did not notice it was doing. So the repair is
+    // made, AND it is named on every RESULT line: a green row that needed a rescue is not the same fact as
+    // a green row that did not, and the file must be able to tell them apart tomorrow.
+    reg         pre_recovered;
     reg [8*140:1] pre_why;
 
     // `P_CLK_OOB` = the meter says the clock is out of band while the domain is still being clocked. That is
@@ -321,16 +328,31 @@ module ulpi_link_tb;
             // both models now clear the knobs before building a pre-state.
             knop_stall_nxt = 0; knop_wrong_cmd = 0; knop_rev_bus = 0; knop_ignore_write = 0;
             knop_abort_n = 0; knop_abort_forever = 0;
-            pre_witness_bad = 1'b0; pre_why = "";
-            // Row isolation, wake edition. Every row before this one ran on a PHY that could answer, so no
-            // pre-state ever had to recover the link; the LPM rows leave it suspended and with `bridge.busy`
-            // set by an access that has no clock to finish. Recovering is the same thing an operator is told
+            pre_witness_bad = 1'b0; pre_why = ""; pre_recovered = 1'b0;
+            // Row isolation, wake edition. Recovering is the same thing an operator is told
             // to do (`.scratch/ulpi-wake/spec.md`'s failure tree): assert `stp`, wait for the clock, then
             // take the PHY reset that releases the bridge -- and it is done HERE, before the row that follows
             // asks anything, because a row that starts behind a stuck `busy` does not fail on its own terms.
-            // SCOPE, and it is a measured scope, not a stylistic one: this recovery runs only for the rows
-            // whose pre-state is a suspended PHY. The first version also fired on a stuck `h_busy`, which is
-            // a sensible-looking thing to want and which DELETED a witness -- `tools/ulpi_mutate.py`'s
+            // THE CONDITION IS A STATE, NOT A `pre` VALUE, and ticket 05 is what changed it. It used to read
+            // `(pre == P_LPM) || (pre == P_RESUME)`, which rested on a sentence that was true until
+            // 2026-11-04 and is false now: "every row before this one ran on a PHY that could answer, so no
+            // pre-state ever had to recover the link". `wake_false_resume` leaves the PHY ASLEEP with
+            // `bridge.busy` asserted by an access that had no clock to finish, so any row appended after it
+            // inherits a dead link -- and did, measured: `exp=24 seen=xx phycmd=00 busy=1` in RTL against a
+            // file the python twin answered correctly, which is the whole reason the twin is kept.
+            // WHICH model was right is now a written answer instead of a difference in behaviour: this file's
+            // own column definition says `pre` is a *precondition the model must be in*, so the harness OWNS
+            // it and must make it true -- the python reading is the contract, and the old RTL reading ("the
+            // row before left this true, and I shall not fix it") was a claim about file order passed off as
+            // a fact about the PHY. But the python twin was only right about the meaning: it repaired in
+            // silence, and a precondition nobody has to earn is a precondition nobody notices being unmet.
+            // The contract is therefore both halves at once: make it true THROUGH THE REAL MECHANISM (never
+            // by poking the model), refuse the row when the mechanism fails (`pre_witness_bad`), and say out
+            // loud on the RESULT line that a rescue happened (`recovered=1`).
+            // SCOPE, and it is a measured scope, not a stylistic one: the trigger is `in_lpm`, so it runs for
+            // EVERY row whose predecessor left the PHY asleep, and for nothing else. It deliberately does NOT
+            // fire on a stuck `h_busy` with the PHY awake. The first version also fired on a stuck
+            // `h_busy`, which is a sensible-looking thing to want and which DELETED a witness -- `tools/ulpi_mutate.py`'s
             // `no_dst_req_withdraw` is noticed precisely because the row before `freerun_rd` leaves a stale
             // request asserted, so a pre-state that resets any busy before every row cleans up the evidence
             // and reports that mutation BLIND on a tree where the bug is present (measured, both ways, on
@@ -338,9 +360,13 @@ module ulpi_link_tb;
             // a sleeping PHY poisons every later row and is not itself a symptom -- and a stuck `busy`
             // anywhere else stays as visible as it was before this ticket. Generalised, because it is not
             // about this row: **isolation is a cure, and a cure applied before every measurement also removes
-            // the disease from the record.**
-            if ((pre == P_LPM) || (pre == P_RESUME)) begin
+            // the disease from the record** -- which is why `recovered=%b` is on every RESULT line and not a
+            // comment here. Widening the trigger to `in_lpm` does NOT re-open that hole: `in_lpm` is 0 for
+            // every row of `no_dst_req_withdraw`'s measured red set, and the mutation still reddens
+            // `freerun_rd` (re-measured for this ticket, `tools/ulpi_mutate.py`).
+            if ((in_lpm === 1'b1) || (pre == P_LPM) || (pre == P_RESUME)) begin
                 if (in_lpm === 1'b1) begin
+                    pre_recovered = 1'b1;
                     tb_wake = 1'b1;
                     g = 0;
                     while ((in_lpm === 1'b1) && (g < 4000)) begin @(posedge usb_clk); g = g + 1; end
@@ -570,7 +596,15 @@ module ulpi_link_tb;
             if (check_cmd !== 1'b0) begin
                 if (seen_cmd !== exp_cmd) begin
                     ok  = 0;
-                    why = "the PHY decoded the wrong TX CMD encoding";
+                    // A failed `pre` outranks the encoding, and ticket 05 is why this line had to say so.
+                    // Every other symptom check below is guarded by `ok`, so this was the ONE unconditional
+                    // `why` assignment left: with `wake_never_reaches_pad` mutated in, the isolation wake
+                    // fails (the pad never rises), and the row printed "the PHY decoded the wrong TX CMD"
+                    // over the honest "a held stp did not bring the clock back" -- right verdict, wrong
+                    // sentence, and the sentence is what decides whether you look at the pad or at the
+                    // master. Measured: `bench/2026-11-09_phy_ready_isolation/`.
+                    if (!pre_witness_bad)
+                        why = "the PHY decoded the wrong TX CMD encoding";
                 end
             end
 
@@ -669,9 +703,12 @@ module ulpi_link_tb;
                 // error bits were only ever visible on a failing row -- and the cross-model diff between
                 // this suite and the python twin (`tools/test_ulpi_phy_model.py`, section 6) compares
                 // readings on rows where both models passed, so it needs them here.
-                $display("RESULT %0d PASS rdata=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d",
+                // `recovered=1` says THIS row's `pre` had to wake a PHY the previous row left asleep. It is
+                // on the PASS line as well as the FAIL line for the reason above: the cure is invisible in a
+                // suite that only reports failures.
+                $display("RESULT %0d PASS rdata=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d recovered=%b",
                          n, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy,
-                         acc_waited, acc_retry, state);
+                         acc_waited, acc_retry, state, pre_recovered);
             if (unsolicited_tx)
                 $display("     WITNESS row %0d: unsolicited USB Transmit, decoded %h off the pads (bug 3)",
                          n, unsolicited_byte);
@@ -682,7 +719,7 @@ module ulpi_link_tb;
                 // `phycmd` is what the PHY says it decoded and `expcmd` what this row expected it to decode:
                 // the two fields that turn "FAIL" into "the master sent a packet command", which is the
                 // difference between a 2-minute fix and an evening in GTKWave.
-                $display("RESULT %0d FAIL exp=%h seen=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d phycmd=%h expcmd=%h why=%0s", n, exp, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy, acc_waited, acc_retry, state, seen_cmd, exp_cmd, why);
+                $display("RESULT %0d FAIL exp=%h seen=%h ack=%b abort=%b tmo=%b noclk=%b reset=%b busy=%b waited=%0d retry=%0d state=%0d phycmd=%h expcmd=%h recovered=%b why=%0s", n, exp, acc_rdata, acc_ok, acc_abort, acc_timeout, err_no_clock, err_reset, h_busy, acc_waited, acc_retry, state, seen_cmd, exp_cmd, pre_recovered, why);
             end
         end
     endtask
