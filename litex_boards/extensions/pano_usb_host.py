@@ -325,16 +325,51 @@ class UsbHostCore(LiteXModule):
         # --- reset -----------------------------------------------------------------------------------
         self.usb_reset = UsbReset(clk_ok = clk_ok, phy_reset = phy_reset)
 
-        # A second, deliberate lever: the BIOS test (M3.3) has to be able to hold the cores in reset while
-        # it checks the clock, and then release. Held by default, and the question it makes answerable on
-        # the bench is the first one worth asking of a new integration: **does the Wishbone window work
-        # before the USB core has ever been released?** It does, because the bridge is not in this reset --
-        # which is also why ``usb_host_state`` can be read while ``usb_host_core_rst`` is 1.
+        # A second, deliberate lever: hold the cores in reset, look at the clock, then release. Held by
+        # default, so a fresh load cannot put packets on a bus nobody inspected.
+        #
+        # WHAT THIS RESET ACTUALLY COVERS, MEASURED (ticket 19, 2026-11-05/06, and it is the opposite of
+        # what this comment used to claim). Earlier text here said "the Wishbone window and the CDC are NOT
+        # in this reset and stay readable while the core is held". Half of that is true, the half that a
+        # bench acts on is false, and a bench found it: with ``phy_reset`` released, ``core_rst = 1`` makes
+        # every read of the window return ``0xffffffff`` **and ``usb_host_lost`` increments** (panologic_g2
+        # ``bench/2026-11-05_usb_host_window_t3/``, ``bench/2026-11-06_hubclass_t3/``, RESEARCH §7.16.6).
+        #
+        # * True, and structurally so: **the bridge is not in this reset**. Its ``cd_usb`` FSM has no reset
+        #   at all in the generated netlist (``tools/test_usb_host_map.py`` pins that), which is what lets
+        #   the access be *declared* lost rather than hang the CPU forever.
+        # * False: **the window does not answer.** The thing in this reset is the vendor core's own
+        #   AXI4-Lite response half -- ``rvalid_q``/``bvalid_q`` are cleared by ``rst_i``
+        #   (``usbh_host.v@81eb9f1:683-691``, ``:711-723``) while its *accept* signals are combinational and
+        #   stay high (``cfg_arready_o = ~cfg_rvalid_o``, ``:150-152``). So a held core **shakes hands and
+        #   never answers**: the bridge hands the transaction to a dead slave, waits, and answers ``err``.
+        #   Over the serial bridge an ``err`` is invisible and LiteX's interconnect timeout fakes the ack
+        #   with all-ones, which is why a bench sees ``0xffffffff`` and not a fault (``docs/NOTES.md``).
+        # * Accepted by design, not inherited. The two ways to make the window answer while held are both
+        #   worse: patching the vendor reset so the register file answers would return its **reset values**,
+        #   and ``USB_CTRL = 0`` is a plausible reading -- the silent-wrong-answer spec decision 3 exists to
+        #   refuse; a shadow register file is new logic on the pad path that already misses ``OFFSET = OUT``
+        #   by 3.3 ns (ADR-0005). ``0xffffffff`` **plus a `lost` increment** is the loud answer, and it is a
+        #   positive report: it says the far side was held.
+        # * Safe, and checked rather than assumed: an access swallowed by a held core is **dropped, not
+        #   delayed** -- no phantom ``rvalid``/``bvalid`` arrives when the core is released, and the held
+        #   write does not land later (``extensions/usb/sim/usbh_held_core_tb.v`` — stage ``held`` of
+        #   ``tools/wb_axil_cdc_sim.py``, so it runs on every commit of the docs repo; the same press against
+        #   ``81eb9f1`` is also in ``bench/2026-11-05_usb_host_window_t3/offline/usbh_held_chain_tb.v``).
+        #
+        # So M3.3's BIOS test must not "read the window while the core is held"; it reads **this module's
+        # CSRs**, which sit on ``cd_sys`` in front of the bridge and are readable with the core held:
+        # ``usb_host_state`` (bit 3 is the level actually applied), ``usb_host_xfer``/``lost``/``aborted``,
+        # and the probe's ``probe_fm_ulpi_value``. That is the same isolation, from the near side.
         self.core_rst = CSRStorage(reset = 1, description =
             "Hold the USB host core and its UTMI/ULPI wrapper in reset (default 1 = held). Not the only "
             "reset: the cores are also held while the PHY's 60 MHz is not vouched for by the probe's clock "
-            "meter, so writing 0 releases them only if C12 is healthy (USB3300 §6.1.11). The Wishbone "
-            "window and the CDC are NOT in this reset and stay readable while the core is held.")
+            "meter, so writing 0 releases them only if C12 is healthy (USB3300 §6.1.11). WHILE HELD the "
+            "core's own register window at usb_host_ctrl does NOT answer -- its AXI4-Lite response "
+            "registers are inside this reset, so a read returns all-ones over a serial bridge and "
+            "usb_host_lost increments (measured; ticket 19). The CSRs of this module (usb_host_state, "
+            "_xfer, _lost, _aborted) are NOT behind the bridge and DO answer: read those to tell a held "
+            "core from a dead bridge.")
 
         # --- what this module is doing, as far as the CPU is concerned --------------------------------
         # One register per fact, in the same style as the ulpi_* map (spec decision 11): a bit-field hunt
@@ -343,9 +378,9 @@ class UsbHostCore(LiteXModule):
             CSRField("clk_ok",    size = 1, description = "Probe's cd_usb meter says a healthy 60 MHz."),
             CSRField("phy_reset", size = 1, description = "Probe holds the PHY in reset (logical level)."),
             CSRField("core_ok",   size = 1, description = "clk_ok & ~phy_reset: the condition UsbReset releases on."),
-            CSRField("core_rst",  size = 1, description = "The level actually applied to the cores (usb_reset | core_rst.storage)."),
+            CSRField("core_rst",  size = 1, description = "The level actually applied to the cores (usb_reset | core_rst.storage). THE register to read first: a window answering all-ones with this bit 1 is a held core, not a dead bridge (ticket 19)."),
             CSRField("cdc_busy",  size = 1, description = "A Wishbone access is in flight across the bridge."),
-            CSRField("cdc_lost",  size = 1, description = "Last crossed access was declared lost (sticky until the next one)."),
+            CSRField("cdc_lost",  size = 1, description = "Last crossed access was declared lost. Sticky until the next access SUCCEEDS, so it records the past: reading the window while core_rst is 1 sets it by itself, and state 0x25 on a board that is otherwise healthy means only that someone polled during a reset (ticket 19)."),
         ])
         self.xfer      = CSRStatus(16, description = "Completed crossed accesses (saturating).")
         self.lost      = CSRStatus(8,  description = "Crossed accesses declared lost (saturating).")
