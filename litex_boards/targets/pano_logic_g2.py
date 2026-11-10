@@ -1049,6 +1049,7 @@ class BaseSoC(SoCCore):
         sdram_clk_phase    = 260.,   # see _CRG: read-eye centre measured on rev C, default 250 corrupts reads
         cpu_reset_pin      = None,
         serial_index       = 0,
+        console            = None,
         with_ulpi_probe    = False,
         with_analyzer      = True,
         w12_pullup         = False,
@@ -1069,6 +1070,20 @@ class BaseSoC(SoCCore):
         **kwargs):
         platform = pano_logic_g2.Platform(revision=revision)
         assert sdram_chip in ["a", "b"]
+
+        # Console dialect, resolved before anything reads `with_uart` (see the block at SoCCore.__init__).
+        # `None` = today's rule, so every existing command line builds the same map it always did.
+        if console is None:
+            console = "uartbone" if with_ulpi_probe else "uart"
+        assert console in ("uart", "uartbone"), \
+            '--console must be "uart" (BIOS/Linux console) or "uartbone" (CSR remote channel), got %r: they '\
+            "share one DDC pair and each drives pads.tx, so there is no both." % (console,)
+        if console == "uart" and with_ulpi_probe:
+            # Say it on the build log, not only in --help: on 2026-11-10 the *absence* of such a line is what
+            # cost the discovery, and the failure it prevents is a bench session with no ladder rather than a
+            # build error.
+            print("[console] `uart` with --with-ulpi-probe: the DDC pair is a CONSOLE for BIOS/Linux, so "
+                  "UARTBone is NOT in this spin and litex_server / tools/ulpi_probe.py cannot reach it.")
 
         # CRG --------------------------------------------------------------------------------------
         # Requested once here and handed down: `platform.request()` consumes the resource, so a second
@@ -1143,7 +1158,13 @@ class BaseSoC(SoCCore):
         # purpose: the DDC pair is either a **console** or the **remote channel**, never both, because
         # they are the same two wires. No BIOS => no console => the host can read CSRs and run the logic
         # analyzer over UARTBone, and the LED chaser is the only "alive" signal.
-        if with_ulpi_probe:
+        # `console` decides which of the two dialects the DDC pair speaks, and it is a *choice* now because
+        # M4 needs the other one. Today's behaviour is unchanged for every command line this repo has built:
+        # a probe spin is CPU-less, so the pair is the remote channel (UARTBone) and the LED chaser is the
+        # only "alive" signal; an M4 spin boots Linux and needs `console=liteuart` or it dies unheard.
+        # Both on one pair is not an option to add quietly: `uart` and `uartbone` would each drive `pads.tx`,
+        # and LiteX has no mux here -- so `console` picks exactly one and the refusal below says why.
+        if console == "uartbone":
             kwargs["with_uart"]     = False
             kwargs["with_uartbone"] = False   # added below, from the pads this target actually requested
 
@@ -1165,7 +1186,7 @@ class BaseSoC(SoCCore):
         # match when number is None: index 0 = the micro-HDMI DDC pair. So the stock helper puts the
         # remote channel on wires nobody cabled, silently, while `uart_pads` (the DVI pair we are wired
         # to) is dropped. Same class of trap as the console's --serial-index (JTAG_CABLE.md §4).
-        if with_ulpi_probe:
+        if console == "uartbone":
             from litex.soc.cores.uart import UARTPHY, UARTBone
             uartbone_phy = UARTPHY(uart_pads,
                 clk_freq              = sys_clk_freq,
@@ -1387,11 +1408,34 @@ NET "{eth_clocks_tx}" CLOCK_DEDICATED_ROUTE = FALSE;
                                          mode="rw", cached=False))
             # An asserted location, not the first free one -- and 0 is NOT free here: this build's own log
             # says `timer0 IRQ allocated at Location 0`, which is what the first draft of this line found in
-            # twenty seconds instead of at the end of a synth run. 1 is chosen because it is free on every map
-            # this repo has built, and because PLAN.md M4.1's device tree will say the number we allocated
-            # rather than the number the allocator happened to reach for: `use_loc_if_exists=True` would make
-            # "the DTS matches the bitstream" a promise that changes whenever another interrupt source is
-            # added. If this raises, the fix is a deliberate change here AND in the DTS, never a quieter flag.
+            # twenty seconds instead of at the end of a synth run. The number is asserted rather than
+            # allocated because PLAN.md M4.1's device tree must be able to say it: `use_loc_if_exists=True`
+            # would make "the DTS matches the bitstream" a promise that changes whenever another interrupt
+            # source is added. If this refuses, the fix is a deliberate change here AND in the DTS, never a
+            # quieter flag -- so refuse LOUDLY: LiteX's own answer is a bare `SoCError` after an
+            # "IRQ Location already used" line buried in a few hundred INFO lines, and 2026-11-10 measured
+            # that the M4 map really does collide (`--with-ethernet` puts ethmac on 1, so the first
+            # M4-shaped build died here with no sentence to act on; M4's spin passes --usb-irq=2).
+            taken = {loc: name for name, loc in self.irq.locs.items()}
+            if usb_irq in taken:
+                # Suggest the next free line, and say plainly that this build's OWN map is what is being
+                # described. Not a fixed number in the text: the first version of this message asserted
+                # "timer0=0, ethmac=1, so --usb-irq=2", and the very next build disproved it -- adding
+                # --console=uart gives `uart` a line too, so the Linux map is uart=0, timer0=1, ethmac=2.
+                # A guard whose help text drifts is the bug's alibi (docs/NOTES.md).
+                free = min(set(range(self.irq.n_locs)) - set(taken))
+                raise ValueError(
+                    "--usb-irq=%d is taken by `%s` on this map (allocated so far: %s). The USB host's "
+                    "interrupt must be an ASSERTED line so PLAN.md M4.1's device tree can name it, so the "
+                    "fix is a deliberate pair: pass a free --usb-irq here (%d is free) AND make the tree "
+                    "say the same number -- litex_json2dts_linux reads `usb_host_interrupt` out of "
+                    "csr.json, so generating the DTS from this build's csr.json keeps the pair honest by "
+                    "itself. Never ask for the next free one silently: that makes "
+                    "'the DTS matches the bitstream' a promise that changes whenever another interrupt "
+                    "source is added."
+                    % (usb_irq, taken[usb_irq],
+                       ", ".join("%s=%s" % (n, l) for n, l in sorted(taken.items(), key=lambda kv: kv[1])),
+                       free))
             self.irq.add("usb_host", usb_irq)
 
             # The probe's two pad views, now the core's. Registered drivers rather than TSTriple internals,
@@ -1648,10 +1692,22 @@ def main():
              "A lost access is reported as `err`, never `ack`: a zero is a plausible USB_STATUS value "
              "(tools/wb_axil_cdc_sim.py's `lost-is-err-not-ack`).")
     parser.add_target_argument("--usb-irq", default=1, type=int,
-        help="IRQ line the USB host core's `intr_o` is wired to (default 1). 0 is NOT free: `timer0` takes "
-             "it on every map this repo builds. M4.1's device tree must say this same number, and a build "
-             "that refuses because the line is taken is the intended behaviour -- the fix is to change both "
-             "files deliberately, not to ask for the next free one.")
+        help="IRQ line the USB host core's `intr_o` is wired to (default 1, which is what the M3 bench spins "
+             "usb_t1..t4 used and what their csr.csv says). Nothing is free by luck: `timer0` takes 0 on "
+             "every map this repo builds, `--with-ethernet` puts ethmac on 1, and `--console=uart` gives the "
+             "UART a line of its own at 0 and shifts the rest. So the M4 Linux line is measured, not "
+             "derived: `--console=uart --with-ethernet` => uart=0, timer0=1, ethmac=2, **--usb-irq=3**. "
+             "M4.1's device tree must say this same number, and a build that refuses because the line is "
+             "taken is the intended behaviour -- the refusal names who holds it and which line is free, and "
+             "the fix is to change both files deliberately, not to ask for the next free one.")
+    parser.add_target_argument("--console", default=None, choices=["uart", "uartbone"],
+        help="Which dialect the console DDC pair (--serial-index) speaks. Default keeps every existing "
+             "build as it was: `uartbone` with --with-ulpi-probe (a CPU-less probe spin has no BIOS to "
+             "print, and the pair is the CSR remote channel `litex_server`/`tools/ulpi_probe.py` speak), "
+             "`uart` otherwise. **An M4/Linux build must say --console=uart**: with `uartbone` the SoC has "
+             "no `uart` CSR, LiteX's own `litex_json2dts_linux` dies on `KeyError: 'uart'`, and even with a "
+             "hand-written tree the BIOS and kernel would have nowhere to print. They are mutually "
+             "exclusive because each drives pads.tx on the same two wires.")
     parser.add_target_argument("--cpu-reset-pin", default=None,
         help="Also reset from this platform resource (active low, e.g. user_btn_n). Default: boot counter only.")
     ethopts = parser.target_group.add_mutually_exclusive_group()
@@ -1678,6 +1734,7 @@ def main():
         sdram_clk_phase     = args.sdram_clk_phase,
         cpu_reset_pin       = args.cpu_reset_pin,
         serial_index        = args.serial_index,
+        console             = args.console,
         with_ulpi_probe     = args.with_ulpi_probe,
         with_analyzer       = not args.no_analyzer,
         w12_pullup          = args.w12_pullup,
